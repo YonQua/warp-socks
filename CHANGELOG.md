@@ -2,7 +2,7 @@
 
 ## 2026-03-25
 
-- 启动隧道后会自动为容器主网络子网添加路由与 OUTPUT 旁路，修复通过 Docker 发布端口从局域网访问 SOCKS5 时容易超时的问题
+- 启动隧道后会自动为主网段与私网地址添加路由和 OUTPUT 旁路，修复通过 Docker 发布端口从局域网访问 SOCKS5 时回复流量误入 WARP 隧道的问题
 - `.env.example` 补充了 `HOST_BIND_IP` / `HOST_BIND_PORT` / `BIND_PORT` 的区别说明，并明确局域网访问应修改宿主机绑定项
 - 项目目录与默认命名从 `warp-teams` 收正为 `warp-socks`，以匹配当前支持 `teams`、`wgcf-free`、`wgcf-plus` 的实际能力面
 - 镜像新增极简 `HEALTHCHECK`，通过容器内本地 SOCKS5 请求 `cdn-cgi/trace` 校验 `warp=on` / `warp=plus`
