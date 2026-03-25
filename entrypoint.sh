@@ -427,6 +427,31 @@ build_wgcf_wg_config() {
   log "已生成 ${WG_CONF}，模式: ${WARP_STACK}"
 }
 
+ensure_primary_network_bypass() {
+  primary_v4_subnet="$(ip -4 route show dev eth0 proto kernel scope link | awk 'NR==1 {print $1}')"
+  primary_v6_subnet="$(ip -6 route show dev eth0 proto kernel | awk '/^[0-9a-fA-F:]+\// {print $1; exit}')"
+
+  if [ -n "$primary_v4_subnet" ]; then
+    if ! ip rule show | grep -Fq "to ${primary_v4_subnet} lookup main"; then
+      ip rule add to "$primary_v4_subnet" lookup main priority 100
+    fi
+    iptables -C OUTPUT -d "$primary_v4_subnet" -j ACCEPT >/dev/null 2>&1 || \
+      iptables -I OUTPUT 1 -d "$primary_v4_subnet" -j ACCEPT
+  fi
+
+  if [ -n "$primary_v6_subnet" ]; then
+    if ! ip -6 rule show | grep -Fq "to ${primary_v6_subnet} lookup main"; then
+      ip -6 rule add to "$primary_v6_subnet" lookup main priority 100
+    fi
+    ip6tables -C OUTPUT -d "$primary_v6_subnet" -j ACCEPT >/dev/null 2>&1 || \
+      ip6tables -I OUTPUT 1 -d "$primary_v6_subnet" -j ACCEPT
+  fi
+
+  if [ -n "$primary_v4_subnet$primary_v6_subnet" ]; then
+    log "已为容器主网络添加旁路: ${primary_v4_subnet:-none}${primary_v6_subnet:+, ${primary_v6_subnet}}"
+  fi
+}
+
 start_tunnel() {
   if ip link show wg0 >/dev/null 2>&1; then
     wg-quick down wg0 >/dev/null 2>&1 || true
@@ -434,6 +459,7 @@ start_tunnel() {
 
   log "正在启动 wg0"
   wg-quick up wg0
+  ensure_primary_network_bypass
   trace="$(curl -s --max-time 5 https://1.1.1.1/cdn-cgi/trace || true)"
   egress_ip="$(printf '%s\n' "$trace" | sed -n 's/^ip=\(.*\)$/\1/p' | head -n 1)"
   [ -n "$egress_ip" ] && log "当前出口 IP: ${egress_ip}" || log "未能在 5 秒内获取出口 IP"
