@@ -1,12 +1,24 @@
-FROM alpine:3.22 AS builder
+ARG ALPINE_VERSION=3.22.3
 
-# 单独编译 microsocks，最终镜像只拷贝产物，保持体积尽量小。
-RUN apk add --no-cache build-base git
-# 固定到已发布 tag，避免上游默认分支漂移影响镜像可复现性。
-RUN git clone --depth 1 --branch v1.0.5 https://github.com/rofl0r/microsocks.git /src/microsocks
-RUN make -C /src/microsocks
+FROM alpine:${ALPINE_VERSION} AS builder
 
-FROM alpine:3.22
+ARG MICROSOCKS_VERSION=v1.0.5
+
+# 通过固定 tag tarball 拉源码，避免默认分支漂移，也省掉 builder 阶段的 git 依赖。
+RUN apk add --no-cache build-base ca-certificates curl \
+ && curl --fail --show-error --location \
+      --retry 5 --retry-all-errors --retry-delay 2 \
+      --output /tmp/microsocks.tar.gz \
+      "https://github.com/rofl0r/microsocks/archive/refs/tags/${MICROSOCKS_VERSION}.tar.gz" \
+ && mkdir -p /src \
+ && tar -xzf /tmp/microsocks.tar.gz -C /src \
+ && mv "/src/microsocks-${MICROSOCKS_VERSION#v}" /src/microsocks \
+ && make -C /src/microsocks \
+ && strip /src/microsocks/microsocks || true
+
+FROM alpine:${ALPINE_VERSION}
+
+ARG WGCF_VERSION=v2.2.30
 
 # 固化 Docker 里的 wg-quick 兼容修补，避免容器启动时写只读 sysctl 导致退出。
 RUN apk add --no-cache ca-certificates curl iproute2 iptables wireguard-tools \
@@ -21,7 +33,11 @@ RUN apk add --no-cache ca-certificates curl iproute2 iptables wireguard-tools \
       s390x) wgcf_arch="s390x" ;; \
       *) echo "Unsupported architecture for wgcf: $arch" >&2; exit 1 ;; \
     esac \
- && curl -fsSL "https://github.com/ViRb3/wgcf/releases/download/v2.2.30/wgcf_2.2.30_linux_${wgcf_arch}" -o /usr/local/bin/wgcf \
+ && curl --fail --show-error --location \
+      --retry 5 --retry-all-errors --retry-delay 2 \
+      --connect-timeout 20 \
+      "https://github.com/ViRb3/wgcf/releases/download/${WGCF_VERSION}/wgcf_${WGCF_VERSION#v}_linux_${wgcf_arch}" \
+      -o /usr/local/bin/wgcf \
  && chmod +x /usr/local/bin/wgcf
 
 COPY --from=builder /src/microsocks/microsocks /usr/local/bin/microsocks
