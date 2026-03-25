@@ -1,0 +1,12 @@
+.git
+.gitignore
+.dockerignore
+.env
+.env.*
+!.env.example
+wireguard/
+wireguard-*/
+README.md
+CHANGELOG.md
+compose.yaml
+docs/

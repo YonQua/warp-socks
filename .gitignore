@@ -1,0 +1,6 @@
+.env
+wireguard/
+wireguard-*/
+task_plan.md
+findings.md
+progress.md
