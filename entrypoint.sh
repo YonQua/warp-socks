@@ -16,6 +16,9 @@ REGISTER_RETRY_DELAY="${REGISTER_RETRY_DELAY:-5}"
 LISTEN_ADDR="${BIND_ADDR:-0.0.0.0}"
 LISTEN_PORT="${BIND_PORT:-1080}"
 WARP_LICENSE_KEY="${WARP_LICENSE_KEY:-}"
+STARTUP_EGRESS_PROBE_RETRIES="${STARTUP_EGRESS_PROBE_RETRIES:-3}"
+STARTUP_EGRESS_PROBE_DELAY="${STARTUP_EGRESS_PROBE_DELAY:-2}"
+STARTUP_EGRESS_PROBE_TIMEOUT="${STARTUP_EGRESS_PROBE_TIMEOUT:-5}"
 # 这是注册 API 的兼容客户端标识，不等同于 Cloudflare 官方桌面客户端的发布版本号。
 CF_CLIENT_VERSION="${CF_CLIENT_VERSION:-a-6.10-2158}"
 
@@ -39,6 +42,19 @@ is_true() {
       ;;
     *)
       return 1
+      ;;
+  esac
+}
+
+sanitize_positive_int() {
+  value="$1"
+  fallback="$2"
+  case "$value" in
+    ''|*[!0-9]*|0)
+      printf '%s' "$fallback"
+      ;;
+    *)
+      printf '%s' "$value"
       ;;
   esac
 }
@@ -469,6 +485,37 @@ ensure_local_network_bypass() {
   log "已为本地网络添加旁路: ${primary_v4_subnet:-none}${primary_v6_subnet:+, ${primary_v6_subnet}} + RFC1918/ULA"
 }
 
+probe_egress_ip() {
+  timeout_seconds="$1"
+  trace="$(curl -s --max-time "$timeout_seconds" https://1.1.1.1/cdn-cgi/trace || true)"
+  printf '%s\n' "$trace" | sed -n 's/^ip=\(.*\)$/\1/p' | head -n 1
+}
+
+wait_for_egress_ready() {
+  probe_retries="$(sanitize_positive_int "$STARTUP_EGRESS_PROBE_RETRIES" 3)"
+  probe_delay="$(sanitize_positive_int "$STARTUP_EGRESS_PROBE_DELAY" 2)"
+  probe_timeout="$(sanitize_positive_int "$STARTUP_EGRESS_PROBE_TIMEOUT" 5)"
+  attempt=1
+
+  # 这里探测的是隧道起来后的第一条真实公网流量。
+  # 如果连续探测都拿不到出口 IP，就不要继续启动 socks5，直接退出交给 Docker 重试。
+  while [ "$attempt" -le "$probe_retries" ]; do
+    egress_ip="$(probe_egress_ip "$probe_timeout")"
+    if [ -n "$egress_ip" ]; then
+      log "当前出口 IP: ${egress_ip}"
+      return 0
+    fi
+
+    if [ "$attempt" -lt "$probe_retries" ]; then
+      warn "启动后第 ${attempt}/${probe_retries} 次出口探测未获取到 IP，${probe_delay} 秒后重试。"
+      sleep "$probe_delay"
+    fi
+    attempt=$((attempt + 1))
+  done
+
+  fail "启动后连续 ${probe_retries} 次出口探测仍未获取到出口 IP，判定隧道尚不可用，退出等待容器重启。"
+}
+
 start_tunnel() {
   if ip link show wg0 >/dev/null 2>&1; then
     wg-quick down wg0 >/dev/null 2>&1 || true
@@ -477,9 +524,7 @@ start_tunnel() {
   log "正在启动 wg0"
   wg-quick up wg0
   ensure_local_network_bypass
-  trace="$(curl -s --max-time 5 https://1.1.1.1/cdn-cgi/trace || true)"
-  egress_ip="$(printf '%s\n' "$trace" | sed -n 's/^ip=\(.*\)$/\1/p' | head -n 1)"
-  [ -n "$egress_ip" ] && log "当前出口 IP: ${egress_ip}" || log "未能在 5 秒内获取出口 IP"
+  wait_for_egress_ready
 }
 
 start_socks5() {

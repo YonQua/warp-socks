@@ -70,12 +70,15 @@ docker compose logs -f
 docker compose ps
 ```
 
-镜像现在内置了一个极简 `HEALTHCHECK`：它会在容器内通过本地 SOCKS5 访问 `https://cloudflare.com/cdn-cgi/trace`，并检查是否返回 `warp=on` 或 `warp=plus`。默认情况下，连续失败达到阈值后它会终止容器主进程，交给 Docker 按 `restart` 策略自动拉起容器并重建隧道；如果你只想观测不恢复，可设置 `HEALTHCHECK_AUTO_RECOVER=0`。
+启动阶段现在会先探测公网出口：只有在拿到出口 IP 后才会启动 `microsocks`；如果连续探测失败，容器会直接退出，交给 Docker 按 `restart` 策略重试，而不是起一个实际上不可用的 SOCKS5 端口。
+
+镜像还内置了一个极简 `HEALTHCHECK`：它会在容器内通过本地 SOCKS5 访问 `https://cloudflare.com/cdn-cgi/trace`，并检查是否返回 `warp=on` 或 `warp=plus`。默认情况下，连续失败达到阈值后它会终止容器主进程，交给 Docker 按 `restart` 策略自动拉起容器并重建隧道；如果你只想观测不恢复，可设置 `HEALTHCHECK_AUTO_RECOVER=0`。
 
 当前 `compose.yaml` 还内置了两类运行保护：
 
 - 基础资源限制：默认 `MEM_LIMIT=256m`、`CPU_LIMIT=0.50`
 - 容器日志滚动：默认 `json-file`，`LOG_MAX_SIZE=1m`、`LOG_MAX_FILE=1`
+- 启动出口探测：默认 `STARTUP_EGRESS_PROBE_RETRIES=3`、`STARTUP_EGRESS_PROBE_DELAY=2`、`STARTUP_EGRESS_PROBE_TIMEOUT=5`
 
 这两类限制都可以通过 `.env` 覆盖。
 
@@ -142,6 +145,7 @@ com.cloudflare.warp://<team-name>.cloudflareaccess.com/auth?token=...
 - 运行状态会持久化到 `./wireguard`；目录里包含私钥和账户信息，`.env` 里可能包含短时效 token，两者都不要提交到版本库。
 - 默认端口映射是 `127.0.0.1:1080 -> 1080`，除非你已经有明确的网络访问控制，否则不要改成 `HOST_BIND_IP=0.0.0.0`。
 - `ENDPOINT_IP` 默认建议留空；只有在默认端点握手失败，或者你所在网络环境明确只能稳定握手某个固定 endpoint 时，才手动覆盖。
+- 启动阶段会先做公网出口探测；如果连续探测都拿不到出口 IP，容器会直接退出并等待 Docker 重试，不会继续启动一个不可用的 SOCKS5 端口。
 - 当前仓库只有一个服务，Compose 默认网络已经足够；因此 `compose.yaml` 没有额外声明自定义 `networks`，避免增加无运行收益的配置面。
 
 ### 3. 阅读路径
@@ -190,6 +194,7 @@ docker compose logs --tail=120
 
 - `wg0` 没拉起来
 - 注册后端状态与当前请求不一致
+- 启动阶段的出口探测连续失败，容器已经提前退出等待重试
 - 固定 endpoint 当前网络不可达或短时抖动
 - 代理端口虽然在监听，但出口已经失效
 
@@ -211,7 +216,7 @@ curl --socks5 127.0.0.1:1080 https://cloudflare.com/cdn-cgi/trace
 - `已覆盖 Endpoint 为 ...`
 - `当前出口 IP: ...`
 
-如果日志里已经显示启动成功，但流量仍失败，优先怀疑当前 endpoint 不适合你的网络环境。
+如果日志里已经显示启动成功，但流量仍失败，优先怀疑当前 endpoint 不适合你的网络环境。反过来，如果启动阶段连续报“出口探测未获取到 IP”并最终退出，那一般就不要再把问题归到 SOCKS5 本身，而应直接排查隧道和 endpoint。
 
 ### 4. endpoint 选择建议
 
@@ -222,7 +227,8 @@ curl --socks5 127.0.0.1:1080 https://cloudflare.com/cdn-cgi/trace
 1. 能走默认 endpoint 就优先留空 `ENDPOINT_IP`
 2. 如果当前网络已知只有固定端点可用，再设置 `ENDPOINT_IP=ip:port`
 3. 如果必须常驻固定 endpoint，建议保持 `HEALTHCHECK_AUTO_RECOVER=1`
-4. 如果仍频繁掉线，再考虑第二阶段的多 endpoint 轮换
+4. 如果启动阶段经常拿不到出口 IP，可先调大 `STARTUP_EGRESS_PROBE_RETRIES` / `STARTUP_EGRESS_PROBE_DELAY`
+5. 如果仍频繁掉线，再考虑第二阶段的多 endpoint 轮换
 
 ### 5. 后端切换导致的问题
 
@@ -276,6 +282,9 @@ curl --socks5 127.0.0.1:1080 https://cloudflare.com/cdn-cgi/trace
 - `FORCE_REREGISTER=0|1`
 - `WARP_STACK=ipv4|dual|ipv6`
 - `ENDPOINT_IP=ip:port`
+- `STARTUP_EGRESS_PROBE_RETRIES`
+- `STARTUP_EGRESS_PROBE_DELAY`
+- `STARTUP_EGRESS_PROBE_TIMEOUT`
 - `MEM_LIMIT`
 - `CPU_LIMIT`
 - `LOG_MAX_SIZE`

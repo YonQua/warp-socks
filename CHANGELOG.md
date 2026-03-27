@@ -5,8 +5,10 @@
 - healthcheck 新增连续失败计数，并可在达到阈值后终止 PID 1，交给 Docker 按现有 `restart` 策略自动拉起容器并重建隧道
 - healthcheck 现在会区分 `socks5h` 远端解析路径与 `socks5` 本地解析路径，并在失败日志里补充最近握手时间与连续失败次数
 - `compose.yaml` 与 `.env.example` 新增 `HEALTHCHECK_AUTO_RECOVER`、`HEALTHCHECK_AUTO_RECOVER_THRESHOLD`，允许显式关闭自动恢复或调整阈值
+- 启动阶段新增出口就绪门禁：连续探测拿不到出口 IP 时，不再继续启动 `microsocks`，而是直接退出容器等待重试
 - README、运行边界与故障排查文档同步更新为“轻量自恢复”语义，并补充固定单 endpoint 时的稳定性边界说明
 - `compose.yaml` 新增直接面向 `docker compose up` 的 `mem_limit`、`cpus` 与 `json-file` 日志滚动限制；`.env.example` 与 README 同步补充 `MEM_LIMIT`、`CPU_LIMIT`、`LOG_MAX_SIZE`、`LOG_MAX_FILE`
+- `compose.yaml` 与 `.env.example` 新增 `STARTUP_EGRESS_PROBE_RETRIES`、`STARTUP_EGRESS_PROBE_DELAY`、`STARTUP_EGRESS_PROBE_TIMEOUT`，允许调整启动阶段的出口探测重试
 - 删除 `docs/README.md` 与 `docs/releases/v0.1.0.md`，去掉与当前运行无直接关系的索引页和发布快照文档
 - 将 `docs/runtime-boundaries.md` 与 `docs/state-and-backend-switching.md` 的有效内容并回 `README.md`，只保留 `docs/troubleshooting.md` 作为专题排障文档
 - 进一步将 `docs/troubleshooting.md` 并回 `README.md`，当前仓库不再保留 `docs/` 目录
