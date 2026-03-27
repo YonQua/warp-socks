@@ -2,6 +2,9 @@
 
 ## 2026-03-27
 
+- 启动日志现在会同时区分“容器内 SOCKS5 监听地址”和“Docker 发布到宿主机的入口端口”，减少 `HOST_BIND_PORT` 与 `BIND_PORT` 混淆
+- `compose.yaml` 现在把 `HOST_BIND_IP` / `HOST_BIND_PORT` 传入容器，仅用于启动日志展示宿主机入口映射
+- README 与 `.env.example` 补充一段明确的端口层级说明，强调 `HOST_BIND_PORT` 才是客户端入口，而 `BIND_ADDR=0.0.0.0` 是容器内监听的推荐默认值
 - 删除自动读取 `wireguard/endpoint-candidates.txt` 与持久化 `endpoint-cursor` 的逻辑，项目重新只认 `.env` 里的 `ENDPOINT_IP` / `ENDPOINT_CANDIDATES`，避免隐藏状态影响启动顺序
 - 删除仓库内置的 endpoint 发现器与握手生成工具，移除 `cmd/discover-endpoints`、`internal/warphandshake`、`go.mod`、`go.sum` 和本地构建产物，项目重新收口为“轻量运行 + 显式 endpoint 候选消费”
 - README / `.env.example` 进一步收口为 `ENDPOINT_IP` 与 `ENDPOINT_CANDIDATES` 两条轻量路径，不再保留仓库自带发现器或隐式缓存文件的使用说明

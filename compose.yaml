@@ -23,6 +23,9 @@ services:
       TEAMS_TOKEN: ${TEAMS_TOKEN:-}
       WARP_LICENSE_KEY: ${WARP_LICENSE_KEY:-}
       FORCE_REREGISTER: ${FORCE_REREGISTER:-0}
+      # 仅用于容器启动日志，帮助区分“宿主机入口”与“容器内监听”。
+      HOST_BIND_IP: ${HOST_BIND_IP:-127.0.0.1}
+      HOST_BIND_PORT: ${HOST_BIND_PORT:-1080}
       BIND_ADDR: ${BIND_ADDR:-0.0.0.0}
       BIND_PORT: ${BIND_PORT:-1080}
       WARP_STACK: ${WARP_STACK:-dual}

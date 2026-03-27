@@ -85,6 +85,7 @@ docker compose ps
 6. 验证代理：
 
 ```bash
+# 默认 HOST_BIND_PORT=1080；如果你把它改成 2080，这里也要改成 2080
 curl --socks5 127.0.0.1:1080 https://cloudflare.com/cdn-cgi/trace
 ```
 
@@ -93,9 +94,23 @@ curl --socks5 127.0.0.1:1080 https://cloudflare.com/cdn-cgi/trace
 - 所有模式都至少应返回 `warp=on`
 - `teams` 模式通常还会返回 `gateway=on`
 
+## 端口与地址层级
+
+当前 `compose.yaml` 的映射关系是：
+
+```text
+HOST_BIND_IP:HOST_BIND_PORT:BIND_PORT
+```
+
+- `HOST_BIND_IP` / `HOST_BIND_PORT` 是宿主机入口，也是客户端真正要连接的地址与端口。
+- `BIND_ADDR` / `BIND_PORT` 是容器内 `microsocks` 自己监听的地址与端口。
+- 大多数场景只改 `HOST_BIND_PORT`，把宿主机入口从 `1080` 改成 `2080`；`BIND_ADDR` / `BIND_PORT` 保持默认即可。
+- 例子：如果你配置 `HOST_BIND_IP=0.0.0.0`、`HOST_BIND_PORT=2080`、`BIND_ADDR=0.0.0.0`、`BIND_PORT=1080`，那么客户端应该连接 `socks5://宿主机IP:2080`；容器日志里显示“容器内监听 `0.0.0.0:1080`”是正常的。
+- `BIND_ADDR` 通常必须保持 `0.0.0.0`。Docker 发布端口会把流量转发到容器网卡地址，而不是容器里的 `127.0.0.1`；如果把 `BIND_ADDR` 改成 `127.0.0.1`，宿主机映射端口通常无法把流量送进容器内的 `microsocks`。
+
 ## 安全边界
 
-`microsocks` 是无认证 SOCKS5 代理。默认端口映射保持在 `127.0.0.1:1080 -> 1080`，这是推荐配置。
+`microsocks` 是无认证 SOCKS5 代理。默认端口映射保持在 `127.0.0.1:1080 -> 容器 1080`，这是推荐配置。
 
 如果你把 `HOST_BIND_IP=0.0.0.0`，就等于把未鉴权代理直接暴露给外部网络。除非你已经有额外 ACL / 防火墙限制，并且明确接受出口被滥用的风险，否则不要这样做。
 
@@ -144,7 +159,7 @@ com.cloudflare.warp://<team-name>.cloudflareaccess.com/auth?token=...
 ### 2. 运行与安全
 
 - 运行状态会持久化到 `./wireguard`；目录里包含私钥和账户信息，`.env` 里可能包含短时效 token，两者都不要提交到版本库。
-- 默认端口映射是 `127.0.0.1:1080 -> 1080`，除非你已经有明确的网络访问控制，否则不要改成 `HOST_BIND_IP=0.0.0.0`。
+- 默认端口映射是 `127.0.0.1:1080 -> 容器 1080`，除非你已经有明确的网络访问控制，否则不要改成 `HOST_BIND_IP=0.0.0.0`。
 - `ENDPOINT_IP` 默认建议留空；只有在默认端点握手失败，或者你所在网络环境明确只能稳定握手某个固定 endpoint 时，才手动覆盖。
 - 如果单个固定 endpoint 仍会抖动，可以改用 `ENDPOINT_CANDIDATES=ip1:port,ip2:port`；启动失败时会在同一次启动流程里按顺序尝试后续候选，运行中健康检查连续失败后则会重启容器，并重新按你写的顺序再尝试一轮。
 - 当前仓库只认 `.env` 里的 `ENDPOINT_IP` / `ENDPOINT_CANDIDATES`，不再自动读取 `./wireguard/endpoint-candidates.txt` 这类隐式缓存文件。
@@ -212,6 +227,7 @@ docker compose logs --tail=120
 先在宿主机确认：
 
 ```bash
+# 如果你把 HOST_BIND_PORT 改成了 2080，这里也要改成 2080
 curl --socks5 127.0.0.1:1080 https://cloudflare.com/cdn-cgi/trace
 ```
 
@@ -311,6 +327,8 @@ ENDPOINT_CANDIDATES=162.159.193.5:2408,162.159.193.9:2408,162.159.193.8:2408,162
 - `HEALTHCHECK_AUTO_RECOVER_THRESHOLD`
 - `HOST_BIND_IP`
 - `HOST_BIND_PORT`
+- `BIND_ADDR`
+- `BIND_PORT`
 - `RESTART_POLICY=unless-stopped|no`
 
 ## 边界
