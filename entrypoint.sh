@@ -22,6 +22,7 @@ LISTEN_ADDR="${BIND_ADDR:-0.0.0.0}"
 LISTEN_PORT="${BIND_PORT:-1080}"
 HOST_LISTEN_ADDR="${HOST_BIND_IP:-}"
 HOST_LISTEN_PORT="${HOST_BIND_PORT:-}"
+LOCAL_BYPASS_RULE_PRIORITY=97
 WARP_LICENSE_KEY="${WARP_LICENSE_KEY:-}"
 STARTUP_EGRESS_PROBE_RETRIES="${STARTUP_EGRESS_PROBE_RETRIES:-3}"
 STARTUP_EGRESS_PROBE_DELAY="${STARTUP_EGRESS_PROBE_DELAY:-2}"
@@ -439,8 +440,13 @@ ensure_ipv4_bypass() {
   subnet="$1"
   [ -n "$subnet" ] || return 0
 
-  if ! ip rule show | grep -Fq "to ${subnet} lookup main"; then
-    ip rule add to "$subnet" lookup main priority 100
+  # 规则必须早于 wg-quick 默认的 `not fwmark ... lookup 51820`（优先级 99），
+  # 否则发往 RFC1918 / 本地网段的回包会先被送进 WARP，后面的旁路规则永远匹配不到。
+  if ! ip rule show | awk -v subnet="$subnet" -v priority="$LOCAL_BYPASS_RULE_PRIORITY" '
+    $1 == priority ":" && index($0, "to " subnet " lookup main") { found = 1 }
+    END { exit found ? 0 : 1 }
+  '; then
+    ip rule add to "$subnet" lookup main priority "$LOCAL_BYPASS_RULE_PRIORITY"
   fi
 
   iptables -C OUTPUT -d "$subnet" -j ACCEPT >/dev/null 2>&1 || \
@@ -451,8 +457,11 @@ ensure_ipv6_bypass() {
   subnet="$1"
   [ -n "$subnet" ] || return 0
 
-  if ! ip -6 rule show | grep -Fq "to ${subnet} lookup main"; then
-    ip -6 rule add to "$subnet" lookup main priority 100
+  if ! ip -6 rule show | awk -v subnet="$subnet" -v priority="$LOCAL_BYPASS_RULE_PRIORITY" '
+    $1 == priority ":" && index($0, "to " subnet " lookup main") { found = 1 }
+    END { exit found ? 0 : 1 }
+  '; then
+    ip -6 rule add to "$subnet" lookup main priority "$LOCAL_BYPASS_RULE_PRIORITY"
   fi
 
   ip6tables -C OUTPUT -d "$subnet" -j ACCEPT >/dev/null 2>&1 || \
