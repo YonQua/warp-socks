@@ -1,6 +1,11 @@
 #!/bin/sh
 set -eu
 
+SCRIPT_DIR="$(CDPATH= cd -- "$(dirname "$0")" && pwd)"
+COMMON_SH="${SCRIPT_DIR}/lib/warp-common.sh"
+[ -f "$COMMON_SH" ] || COMMON_SH="/usr/local/lib/warp-common.sh"
+. "$COMMON_SH"
+
 WG_DIR="/etc/wireguard"
 WG_CONF="${WG_DIR}/wg0.conf"
 ACCOUNT_JSON="${WG_DIR}/account.json"
@@ -33,30 +38,6 @@ warn() {
 fail() {
   printf '%s %s\n' "==> [warp-socks][ERROR]" "$*" >&2
   exit 1
-}
-
-is_true() {
-  case "${1:-0}" in
-    1|true|TRUE|yes|YES|on|ON)
-      return 0
-      ;;
-    *)
-      return 1
-      ;;
-  esac
-}
-
-sanitize_positive_int() {
-  value="$1"
-  fallback="$2"
-  case "$value" in
-    ''|*[!0-9]*|0)
-      printf '%s' "$fallback"
-      ;;
-    *)
-      printf '%s' "$value"
-      ;;
-  esac
 }
 
 prepare_runtime() {
@@ -170,6 +151,7 @@ clear_backend_state() {
 }
 
 detect_requested_backend() {
+  existing_backend="$1"
   case "$AUTH_MODE" in
     auto)
       if [ -n "${TEAMS_TOKEN:-}" ]; then
@@ -179,17 +161,19 @@ detect_requested_backend() {
         printf 'teams'
       elif [ -n "$WARP_LICENSE_KEY" ]; then
         printf 'wgcf-plus'
+      elif [ -n "$existing_backend" ]; then
+        printf '%s' "$existing_backend"
       else
         printf 'wgcf-free'
       fi
       ;;
     teams)
-      [ -n "${TEAMS_TOKEN:-}" ] || fail "AUTH_MODE=teams 时必须提供 TEAMS_TOKEN。"
+      [ -n "${TEAMS_TOKEN:-}" ] || [ "$existing_backend" = "teams" ] || fail "AUTH_MODE=teams 时必须提供 TEAMS_TOKEN，或已有可复用的 teams 持久化状态。"
       [ -n "$WARP_LICENSE_KEY" ] && warn "AUTH_MODE=teams 已显式指定，忽略 WARP_LICENSE_KEY。"
       printf 'teams'
       ;;
     wgcf-plus)
-      [ -n "$WARP_LICENSE_KEY" ] || fail "AUTH_MODE=wgcf-plus 时必须提供 WARP_LICENSE_KEY。"
+      [ -n "$WARP_LICENSE_KEY" ] || [ "$existing_backend" = "wgcf-plus" ] || fail "AUTH_MODE=wgcf-plus 时必须提供 WARP_LICENSE_KEY，或已有可复用的 wgcf-plus 持久化状态。"
       [ -n "${TEAMS_TOKEN:-}" ] && warn "AUTH_MODE=wgcf-plus 已显式指定，忽略 TEAMS_TOKEN。"
       printf 'wgcf-plus'
       ;;
@@ -487,8 +471,7 @@ ensure_local_network_bypass() {
 
 probe_egress_ip() {
   timeout_seconds="$1"
-  trace="$(curl -s --max-time "$timeout_seconds" https://1.1.1.1/cdn-cgi/trace || true)"
-  printf '%s\n' "$trace" | sed -n 's/^ip=\(.*\)$/\1/p' | head -n 1
+  probe_direct_trace_ip "$timeout_seconds"
 }
 
 wait_for_egress_ready() {
@@ -535,7 +518,7 @@ start_socks5() {
 mkdir -p "$WG_DIR"
 prepare_runtime
 
-requested_backend="$(detect_requested_backend)"
+requested_backend="$(detect_requested_backend "$(current_state_backend)")"
 log "当前注册后端: ${requested_backend}"
 ensure_backend_state "$requested_backend"
 

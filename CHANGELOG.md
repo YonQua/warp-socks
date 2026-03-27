@@ -6,6 +6,8 @@
 - healthcheck 现在会区分 `socks5h` 远端解析路径与 `socks5` 本地解析路径，并在失败日志里补充最近握手时间与连续失败次数
 - `compose.yaml` 与 `.env.example` 新增 `HEALTHCHECK_AUTO_RECOVER`、`HEALTHCHECK_AUTO_RECOVER_THRESHOLD`，允许显式关闭自动恢复或调整阈值
 - 启动阶段新增出口就绪门禁：连续探测拿不到出口 IP 时，不再继续启动 `microsocks`，而是直接退出容器等待重试
+- 将 `entrypoint.sh` 与 `healthcheck` 的公共探测和参数处理下沉到共享的 `lib/warp-common.sh`，减少脚本间漂移
+- 收正后端选择语义：已有可复用持久化状态时，`AUTH_MODE=auto` / `teams` / `wgcf-plus` 不再过度依赖首次注册凭据
 - README、运行边界与故障排查文档同步更新为“轻量自恢复”语义，并补充固定单 endpoint 时的稳定性边界说明
 - `compose.yaml` 新增直接面向 `docker compose up` 的 `mem_limit`、`cpus` 与 `json-file` 日志滚动限制；`.env.example` 与 README 同步补充 `MEM_LIMIT`、`CPU_LIMIT`、`LOG_MAX_SIZE`、`LOG_MAX_FILE`
 - `compose.yaml` 与 `.env.example` 新增 `STARTUP_EGRESS_PROBE_RETRIES`、`STARTUP_EGRESS_PROBE_DELAY`、`STARTUP_EGRESS_PROBE_TIMEOUT`，允许调整启动阶段的出口探测重试

@@ -74,7 +74,7 @@ docker compose ps
 
 镜像还内置了一个极简 `HEALTHCHECK`：它会在容器内通过本地 SOCKS5 访问 `https://cloudflare.com/cdn-cgi/trace`，并检查是否返回 `warp=on` 或 `warp=plus`。默认情况下，连续失败达到阈值后它会终止容器主进程，交给 Docker 按 `restart` 策略自动拉起容器并重建隧道；如果你只想观测不恢复，可设置 `HEALTHCHECK_AUTO_RECOVER=0`。
 
-当前 `compose.yaml` 还内置了两类运行保护：
+当前 `compose.yaml` 还内置了三类运行保护：
 
 - 基础资源限制：默认 `MEM_LIMIT=256m`、`CPU_LIMIT=0.50`
 - 容器日志滚动：默认 `json-file`，`LOG_MAX_SIZE=1m`、`LOG_MAX_FILE=1`
@@ -139,6 +139,7 @@ com.cloudflare.warp://<team-name>.cloudflareaccess.com/auth?token=...
 - `registration token` 是短时效凭据，只用于首次注册。
 - `WARP_LICENSE_KEY` 只在首次 `wgcf-plus` 注册或你主动更新绑定时需要；成功后会随着本地持久化状态一起复用。
 - `wgcf-plus` 走的是社区 `wgcf` 工具链，不是 Cloudflare 官方 `warp-cli registration license` 容器化封装。
+- 在已有可复用持久化状态时，`AUTH_MODE=auto` 会优先复用当前后端；`AUTH_MODE=teams` / `wgcf-plus` 也不再强制要求重复提供首次注册时的凭据。
 
 ### 2. 运行与安全
 

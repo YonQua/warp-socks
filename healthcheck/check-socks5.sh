@@ -1,6 +1,11 @@
 #!/bin/sh
 set -eu
 
+SCRIPT_DIR="$(CDPATH= cd -- "$(dirname "$0")" && pwd)"
+COMMON_SH="${SCRIPT_DIR}/../lib/warp-common.sh"
+[ -f "$COMMON_SH" ] || COMMON_SH="/usr/local/lib/warp-common.sh"
+. "$COMMON_SH"
+
 port="${BIND_PORT:-1080}"
 trace_url="https://cloudflare.com/cdn-cgi/trace"
 state_dir="/tmp/warp-socks-healthcheck"
@@ -10,30 +15,6 @@ failure_threshold="${HEALTHCHECK_AUTO_RECOVER_THRESHOLD:-3}"
 
 log() {
   printf '%s %s\n' "==> [warp-socks][healthcheck]" "$*" >&2
-}
-
-is_true() {
-  case "${1:-0}" in
-    1|true|TRUE|yes|YES|on|ON)
-      return 0
-      ;;
-    *)
-      return 1
-      ;;
-  esac
-}
-
-sanitize_positive_int() {
-  value="$1"
-  fallback="$2"
-  case "$value" in
-    ''|*[!0-9]*|0)
-      printf '%s' "$fallback"
-      ;;
-    *)
-      printf '%s' "$value"
-      ;;
-  esac
 }
 
 read_fail_count() {
@@ -60,53 +41,6 @@ clear_fail_count() {
   rm -f "$fail_count_file"
 }
 
-probe_trace() {
-  mode="$1"
-  trace_file="$(mktemp)"
-  err_file="$(mktemp)"
-  reason=""
-
-  if [ "$mode" = "remote_dns" ]; then
-    if ! curl \
-      --silent \
-      --show-error \
-      --fail \
-      --max-time 10 \
-      --socks5-hostname "127.0.0.1:${port}" \
-      "$trace_url" \
-      >"$trace_file" \
-      2>"$err_file"; then
-      reason="$(tr '\n' ' ' <"$err_file" | tr -s ' ' | cut -c 1-180)"
-    fi
-  else
-    if ! curl \
-      --silent \
-      --show-error \
-      --fail \
-      --max-time 10 \
-      --socks5 "127.0.0.1:${port}" \
-      "$trace_url" \
-      >"$trace_file" \
-      2>"$err_file"; then
-      reason="$(tr '\n' ' ' <"$err_file" | tr -s ' ' | cut -c 1-180)"
-    fi
-  fi
-
-  if [ -z "$reason" ] && grep -qE '^warp=(on|plus)$' "$trace_file"; then
-    rm -f "$trace_file" "$err_file"
-    return 0
-  fi
-
-  if [ -z "$reason" ]; then
-    reason="$(tr '\n' ' ' <"$trace_file" | tr -s ' ' | cut -c 1-180)"
-    [ -n "$reason" ] || reason="响应缺少 warp 标记。"
-  fi
-
-  rm -f "$trace_file" "$err_file"
-  printf '%s' "$reason"
-  return 1
-}
-
 latest_handshake() {
   ts="$(wg show wg0 latest-handshakes 2>/dev/null | awk 'NR==1 {print $2}')"
   case "${ts:-}" in
@@ -124,7 +58,7 @@ mkdir -p "$state_dir"
 previous_failures="$(read_fail_count)"
 
 remote_reason=""
-if remote_reason="$(probe_trace remote_dns)"; then
+if remote_reason="$(probe_socks_trace remote_dns "$port" 10 "$trace_url")"; then
   if [ "$previous_failures" -gt 0 ]; then
     log "远端解析路径恢复，已清除连续失败计数 ${previous_failures}。"
   fi
@@ -134,7 +68,7 @@ fi
 
 local_dns_ok=0
 local_reason=""
-if local_reason="$(probe_trace local_dns)"; then
+if local_reason="$(probe_socks_trace local_dns "$port" 10 "$trace_url")"; then
   local_dns_ok=1
 else
   :

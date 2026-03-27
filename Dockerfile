@@ -41,10 +41,11 @@ RUN apk add --no-cache ca-certificates curl iproute2 iptables wireguard-tools \
  && chmod +x /usr/local/bin/wgcf
 
 COPY --from=builder /src/microsocks/microsocks /usr/local/bin/microsocks
+COPY lib/warp-common.sh /usr/local/lib/warp-common.sh
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh
 COPY healthcheck/check-socks5.sh /usr/local/bin/healthcheck-check-socks5.sh
 
-RUN chmod +x /usr/local/bin/entrypoint.sh /usr/local/bin/healthcheck-check-socks5.sh
+RUN chmod +x /usr/local/bin/entrypoint.sh /usr/local/bin/healthcheck-check-socks5.sh /usr/local/lib/warp-common.sh
 
 HEALTHCHECK --interval=30s --timeout=12s --start-period=20s --retries=3 \
   CMD ["/usr/local/bin/healthcheck-check-socks5.sh"]
