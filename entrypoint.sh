@@ -22,7 +22,7 @@ LISTEN_ADDR="${BIND_ADDR:-0.0.0.0}"
 LISTEN_PORT="${BIND_PORT:-1080}"
 HOST_LISTEN_ADDR="${HOST_BIND_IP:-}"
 HOST_LISTEN_PORT="${HOST_BIND_PORT:-}"
-LOCAL_BYPASS_RULE_PRIORITY=97
+LOCAL_BYPASS_RULE_PRIORITY_FALLBACK=97
 WARP_LICENSE_KEY="${WARP_LICENSE_KEY:-}"
 STARTUP_EGRESS_PROBE_RETRIES="${STARTUP_EGRESS_PROBE_RETRIES:-3}"
 STARTUP_EGRESS_PROBE_DELAY="${STARTUP_EGRESS_PROBE_DELAY:-2}"
@@ -438,15 +438,17 @@ build_wgcf_wg_config() {
 
 ensure_ipv4_bypass() {
   subnet="$1"
+  priority="${2:-}"
   [ -n "$subnet" ] || return 0
 
-  # 规则必须早于 wg-quick 默认的 `not fwmark ... lookup 51820`（优先级 99），
-  # 否则发往 RFC1918 / 本地网段的回包会先被送进 WARP，后面的旁路规则永远匹配不到。
-  if ! ip rule show | awk -v subnet="$subnet" -v priority="$LOCAL_BYPASS_RULE_PRIORITY" '
+  [ -n "$priority" ] || priority="$(detect_local_bypass_rule_priority ipv4 "$LOCAL_BYPASS_RULE_PRIORITY_FALLBACK")"
+  remove_stale_bypass_rules ipv4 "$subnet" "$priority"
+
+  if ! ip rule show | awk -v subnet="$subnet" -v priority="$priority" '
     $1 == priority ":" && index($0, "to " subnet " lookup main") { found = 1 }
     END { exit found ? 0 : 1 }
   '; then
-    ip rule add to "$subnet" lookup main priority "$LOCAL_BYPASS_RULE_PRIORITY"
+    ip rule add to "$subnet" lookup main priority "$priority"
   fi
 
   iptables -C OUTPUT -d "$subnet" -j ACCEPT >/dev/null 2>&1 || \
@@ -455,35 +457,172 @@ ensure_ipv4_bypass() {
 
 ensure_ipv6_bypass() {
   subnet="$1"
+  priority="${2:-}"
   [ -n "$subnet" ] || return 0
 
-  if ! ip -6 rule show | awk -v subnet="$subnet" -v priority="$LOCAL_BYPASS_RULE_PRIORITY" '
+  [ -n "$priority" ] || priority="$(detect_local_bypass_rule_priority ipv6 "$LOCAL_BYPASS_RULE_PRIORITY_FALLBACK")"
+  remove_stale_bypass_rules ipv6 "$subnet" "$priority"
+
+  if ! ip -6 rule show | awk -v subnet="$subnet" -v priority="$priority" '
     $1 == priority ":" && index($0, "to " subnet " lookup main") { found = 1 }
     END { exit found ? 0 : 1 }
   '; then
-    ip -6 rule add to "$subnet" lookup main priority "$LOCAL_BYPASS_RULE_PRIORITY"
+    ip -6 rule add to "$subnet" lookup main priority "$priority"
   fi
 
   ip6tables -C OUTPUT -d "$subnet" -j ACCEPT >/dev/null 2>&1 || \
     ip6tables -I OUTPUT 1 -d "$subnet" -j ACCEPT
 }
 
-ensure_local_network_bypass() {
+detect_local_bypass_rule_priority() {
+  family="$1"
+  fallback="$2"
+
+  if [ "$family" = "ipv6" ]; then
+    rule_output="$(ip -6 rule show)"
+  else
+    rule_output="$(ip rule show)"
+  fi
+
+  current_priority="$(printf '%s\n' "$rule_output" | awk '
+    /lookup main suppress_prefixlength 0/ || (/fwmark/ && /lookup 51820/) {
+      priority = $1
+      sub(/:$/, "", priority)
+      if (priority ~ /^[0-9]+$/ && (min == "" || priority + 0 < min)) {
+        min = priority + 0
+      }
+    }
+    END {
+      if (min != "") {
+        print min
+      }
+    }
+  ')"
+
+  case "$current_priority" in
+    ''|*[!0-9]*|0|1)
+      printf '%s' "$fallback"
+      ;;
+    *)
+      printf '%s' $((current_priority - 1))
+      ;;
+  esac
+}
+
+remove_stale_bypass_rules() {
+  family="$1"
+  subnet="$2"
+  keep_priority="$3"
+  [ -n "$subnet" ] || return 0
+  [ -n "$keep_priority" ] || return 0
+
+  if [ "$family" = "ipv6" ]; then
+    ip -6 rule show | awk -v subnet="$subnet" -v keep_priority="$keep_priority" '
+      index($0, "to " subnet " lookup main") {
+        priority = $1
+        sub(/:$/, "", priority)
+        if (priority ~ /^[0-9]+$/ && priority != keep_priority) {
+          print priority
+        }
+      }
+    ' | while IFS= read -r stale_priority; do
+      [ -n "$stale_priority" ] || continue
+      ip -6 rule del to "$subnet" lookup main priority "$stale_priority" 2>/dev/null || true
+    done
+  else
+    ip rule show | awk -v subnet="$subnet" -v keep_priority="$keep_priority" '
+      index($0, "to " subnet " lookup main") {
+        priority = $1
+        sub(/:$/, "", priority)
+        if (priority ~ /^[0-9]+$/ && priority != keep_priority) {
+          print priority
+        }
+      }
+    ' | while IFS= read -r stale_priority; do
+      [ -n "$stale_priority" ] || continue
+      ip rule del to "$subnet" lookup main priority "$stale_priority" 2>/dev/null || true
+    done
+  fi
+}
+
+remove_bypass_rules() {
+  family="$1"
+  subnet="$2"
+  [ -n "$subnet" ] || return 0
+
+  if [ "$family" = "ipv6" ]; then
+    ip -6 rule show | awk -v subnet="$subnet" '
+      index($0, "to " subnet " lookup main") {
+        priority = $1
+        sub(/:$/, "", priority)
+        if (priority ~ /^[0-9]+$/) {
+          print priority
+        }
+      }
+    ' | while IFS= read -r stale_priority; do
+      [ -n "$stale_priority" ] || continue
+      ip -6 rule del to "$subnet" lookup main priority "$stale_priority" 2>/dev/null || true
+    done
+
+    while ip6tables -C OUTPUT -d "$subnet" -j ACCEPT >/dev/null 2>&1; do
+      ip6tables -D OUTPUT -d "$subnet" -j ACCEPT >/dev/null 2>&1 || true
+    done
+  else
+    ip rule show | awk -v subnet="$subnet" '
+      index($0, "to " subnet " lookup main") {
+        priority = $1
+        sub(/:$/, "", priority)
+        if (priority ~ /^[0-9]+$/) {
+          print priority
+        }
+      }
+    ' | while IFS= read -r stale_priority; do
+      [ -n "$stale_priority" ] || continue
+      ip rule del to "$subnet" lookup main priority "$stale_priority" 2>/dev/null || true
+    done
+
+    while iptables -C OUTPUT -d "$subnet" -j ACCEPT >/dev/null 2>&1; do
+      iptables -D OUTPUT -d "$subnet" -j ACCEPT >/dev/null 2>&1 || true
+    done
+  fi
+}
+
+cleanup_local_network_bypass() {
   primary_v4_subnet="$(ip -4 route show dev eth0 proto kernel scope link | awk 'NR==1 {print $1}')"
   primary_v6_subnet="$(ip -6 route show dev eth0 proto kernel | awk '/^[0-9a-fA-F:]+\// {print $1; exit}')"
 
-  ensure_ipv4_bypass "$primary_v4_subnet"
-  ensure_ipv4_bypass "10.0.0.0/8"
-  ensure_ipv4_bypass "172.16.0.0/12"
-  ensure_ipv4_bypass "192.168.0.0/16"
-  ensure_ipv4_bypass "100.64.0.0/10"
-  ensure_ipv4_bypass "169.254.0.0/16"
+  remove_bypass_rules ipv4 "$primary_v4_subnet"
+  remove_bypass_rules ipv4 "10.0.0.0/8"
+  remove_bypass_rules ipv4 "172.16.0.0/12"
+  remove_bypass_rules ipv4 "192.168.0.0/16"
+  remove_bypass_rules ipv4 "100.64.0.0/10"
+  remove_bypass_rules ipv4 "169.254.0.0/16"
 
-  ensure_ipv6_bypass "$primary_v6_subnet"
-  ensure_ipv6_bypass "fc00::/7"
-  ensure_ipv6_bypass "fe80::/10"
+  remove_bypass_rules ipv6 "$primary_v6_subnet"
+  remove_bypass_rules ipv6 "fc00::/7"
+  remove_bypass_rules ipv6 "fe80::/10"
+}
 
-  log "已为本地网络添加旁路: ${primary_v4_subnet:-none}${primary_v6_subnet:+, ${primary_v6_subnet}} + RFC1918/ULA"
+ensure_local_network_bypass() {
+  primary_v4_subnet="$(ip -4 route show dev eth0 proto kernel scope link | awk 'NR==1 {print $1}')"
+  primary_v6_subnet="$(ip -6 route show dev eth0 proto kernel | awk '/^[0-9a-fA-F:]+\// {print $1; exit}')"
+  ipv4_bypass_priority="$(detect_local_bypass_rule_priority ipv4 "$LOCAL_BYPASS_RULE_PRIORITY_FALLBACK")"
+  ipv6_bypass_priority="$(detect_local_bypass_rule_priority ipv6 "$LOCAL_BYPASS_RULE_PRIORITY_FALLBACK")"
+
+  # 旁路规则必须动态保持在当前 wg-quick 自动规则之前。
+  # 否则 endpoint 轮换或同一容器内重复 down/up 后，wg-quick 新拿到的更高优先级规则仍会把局域网回包抢走。
+  ensure_ipv4_bypass "$primary_v4_subnet" "$ipv4_bypass_priority"
+  ensure_ipv4_bypass "10.0.0.0/8" "$ipv4_bypass_priority"
+  ensure_ipv4_bypass "172.16.0.0/12" "$ipv4_bypass_priority"
+  ensure_ipv4_bypass "192.168.0.0/16" "$ipv4_bypass_priority"
+  ensure_ipv4_bypass "100.64.0.0/10" "$ipv4_bypass_priority"
+  ensure_ipv4_bypass "169.254.0.0/16" "$ipv4_bypass_priority"
+
+  ensure_ipv6_bypass "$primary_v6_subnet" "$ipv6_bypass_priority"
+  ensure_ipv6_bypass "fc00::/7" "$ipv6_bypass_priority"
+  ensure_ipv6_bypass "fe80::/10" "$ipv6_bypass_priority"
+
+  log "已为本地网络添加旁路: ${primary_v4_subnet:-none}${primary_v6_subnet:+, ${primary_v6_subnet}} + RFC1918/ULA（策略优先级 v4=${ipv4_bypass_priority}, v6=${ipv6_bypass_priority}）"
 }
 
 wait_for_egress_ready() {
@@ -548,6 +687,7 @@ bring_down_tunnel_if_present() {
   if ip link show wg0 >/dev/null 2>&1; then
     wg-quick down wg0 >/dev/null 2>&1 || true
   fi
+  cleanup_local_network_bypass
 }
 
 start_tunnel() {

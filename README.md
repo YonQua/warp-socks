@@ -165,7 +165,7 @@ com.cloudflare.warp://<team-name>.cloudflareaccess.com/auth?token=...
 - 当前仓库只认 `.env` 里的 `ENDPOINT_IP` / `ENDPOINT_CANDIDATES`，不再自动读取 `./wireguard/endpoint-candidates.txt` 这类隐式缓存文件。
 - 启动阶段会先做公网出口探测；如果连续探测都拿不到出口 IP，容器会直接退出并等待 Docker 重试，不会继续启动一个不可用的 SOCKS5 端口。
 - 当前仓库只有一个服务，Compose 默认网络已经足够；因此 `compose.yaml` 没有额外声明自定义 `networks`，避免增加无运行收益的配置面。
-- 当前版本会把 RFC1918 / ULA 的旁路 `ip rule` 安装到 `wg-quick` 默认 `fwmark` 规则之前，确保局域网客户端访问宿主机发布端口时，回包不会误入 WARP 默认路由。
+- 当前版本会动态读取 `wg-quick` 当前安装出来的策略路由优先级，把 RFC1918 / ULA 的旁路 `ip rule` 提前装到它前面，并清理旧的错误优先级残留，确保局域网客户端访问宿主机发布端口时，回包不会误入 WARP 默认路由。
 
 ### 3. 阅读路径
 
