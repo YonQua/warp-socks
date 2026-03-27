@@ -26,6 +26,10 @@ STARTUP_EGRESS_PROBE_DELAY="${STARTUP_EGRESS_PROBE_DELAY:-2}"
 STARTUP_EGRESS_PROBE_TIMEOUT="${STARTUP_EGRESS_PROBE_TIMEOUT:-5}"
 # 这是注册 API 的兼容客户端标识，不等同于 Cloudflare 官方桌面客户端的发布版本号。
 CF_CLIENT_VERSION="${CF_CLIENT_VERSION:-a-6.10-2158}"
+CURRENT_ENDPOINT_OVERRIDE=""
+CURRENT_ENDPOINT_INDEX=""
+CURRENT_ENDPOINT_TOTAL="0"
+VALIDATE_ENDPOINT_ONLY="${VALIDATE_ENDPOINT_ONLY:-0}"
 
 log() {
   printf '%s %s\n' "==> [warp-socks]" "$*"
@@ -38,6 +42,13 @@ warn() {
 fail() {
   printf '%s %s\n' "==> [warp-socks][ERROR]" "$*" >&2
   exit 1
+}
+
+log_endpoint_candidate_plan() {
+  candidate_total="$(endpoint_candidate_count)"
+  if has_explicit_endpoint_candidates && [ "$candidate_total" -gt 0 ]; then
+    log "检测到显式 endpoint 候选，共 ${candidate_total} 个。"
+  fi
 }
 
 prepare_runtime() {
@@ -388,11 +399,6 @@ EOF
 
   sed -i '/^DNS.*/d' "$WG_CONF"
 
-  if [ -n "${ENDPOINT_IP:-}" ]; then
-    sed -i "s#^Endpoint = .*#Endpoint = ${ENDPOINT_IP}#" "$WG_CONF"
-    log "已覆盖 Endpoint 为 ${ENDPOINT_IP}"
-  fi
-
   chmod 600 "$WG_CONF"
   [ -f "$STATE_FILE" ] && chmod 600 "$STATE_FILE"
 }
@@ -469,11 +475,6 @@ ensure_local_network_bypass() {
   log "已为本地网络添加旁路: ${primary_v4_subnet:-none}${primary_v6_subnet:+, ${primary_v6_subnet}} + RFC1918/ULA"
 }
 
-probe_egress_ip() {
-  timeout_seconds="$1"
-  probe_direct_trace_ip "$timeout_seconds"
-}
-
 wait_for_egress_ready() {
   probe_retries="$(sanitize_positive_int "$STARTUP_EGRESS_PROBE_RETRIES" 3)"
   probe_delay="$(sanitize_positive_int "$STARTUP_EGRESS_PROBE_DELAY" 2)"
@@ -483,7 +484,7 @@ wait_for_egress_ready() {
   # 这里探测的是隧道起来后的第一条真实公网流量。
   # 如果连续探测都拿不到出口 IP，就不要继续启动 socks5，直接退出交给 Docker 重试。
   while [ "$attempt" -le "$probe_retries" ]; do
-    egress_ip="$(probe_egress_ip "$probe_timeout")"
+    egress_ip="$(probe_direct_trace_ip "$probe_timeout")"
     if [ -n "$egress_ip" ]; then
       log "当前出口 IP: ${egress_ip}"
       return 0
@@ -496,18 +497,80 @@ wait_for_egress_ready() {
     attempt=$((attempt + 1))
   done
 
-  fail "启动后连续 ${probe_retries} 次出口探测仍未获取到出口 IP，判定隧道尚不可用，退出等待容器重启。"
+  return 1
 }
 
-start_tunnel() {
+select_endpoint_candidate_by_index() {
+  requested_index="$(sanitize_positive_int "${1:-0}" 0)"
+  CURRENT_ENDPOINT_OVERRIDE=""
+  CURRENT_ENDPOINT_INDEX=""
+  CURRENT_ENDPOINT_TOTAL="$(endpoint_candidate_count)"
+
+  if [ "$CURRENT_ENDPOINT_TOTAL" -le 0 ]; then
+    return 1
+  fi
+
+  if [ "$requested_index" -le 0 ] || [ "$requested_index" -gt "$CURRENT_ENDPOINT_TOTAL" ]; then
+    requested_index=1
+  fi
+
+  CURRENT_ENDPOINT_INDEX="$requested_index"
+  CURRENT_ENDPOINT_OVERRIDE="$(endpoint_candidate_at "$CURRENT_ENDPOINT_INDEX")"
+  [ -n "$CURRENT_ENDPOINT_OVERRIDE" ]
+}
+
+apply_endpoint_override_to_wg_conf() {
+  requested_index="${1:-}"
+  if ! select_endpoint_candidate_by_index "$requested_index"; then
+    return 1
+  fi
+
+  sed -i "s#^Endpoint = .*#Endpoint = ${CURRENT_ENDPOINT_OVERRIDE}#" "$WG_CONF"
+  if [ "$CURRENT_ENDPOINT_TOTAL" -gt 1 ]; then
+    log "已覆盖 Endpoint 为 ${CURRENT_ENDPOINT_OVERRIDE}（候选 ${CURRENT_ENDPOINT_INDEX}/${CURRENT_ENDPOINT_TOTAL}）"
+  else
+    log "已覆盖 Endpoint 为 ${CURRENT_ENDPOINT_OVERRIDE}"
+  fi
+}
+
+bring_down_tunnel_if_present() {
   if ip link show wg0 >/dev/null 2>&1; then
     wg-quick down wg0 >/dev/null 2>&1 || true
   fi
+}
 
-  log "正在启动 wg0"
-  wg-quick up wg0
-  ensure_local_network_bypass
-  wait_for_egress_ready
+start_tunnel() {
+  candidate_count="$(endpoint_candidate_count)"
+  # 无候选时视为单次尝试（不覆盖 Endpoint）；有候选时依次轮询每个候选。
+  max_attempts="$([ "$candidate_count" -le 0 ] && echo 1 || echo "$candidate_count")"
+  index=1
+
+  while [ "$index" -le "$max_attempts" ]; do
+    bring_down_tunnel_if_present
+    [ "$candidate_count" -gt 0 ] && apply_endpoint_override_to_wg_conf "$index"
+
+    log "正在启动 wg0"
+    wg-quick up wg0
+    ensure_local_network_bypass
+
+    if wait_for_egress_ready; then
+      return 0
+    fi
+
+    warn "启动后连续 ${STARTUP_EGRESS_PROBE_RETRIES} 次出口探测仍未获取到出口 IP。"
+    bring_down_tunnel_if_present
+
+    if [ "$candidate_count" -gt 1 ] && [ "$index" -lt "$candidate_count" ]; then
+      failed_endpoint="${CURRENT_ENDPOINT_OVERRIDE:-unknown}"
+      next_index=$((index + 1))
+      next_endpoint="$(endpoint_candidate_at "$next_index")"
+      warn "当前 endpoint ${failed_endpoint} 未通过出口探测，切换到候选 ${next_index}/${candidate_count}: ${next_endpoint:-unknown}。"
+    fi
+
+    index=$((index + 1))
+  done
+
+  fail "启动后连续 ${STARTUP_EGRESS_PROBE_RETRIES} 次出口探测仍未获取到出口 IP，判定隧道尚不可用，退出等待容器重启。"
 }
 
 start_socks5() {
@@ -540,5 +603,10 @@ case "$requested_backend" in
     ;;
 esac
 
+log_endpoint_candidate_plan
 start_tunnel
+if is_true "$VALIDATE_ENDPOINT_ONLY"; then
+  log "验证模式已通过出口探测，不启动 socks5。"
+  exit 0
+fi
 start_socks5

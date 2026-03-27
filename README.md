@@ -80,7 +80,7 @@ docker compose ps
 - 容器日志滚动：默认 `json-file`，`LOG_MAX_SIZE=1m`、`LOG_MAX_FILE=1`
 - 启动出口探测：默认 `STARTUP_EGRESS_PROBE_RETRIES=3`、`STARTUP_EGRESS_PROBE_DELAY=2`、`STARTUP_EGRESS_PROBE_TIMEOUT=5`
 
-这两类限制都可以通过 `.env` 覆盖。
+这些参数都可以通过 `.env` 覆盖。
 
 6. 验证代理：
 
@@ -146,6 +146,8 @@ com.cloudflare.warp://<team-name>.cloudflareaccess.com/auth?token=...
 - 运行状态会持久化到 `./wireguard`；目录里包含私钥和账户信息，`.env` 里可能包含短时效 token，两者都不要提交到版本库。
 - 默认端口映射是 `127.0.0.1:1080 -> 1080`，除非你已经有明确的网络访问控制，否则不要改成 `HOST_BIND_IP=0.0.0.0`。
 - `ENDPOINT_IP` 默认建议留空；只有在默认端点握手失败，或者你所在网络环境明确只能稳定握手某个固定 endpoint 时，才手动覆盖。
+- 如果单个固定 endpoint 仍会抖动，可以改用 `ENDPOINT_CANDIDATES=ip1:port,ip2:port`；启动失败时会在同一次启动流程里按顺序尝试后续候选，运行中健康检查连续失败后则会重启容器，并重新按你写的顺序再尝试一轮。
+- 当前仓库只认 `.env` 里的 `ENDPOINT_IP` / `ENDPOINT_CANDIDATES`，不再自动读取 `./wireguard/endpoint-candidates.txt` 这类隐式缓存文件。
 - 启动阶段会先做公网出口探测；如果连续探测都拿不到出口 IP，容器会直接退出并等待 Docker 重试，不会继续启动一个不可用的 SOCKS5 端口。
 - 当前仓库只有一个服务，Compose 默认网络已经足够；因此 `compose.yaml` 没有额外声明自定义 `networks`，避免增加无运行收益的配置面。
 
@@ -197,6 +199,7 @@ docker compose logs --tail=120
 - 注册后端状态与当前请求不一致
 - 启动阶段的出口探测连续失败，容器已经提前退出等待重试
 - 固定 endpoint 当前网络不可达或短时抖动
+- 固定 endpoint 只有单个候选，恢复时仍会反复撞回同一个端点
 - 代理端口虽然在监听，但出口已经失效
 
 日志里重点看两类线索：
@@ -221,15 +224,28 @@ curl --socks5 127.0.0.1:1080 https://cloudflare.com/cdn-cgi/trace
 
 ### 4. endpoint 选择建议
 
-`ENDPOINT_IP` 默认更适合排障时临时覆盖；但如果你所在网络环境明确只能握手某个固定 endpoint，也可以常驻配置。当前这台机器上，`162.159.193.7:2408` 已实测可用，因此 `.env.example` 里保留了注释示例。
+`ENDPOINT_IP` 默认更适合排障时临时覆盖；但如果你所在网络环境明确只能握手固定 endpoint，也可以常驻配置。对“单个固定端点偶发失活”的环境，当前仓库已经支持 `ENDPOINT_CANDIDATES` 顺序尝试：启动阶段某个候选连续拿不到出口 IP，会在同一次启动流程里切到下一个；运行中连续 healthcheck 失败达到阈值后，容器会重启，并重新按你写的候选顺序再尝试一轮。
 
 建议顺序：
 
 1. 能走默认 endpoint 就优先留空 `ENDPOINT_IP`
-2. 如果当前网络已知只有固定端点可用，再设置 `ENDPOINT_IP=ip:port`
-3. 如果必须常驻固定 endpoint，建议保持 `HEALTHCHECK_AUTO_RECOVER=1`
-4. 如果启动阶段经常拿不到出口 IP，可先调大 `STARTUP_EGRESS_PROBE_RETRIES` / `STARTUP_EGRESS_PROBE_DELAY`
-5. 如果仍频繁掉线，再考虑第二阶段的多 endpoint 轮换
+2. 如果当前网络已知只有固定端点可用，再先设置 `ENDPOINT_IP=ip:port`
+3. 如果单个固定 endpoint 仍会抖动，优先改用少量显式 `ENDPOINT_CANDIDATES=ip1:port,ip2:port`
+4. 如果你有外部筛好的 endpoint，就显式写进 `ENDPOINT_CANDIDATES`
+5. 使用固定 endpoint 或候选缓存时，建议保持 `HEALTHCHECK_AUTO_RECOVER=1`
+6. 如果启动阶段经常拿不到出口 IP，再调大 `STARTUP_EGRESS_PROBE_RETRIES` / `STARTUP_EGRESS_PROBE_DELAY`
+
+当前环境这轮实测里，更适合作为起点的是下面这组显式候选：
+
+```env
+ENDPOINT_CANDIDATES=162.159.193.5:2408,162.159.193.9:2408,162.159.193.8:2408,162.159.193.3:2408
+```
+
+这里的含义是“当前网络条件下验证过至少一次，其中 `162.159.193.5:2408` 最稳”，不是永久承诺。像 `162.159.193.9:2408`、`162.159.193.8:2408`、`162.159.193.3:2408` 目前更接近备选池，而不是和 `.5` 一样稳。
+
+`ENDPOINT_IP` 也支持主机名，例如第三方聚合域名 `engage.nanocat.me:2408`。但这种方式只是把 DNS 选择交给第三方，不等于当前项目自己完成了稳定优选；而且我在本地当前环境实测过一次，该 hostname 这次解析到的实际结果并没有通过出口探测。因此它更适合作为个人临时尝试，不建议写成仓库默认值。
+
+如果你已经有外部筛好的 endpoint，请直接把它们写进 `.env` 里的 `ENDPOINT_CANDIDATES`。当前仓库不再自动读取 `./wireguard/endpoint-candidates.txt`，这样可以避免旧缓存和隐式状态干扰启动结果。
 
 ### 5. 后端切换导致的问题
 
@@ -283,6 +299,7 @@ curl --socks5 127.0.0.1:1080 https://cloudflare.com/cdn-cgi/trace
 - `FORCE_REREGISTER=0|1`
 - `WARP_STACK=ipv4|dual|ipv6`
 - `ENDPOINT_IP=ip:port`
+- `ENDPOINT_CANDIDATES=ip1:port,ip2:port`
 - `STARTUP_EGRESS_PROBE_RETRIES`
 - `STARTUP_EGRESS_PROBE_DELAY`
 - `STARTUP_EGRESS_PROBE_TIMEOUT`

@@ -88,3 +88,30 @@ probe_socks_trace() {
   printf '%s' "$reason"
   return 1
 }
+
+has_explicit_endpoint_candidates() {
+  [ -n "${ENDPOINT_IP:-}" ] || [ -n "${ENDPOINT_CANDIDATES:-}" ]
+}
+
+normalize_endpoint_list() {
+  {
+    printf '%s\n' "${ENDPOINT_IP:-}"
+    printf '%s\n' "${ENDPOINT_CANDIDATES:-}"
+  } \
+    | tr ',' '\n' \
+    | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' \
+    | awk 'NF && !seen[$0]++'
+}
+
+endpoint_candidate_count() {
+  normalize_endpoint_list | awk 'NF {count++} END {print count+0}'
+}
+
+endpoint_candidate_at() {
+  index="$(sanitize_positive_int "${1:-0}" 0)"
+  if [ "$index" -le 0 ]; then
+    return 1
+  fi
+
+  normalize_endpoint_list | sed -n "${index}p" | head -n 1
+}

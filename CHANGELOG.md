@@ -2,6 +2,28 @@
 
 ## 2026-03-27
 
+- 删除自动读取 `wireguard/endpoint-candidates.txt` 与持久化 `endpoint-cursor` 的逻辑，项目重新只认 `.env` 里的 `ENDPOINT_IP` / `ENDPOINT_CANDIDATES`，避免隐藏状态影响启动顺序
+- 删除仓库内置的 endpoint 发现器与握手生成工具，移除 `cmd/discover-endpoints`、`internal/warphandshake`、`go.mod`、`go.sum` 和本地构建产物，项目重新收口为“轻量运行 + 显式 endpoint 候选消费”
+- README / `.env.example` 进一步收口为 `ENDPOINT_IP` 与 `ENDPOINT_CANDIDATES` 两条轻量路径，不再保留仓库自带发现器或隐式缓存文件的使用说明
+- 新增 repo-native `cmd/discover-endpoints`：使用仓库内维护的 WARP CIDR 与端口列表，直接发送 UDP 握手包筛选 `IP:Port` 候选，并按丢包率/延迟排序
+- 发现器新增 `--preset`，默认改为官方 `teams-wireguard` 窄池优先：先扫 `162.159.193.0/24:2408`；原先的大范围多网段多端口扫描改为显式 `--preset wide`
+- 新增 `teams-wireguard-fallback` 与 `consumer-wireguard` 预设，分别对应官方 WireGuard fallback 端口和 consumer/free 窄池
+- README / `.env.example` 当前已收口为“主项目轻量运行 + 显式候选池优先”的路径；发现器保留为可选离线工具，不再作为默认主叙事
+- 发现器默认优先读取 `wireguard/account.json`，按当前账号参数生成更贴近真实环境的握手包；缺失或解析失败时再回退到内置默认握手包
+- 发现器现在改为“两阶段筛选”：先做 UDP 握手缩小候选池，再对前 N 个候选启动临时验证容器，直接复用启动后的 `trace` 出口探测标准；只有真正拿到出口 IP 的候选才会写入缓存
+- 第二阶段验证现在默认附带当前仓库 `.env`，并把临时状态目录放到系统临时目录，减少与真实 `docker compose` 运行条件的漂移，也避免在仓库 `wireguard/` 下堆积 `.validator-*` 残留目录
+- 第二阶段独立验证次数默认从 2 次提高到 3 次，并引入“多数派稳定阈值”判定；当前默认至少成功 `2/3` 次才会进入最终候选池
+- `wireguard/endpoint-discovery.csv` 现在会额外记录第二阶段的成功次数、总次数和成功率，便于直接审查 endpoint 稳定度，而不是只看一次成败
+- 新增本地 endpoint 缓存文件 `wireguard/endpoint-candidates.txt`；当 `.env` 未显式设置 `ENDPOINT_IP` / `ENDPOINT_CANDIDATES` 时，启动链路会自动读取这份缓存
+- `lib/warp-common.sh` 新增 endpoint 缓存读取与 source 判定逻辑，`entrypoint.sh` 会在启动时明确记录当前是使用显式候选还是本地缓存
+- 新增内部包 `internal/warphandshake`，收口账户文件解析、Reserved 提取和真实握手包生成逻辑
+- 删除旧的 `scripts/discover-endpoints.py`、`scripts/optimize-endpoints.sh` 和临时 `cmd/warp-handshake-packet`，只保留 Go 版发现器
+- `.dockerignore` 现在会排除 `cmd/`、`internal/`、`go.mod`、`go.sum`，避免本地发现工具进入 Docker build context
+- 新增 `ENDPOINT_CANDIDATES`，允许预先提供多个固定 endpoint 候选，并在启动阶段按候选顺序轮换
+- 启动阶段的 endpoint 轮换不再依赖整容器重启：当前候选连续拿不到出口 IP 时，会在同一次启动流程里直接切到下一个候选重试
+- healthcheck 在连续失败达到阈值时，若配置了多个 endpoint 候选，会先推进候选游标，再终止 PID 1 触发容器重启
+- `lib/warp-common.sh` 新增 endpoint 候选归一化、去重与游标持久化逻辑，供 `entrypoint.sh` 与 `healthcheck` 共享
+- `.env.example` 与 README 同步补充“先筛出一批可用 endpoint，再交给容器轮换”的使用路径
 - healthcheck 新增连续失败计数，并可在达到阈值后终止 PID 1，交给 Docker 按现有 `restart` 策略自动拉起容器并重建隧道
 - healthcheck 现在会区分 `socks5h` 远端解析路径与 `socks5` 本地解析路径，并在失败日志里补充最近握手时间与连续失败次数
 - `compose.yaml` 与 `.env.example` 新增 `HEALTHCHECK_AUTO_RECOVER`、`HEALTHCHECK_AUTO_RECOVER_THRESHOLD`，允许显式关闭自动恢复或调整阈值

@@ -86,6 +86,10 @@ fi
 log "$message"
 
 if is_true "$auto_recover" && [ "$current_failures" -ge "$failure_threshold" ]; then
+  endpoint_total="$(endpoint_candidate_count)"
+  if [ "$endpoint_total" -gt 1 ]; then
+    log "连续失败达到阈值，容器重启后会按显式 endpoint 候选顺序重新尝试。"
+  fi
   log "连续失败达到阈值，发送 TERM 给 PID 1 触发容器重启。"
   kill -TERM 1 || log "向 PID 1 发送 TERM 失败。"
 fi
