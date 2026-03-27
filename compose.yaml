@@ -8,6 +8,10 @@ services:
     image: warp-socks:latest
     container_name: warp-socks
     restart: ${RESTART_POLICY:-unless-stopped}
+    # 当前仓库的主运行方式是 docker compose up，而不是 Swarm；
+    # 这里直接使用 Compose 服务级限制，避免 deploy.resources 在不同平台上语义漂移。
+    mem_limit: ${MEM_LIMIT:-256m}
+    cpus: ${CPU_LIMIT:-0.50}
     cap_add:
       - NET_ADMIN
       - SYS_MODULE
@@ -27,6 +31,13 @@ services:
       # 兼容注册 API 的客户端标识；默认沿用社区验证过的旧值，需要试新值时可在 .env 覆盖。
       CF_CLIENT_VERSION: ${CF_CLIENT_VERSION:-a-6.10-2158}
       ENDPOINT_IP: ${ENDPOINT_IP:-}
+      HEALTHCHECK_AUTO_RECOVER: ${HEALTHCHECK_AUTO_RECOVER:-1}
+      HEALTHCHECK_AUTO_RECOVER_THRESHOLD: ${HEALTHCHECK_AUTO_RECOVER_THRESHOLD:-3}
+    logging:
+      driver: json-file
+      options:
+        max-size: ${LOG_MAX_SIZE:-1m}
+        max-file: ${LOG_MAX_FILE:-1}
     ports:
       # 默认只绑定到本机，先确保代理可用；需要对外暴露时再改 HOST_BIND_IP=0.0.0.0
       - '${HOST_BIND_IP:-127.0.0.1}:${HOST_BIND_PORT:-1080}:${BIND_PORT:-1080}'
