@@ -94,6 +94,26 @@ curl --socks5 127.0.0.1:1080 https://cloudflare.com/cdn-cgi/trace
 - 所有模式都至少应返回 `warp=on`
 - `teams` 模式通常还会返回 `gateway=on`
 
+## 预构建镜像
+
+当前仓库会通过 GitHub Actions 自动发布 GHCR 镜像，地址是 `ghcr.io/yonqua/warp-socks`。如果你是在别的 VPS 或配置仓库里复用它，建议显式写版本 tag，而不是长期跟随 `latest`。
+
+例如，把 `compose.yaml` 里的 `build:` 换成 `image:`：
+
+```yaml
+services:
+  warp-socks:
+    image: ghcr.io/yonqua/warp-socks:v0.3.0
+```
+
+或者在外部配置里写成：
+
+```env
+WARP_SOCKS_IMAGE=ghcr.io/yonqua/warp-socks:v0.3.0
+```
+
+GHCR 只是分发层，不会替代运行时的 `.env`、`cap_add`、`./wireguard` 持久化状态和目标 VPS 的 WireGuard / iptables 能力。
+
 ## 端口与地址层级
 
 当前 `compose.yaml` 的映射关系是：
@@ -333,4 +353,5 @@ ENDPOINT_CANDIDATES=162.159.193.5:2408,162.159.193.9:2408,162.159.193.8:2408,162
 - `RESTART_POLICY=unless-stopped|no`
 
 ## 边界
+
 - 当前目录提供的是轻量 WireGuard 路线，目标是稳定提供一个可用的 SOCKS5 出口。
