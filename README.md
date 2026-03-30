@@ -96,7 +96,12 @@ curl --socks5 127.0.0.1:1080 https://cloudflare.com/cdn-cgi/trace
 
 ## 预构建镜像
 
-当前仓库会通过 GitHub Actions 自动发布 GHCR 镜像，地址是 `ghcr.io/yonqua/warp-socks`。如果你是在别的 VPS 或配置仓库里复用它，建议显式写版本 tag，而不是长期跟随 `latest`。
+当前仓库会在推送 `v*` tag 时通过 GitHub Actions 自动同步做两件事：
+
+- 发布 GHCR 镜像到 `ghcr.io/yonqua/warp-socks`
+- 创建同名 GitHub Release
+
+自动化范围到 tag 为止，版本号本身仍需要维护者显式决定；如果你是在别的 VPS 或配置仓库里复用它，建议显式写版本 tag，而不是长期跟随 `latest`。
 
 例如，把 `compose.yaml` 里的 `build:` 换成 `image:`：
 
