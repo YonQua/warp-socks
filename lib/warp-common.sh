@@ -2,6 +2,100 @@
 
 TRACE_URL_DEFAULT="https://cloudflare.com/cdn-cgi/trace"
 TRACE_IP_URL_DEFAULT="https://1.1.1.1/cdn-cgi/trace"
+LOG_TIMEZONE_DEFAULT="CST-8"
+LOG_TIME_FORMAT_DEFAULT="%Y-%m-%d %H:%M:%S %Z"
+
+log_timestamp() {
+  TZ="${LOG_TIMEZONE:-$LOG_TIMEZONE_DEFAULT}" \
+    date +"${LOG_TIME_FORMAT:-$LOG_TIME_FORMAT_DEFAULT}"
+}
+
+current_log_mode() {
+  if [ -n "${LOG_MODE:-}" ]; then
+    printf '%s' "$LOG_MODE"
+    return 0
+  fi
+
+  state_file="${LOG_MODE_STATE_FILE:-/etc/wireguard/state.json}"
+  [ -s "$state_file" ] || return 0
+
+  mode="$(sed -n 's/.*"backend":"\([^"]*\)".*/\1/p' "$state_file" | head -n 1)"
+  [ -n "$mode" ] || return 0
+  printf '%s' "$mode"
+}
+
+emit_log_line() {
+  component="$1"
+  level="$2"
+  shift 2
+  mode="$(current_log_mode)"
+  component_prefix=""
+  if [ -n "$component" ]; then
+    component_prefix="[$component]"
+  fi
+
+  if [ -n "$mode" ]; then
+    printf '%s %s[%s][mode=%s] %s\n' "$(log_timestamp)" "$component_prefix" "$level" "$mode" "$*"
+  else
+    printf '%s %s[%s] %s\n' "$(log_timestamp)" "$component_prefix" "$level" "$*"
+  fi
+}
+
+log_info() {
+  component="$1"
+  shift
+  emit_log_line "$component" "INFO" "$*"
+}
+
+log_warn() {
+  component="$1"
+  shift
+  emit_log_line "$component" "WARN" "$*" >&2
+}
+
+log_error() {
+  component="$1"
+  shift
+  emit_log_line "$component" "ERROR" "$*" >&2
+}
+
+format_log_stream() {
+  component="$1"
+  level="${2:-INFO}"
+  filter_fn="${3:-}"
+
+  while IFS= read -r line || [ -n "$line" ]; do
+    if [ -n "$filter_fn" ] && ! "$filter_fn" "$line"; then
+      continue
+    fi
+    emit_log_line "$component" "$level" "$line"
+  done
+}
+
+run_with_formatted_logs() {
+  component="$1"
+  level="${2:-INFO}"
+  filter_fn="${3:-}"
+  shift 3
+
+  pipe_path="$(mktemp -u /tmp/warp-socks-log.XXXXXX)"
+  rm -f "$pipe_path"
+  mkfifo "$pipe_path"
+  (
+    format_log_stream "$component" "$level" "$filter_fn" <"$pipe_path"
+    rm -f "$pipe_path"
+  ) &
+  reader_pid=$!
+
+  if "$@" >"$pipe_path" 2>&1; then
+    cmd_status=0
+  else
+    cmd_status=$?
+  fi
+
+  wait "$reader_pid" || true
+  return "$cmd_status"
+}
 
 is_true() {
   case "${1:-0}" in

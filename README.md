@@ -64,21 +64,33 @@ docker compose up --build -d
 docker compose logs -f
 ```
 
+日志会给入口脚本、healthcheck、`wg-quick` / `wgcf` 输出以及 `microsocks` 连接日志统一补上时间戳，格式类似：
+
+```text
+2026-04-01 14:30:45 CST [microsocks][INFO][mode=teams] client[5] 10.10.10.4: connected to api.cloudflare.com:443
+```
+
+默认时区是东八区固定偏移 `CST-8`，不依赖镜像里额外安装 `tzdata`；同时每条格式化日志都会尽量带上当前后端模式，例如 `mode=teams`。根日志会省略 `warp-socks` 组件名，避免和 `docker compose logs` 左侧的服务名前缀叠加。如果你想改成别的时区或格式，可在 `.env` 里覆盖 `LOG_TIMEZONE` / `LOG_TIME_FORMAT`。
+
+默认情况下，`microsocks` 会保留真实客户端连接日志，但隐藏容器内 `127.0.0.1` / `::1` 的本地探测流量，避免 healthcheck 把日志刷屏。如果你想完全关闭这类连接日志，可设置 `MICROSOCKS_LOG_ACCESS=0`；如果你排障时希望连本地探测也一起看，可设置 `MICROSOCKS_LOG_LOCAL_CLIENTS=1`。
+
 5. 查看容器健康状态：
 
 ```bash
 docker compose ps
 ```
 
-启动阶段现在会先探测公网出口：只有在拿到出口 IP 后才会启动 `microsocks`；如果连续探测失败，容器会直接退出，交给 Docker 按 `restart` 策略重试，而不是起一个实际上不可用的 SOCKS5 端口。
+启动阶段会先探测公网出口：只有在拿到出口 IP 后才会启动 `microsocks`；如果连续探测失败，容器会直接退出，交给 Docker 按 `restart` 策略重试，而不是起一个实际上不可用的 SOCKS5 端口。
 
-镜像还内置了一个极简 `HEALTHCHECK`：它会在容器内通过本地 SOCKS5 访问 `https://cloudflare.com/cdn-cgi/trace`，并检查是否返回 `warp=on` 或 `warp=plus`。默认情况下，连续失败达到阈值后它会终止容器主进程，交给 Docker 按 `restart` 策略自动拉起容器并重建隧道；如果你只想观测不恢复，可设置 `HEALTHCHECK_AUTO_RECOVER=0`。
+镜像内置了一个极简 `HEALTHCHECK`：它会在容器内通过本地 SOCKS5 访问 `https://cloudflare.com/cdn-cgi/trace`，并检查是否返回 `warp=on` 或 `warp=plus`。默认情况下，连续失败达到阈值后它会终止容器主进程，交给 Docker 按 `restart` 策略自动拉起容器并重建隧道；如果你只想观测不恢复，可设置 `HEALTHCHECK_AUTO_RECOVER=0`。
 
-当前 `compose.yaml` 还内置了三类运行保护：
+默认配置还包含三类运行保护：
 
 - 基础资源限制：默认 `MEM_LIMIT=256m`、`CPU_LIMIT=0.50`
 - 容器日志滚动：默认 `json-file`，`LOG_MAX_SIZE=1m`、`LOG_MAX_FILE=1`
 - 启动出口探测：默认 `STARTUP_EGRESS_PROBE_RETRIES=3`、`STARTUP_EGRESS_PROBE_DELAY=2`、`STARTUP_EGRESS_PROBE_TIMEOUT=5`
+
+另外还有一组“本地网段旁路”默认值：会把当前容器主网段和常见私网网段放到 WARP 默认路由之前。大多数场景保持默认即可；如果你的网络结构比较特殊，才需要改 `LOCAL_BYPASS_INCLUDE_PRIMARY`、`LOCAL_BYPASS_IPV4_SUBNETS`、`LOCAL_BYPASS_IPV6_SUBNETS`。
 
 这些参数都可以通过 `.env` 覆盖。
 
@@ -96,7 +108,7 @@ curl --socks5 127.0.0.1:1080 https://cloudflare.com/cdn-cgi/trace
 
 ## 预构建镜像
 
-当前仓库会在推送 `v*` tag 时通过 GitHub Actions 自动同步做两件事：
+推送 `v*` tag 时，GitHub Actions 会自动做两件事：
 
 - 发布 GHCR 镜像到 `ghcr.io/yonqua/warp-socks`
 - 创建同名 GitHub Release
@@ -121,7 +133,7 @@ GHCR 只是分发层，不会替代运行时的 `.env`、`cap_add`、`./wireguar
 
 ## 端口与地址层级
 
-当前 `compose.yaml` 的映射关系是：
+端口映射关系是：
 
 ```text
 HOST_BIND_IP:HOST_BIND_PORT:BIND_PORT
@@ -187,10 +199,13 @@ com.cloudflare.warp://<team-name>.cloudflareaccess.com/auth?token=...
 - 默认端口映射是 `127.0.0.1:1080 -> 容器 1080`，除非你已经有明确的网络访问控制，否则不要改成 `HOST_BIND_IP=0.0.0.0`。
 - `ENDPOINT_IP` 默认建议留空；只有在默认端点握手失败，或者你所在网络环境明确只能稳定握手某个固定 endpoint 时，才手动覆盖。
 - 如果单个固定 endpoint 仍会抖动，可以改用 `ENDPOINT_CANDIDATES=ip1:port,ip2:port`；启动失败时会在同一次启动流程里按顺序尝试后续候选，运行中健康检查连续失败后则会重启容器，并重新按你写的顺序再尝试一轮。
-- 当前仓库只认 `.env` 里的 `ENDPOINT_IP` / `ENDPOINT_CANDIDATES`，不再自动读取 `./wireguard/endpoint-candidates.txt` 这类隐式缓存文件。
+- 仓库只认 `.env` 里的 `ENDPOINT_IP` / `ENDPOINT_CANDIDATES`，不再自动读取 `./wireguard/endpoint-candidates.txt` 这类隐式缓存文件。
 - 启动阶段会先做公网出口探测；如果连续探测都拿不到出口 IP，容器会直接退出并等待 Docker 重试，不会继续启动一个不可用的 SOCKS5 端口。
-- 当前仓库只有一个服务，Compose 默认网络已经足够；因此 `compose.yaml` 没有额外声明自定义 `networks`，避免增加无运行收益的配置面。
-- 当前版本会动态读取 `wg-quick` 当前安装出来的策略路由优先级，把 RFC1918 / ULA 的旁路 `ip rule` 提前装到它前面，并清理旧的错误优先级残留，确保局域网客户端访问宿主机发布端口时，回包不会误入 WARP 默认路由。
+- 日志会把入口脚本、healthcheck 与 `microsocks` / `wg-quick` 关键输出统一格式化为 `时间 [组件][级别][mode=后端] 消息`；其中根日志默认省略组件名，避免和 `docker compose logs` 左侧的 `warp-socks |` 重复。默认时区是 `CST-8`，这样即使容器已经停掉，也能直接从最后一条日志看出准确时间和当前运行模式。
+- 默认会隐藏 `microsocks` 本地 `127.0.0.1` / `::1` 探测连接日志，减少 healthcheck 噪音；真实局域网或外部客户端连接仍会保留。
+- 仓库只有一个服务，Compose 默认网络已经足够；因此 `compose.yaml` 没有额外声明自定义 `networks`，避免增加无运行收益的配置面。
+- 启动时会动态读取 `wg-quick` 当前安装出来的策略路由优先级，把“当前容器主网段 + 默认私网/ULA 旁路网段”提前装到它前面，并清理旧的错误优先级残留，确保局域网客户端访问宿主机发布端口时，回包不会误入 WARP 默认路由。
+- 这组旁路网段可以通过 `.env` 控制：`LOCAL_BYPASS_INCLUDE_PRIMARY=0|1`、`LOCAL_BYPASS_IPV4_SUBNETS=`、`LOCAL_BYPASS_IPV6_SUBNETS=`。默认值是面向大多数局域网环境的安全基线，不建议无必要地全部关掉。
 
 ### 3. 阅读路径
 
@@ -234,7 +249,7 @@ docker compose ps
 docker compose logs --tail=120
 ```
 
-当前健康检查默认会在连续失败达到阈值后触发一次容器重启，以便重新建立隧道；如果你把 `HEALTHCHECK_AUTO_RECOVER=0`，它就只负责探测。常见原因包括：
+健康检查默认会在连续失败达到阈值后触发一次容器重启，以便重新建立隧道；如果你把 `HEALTHCHECK_AUTO_RECOVER=0`，它就只负责探测。常见原因包括：
 
 - `wg0` 没拉起来
 - 注册后端状态与当前请求不一致
@@ -277,15 +292,13 @@ curl --socks5 127.0.0.1:1080 https://cloudflare.com/cdn-cgi/trace
 5. 使用固定 endpoint 或候选缓存时，建议保持 `HEALTHCHECK_AUTO_RECOVER=1`
 6. 如果启动阶段经常拿不到出口 IP，再调大 `STARTUP_EGRESS_PROBE_RETRIES` / `STARTUP_EGRESS_PROBE_DELAY`
 
-当前环境这轮实测里，更适合作为起点的是下面这组显式候选：
+如果你已经筛出一组适合当前网络环境的候选，可以直接写进 `.env`，例如：
 
 ```env
-ENDPOINT_CANDIDATES=162.159.193.5:2408,162.159.193.9:2408,162.159.193.8:2408,162.159.193.3:2408
+ENDPOINT_CANDIDATES=ip1:port,ip2:port,ip3:port
 ```
 
-这里的含义是“当前网络条件下验证过至少一次，其中 `162.159.193.5:2408` 最稳”，不是永久承诺。像 `162.159.193.9:2408`、`162.159.193.8:2408`、`162.159.193.3:2408` 目前更接近备选池，而不是和 `.5` 一样稳。
-
-`ENDPOINT_IP` 也支持主机名，例如第三方聚合域名 `engage.nanocat.me:2408`。但这种方式只是把 DNS 选择交给第三方，不等于当前项目自己完成了稳定优选；而且我在本地当前环境实测过一次，该 hostname 这次解析到的实际结果并没有通过出口探测。因此它更适合作为个人临时尝试，不建议写成仓库默认值。
+`ENDPOINT_IP` 也支持主机名。但这种方式只是把 DNS 选择交给上游解析，不等于项目本身完成了稳定优选，因此更适合作为个人临时尝试，而不是仓库默认值。
 
 如果你已经有外部筛好的 endpoint，请直接把它们写进 `.env` 里的 `ENDPOINT_CANDIDATES`。当前仓库不再自动读取 `./wireguard/endpoint-candidates.txt`，这样可以避免旧缓存和隐式状态干扰启动结果。
 
@@ -345,10 +358,17 @@ ENDPOINT_CANDIDATES=162.159.193.5:2408,162.159.193.9:2408,162.159.193.8:2408,162
 - `STARTUP_EGRESS_PROBE_RETRIES`
 - `STARTUP_EGRESS_PROBE_DELAY`
 - `STARTUP_EGRESS_PROBE_TIMEOUT`
+- `LOCAL_BYPASS_INCLUDE_PRIMARY=0|1`
+- `LOCAL_BYPASS_IPV4_SUBNETS`
+- `LOCAL_BYPASS_IPV6_SUBNETS`
 - `MEM_LIMIT`
 - `CPU_LIMIT`
 - `LOG_MAX_SIZE`
 - `LOG_MAX_FILE`
+- `LOG_TIMEZONE`
+- `LOG_TIME_FORMAT`
+- `MICROSOCKS_LOG_ACCESS=0|1`
+- `MICROSOCKS_LOG_LOCAL_CLIENTS=0|1`
 - `HEALTHCHECK_AUTO_RECOVER=0|1`
 - `HEALTHCHECK_AUTO_RECOVER_THRESHOLD`
 - `HOST_BIND_IP`

@@ -12,6 +12,7 @@ ACCOUNT_JSON="${WG_DIR}/account.json"
 WGCF_ACCOUNT="${WG_DIR}/wgcf-account.toml"
 WGCF_PROFILE="${WG_DIR}/wgcf-profile.conf"
 STATE_FILE="${WG_DIR}/state.json"
+LOG_MODE_STATE_FILE="$STATE_FILE"
 REGISTER_URL="${REGISTER_URL:-https://api.cloudflareclient.com/v0a2158/reg}"
 AUTH_MODE="${AUTH_MODE:-auto}"
 FORCE_REREGISTER="${FORCE_REREGISTER:-0}"
@@ -23,6 +24,9 @@ LISTEN_PORT="${BIND_PORT:-1080}"
 HOST_LISTEN_ADDR="${HOST_BIND_IP:-}"
 HOST_LISTEN_PORT="${HOST_BIND_PORT:-}"
 LOCAL_BYPASS_RULE_PRIORITY_FALLBACK=97
+LOCAL_BYPASS_INCLUDE_PRIMARY="${LOCAL_BYPASS_INCLUDE_PRIMARY:-1}"
+LOCAL_BYPASS_IPV4_SUBNETS="${LOCAL_BYPASS_IPV4_SUBNETS-10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,100.64.0.0/10,169.254.0.0/16}"
+LOCAL_BYPASS_IPV6_SUBNETS="${LOCAL_BYPASS_IPV6_SUBNETS-fc00::/7,fe80::/10}"
 WARP_LICENSE_KEY="${WARP_LICENSE_KEY:-}"
 STARTUP_EGRESS_PROBE_RETRIES="${STARTUP_EGRESS_PROBE_RETRIES:-3}"
 STARTUP_EGRESS_PROBE_DELAY="${STARTUP_EGRESS_PROBE_DELAY:-2}"
@@ -33,18 +37,47 @@ CURRENT_ENDPOINT_OVERRIDE=""
 CURRENT_ENDPOINT_INDEX=""
 CURRENT_ENDPOINT_TOTAL="0"
 VALIDATE_ENDPOINT_ONLY="${VALIDATE_ENDPOINT_ONLY:-0}"
+MICROSOCKS_LOG_ACCESS="${MICROSOCKS_LOG_ACCESS:-1}"
+MICROSOCKS_LOG_LOCAL_CLIENTS="${MICROSOCKS_LOG_LOCAL_CLIENTS:-0}"
+LOG_COMPONENT=""
 
 log() {
-  printf '%s %s\n' "==> [warp-socks]" "$*"
+  log_info "$LOG_COMPONENT" "$*"
 }
 
 warn() {
-  printf '%s %s\n' "==> [warp-socks][WARN]" "$*" >&2
+  log_warn "$LOG_COMPONENT" "$*"
 }
 
 fail() {
-  printf '%s %s\n' "==> [warp-socks][ERROR]" "$*" >&2
+  log_error "$LOG_COMPONENT" "$*"
   exit 1
+}
+
+start_log_pipe_formatter() {
+  pipe_path="$1"
+  component="$2"
+  level="${3:-INFO}"
+  filter_fn="${4:-}"
+
+  rm -f "$pipe_path"
+  mkfifo "$pipe_path"
+  (
+    format_log_stream "$component" "$level" "$filter_fn" <"$pipe_path"
+    rm -f "$pipe_path"
+  ) &
+}
+
+should_emit_microsocks_log_line() {
+  line="$1"
+  if ! is_true "$MICROSOCKS_LOG_LOCAL_CLIENTS"; then
+    case "$line" in
+      client*\ 127.0.0.1:\ connected\ to\ *|client*\ \[::1\]:\ connected\ to\ *|client*\ ::1:\ connected\ to\ *)
+        return 1
+        ;;
+    esac
+  fi
+  return 0
 }
 
 log_endpoint_candidate_plan() {
@@ -93,7 +126,7 @@ run_wgcf() {
   ensure_wgcf
   (
     cd "$WG_DIR"
-    wgcf "$@"
+    run_with_formatted_logs "wgcf" "INFO" "" wgcf "$@"
   )
 }
 
@@ -117,6 +150,47 @@ ensure_v6_cidr() {
       printf '%s/128' "$1"
       ;;
   esac
+}
+
+iterate_configured_bypass_subnets() {
+  family="$1"
+  case "$family" in
+    ipv4)
+      printf '%s\n' "$LOCAL_BYPASS_IPV4_SUBNETS"
+      ;;
+    ipv6)
+      printf '%s\n' "$LOCAL_BYPASS_IPV6_SUBNETS"
+      ;;
+    *)
+      return 1
+      ;;
+  esac \
+    | tr ',' '\n' \
+    | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' \
+    | awk 'NF && !seen[$0]++'
+}
+
+configured_bypass_summary() {
+  family="$1"
+  primary_subnet="${2:-}"
+  summary=""
+
+  if is_true "$LOCAL_BYPASS_INCLUDE_PRIMARY" && [ -n "$primary_subnet" ]; then
+    summary="$primary_subnet"
+  fi
+
+  while IFS= read -r subnet; do
+    [ -n "$subnet" ] || continue
+    if [ -n "$summary" ]; then
+      summary="${summary},${subnet}"
+    else
+      summary="$subnet"
+    fi
+  done <<EOF
+$(iterate_configured_bypass_subnets "$family")
+EOF
+
+  printf '%s' "${summary:-none}"
 }
 
 write_state() {
@@ -591,16 +665,25 @@ cleanup_local_network_bypass() {
   primary_v4_subnet="$(ip -4 route show dev eth0 proto kernel scope link | awk 'NR==1 {print $1}')"
   primary_v6_subnet="$(ip -6 route show dev eth0 proto kernel | awk '/^[0-9a-fA-F:]+\// {print $1; exit}')"
 
-  remove_bypass_rules ipv4 "$primary_v4_subnet"
-  remove_bypass_rules ipv4 "10.0.0.0/8"
-  remove_bypass_rules ipv4 "172.16.0.0/12"
-  remove_bypass_rules ipv4 "192.168.0.0/16"
-  remove_bypass_rules ipv4 "100.64.0.0/10"
-  remove_bypass_rules ipv4 "169.254.0.0/16"
+  if is_true "$LOCAL_BYPASS_INCLUDE_PRIMARY"; then
+    remove_bypass_rules ipv4 "$primary_v4_subnet"
+  fi
+  while IFS= read -r subnet; do
+    [ -n "$subnet" ] || continue
+    remove_bypass_rules ipv4 "$subnet"
+  done <<EOF
+$(iterate_configured_bypass_subnets ipv4)
+EOF
 
-  remove_bypass_rules ipv6 "$primary_v6_subnet"
-  remove_bypass_rules ipv6 "fc00::/7"
-  remove_bypass_rules ipv6 "fe80::/10"
+  if is_true "$LOCAL_BYPASS_INCLUDE_PRIMARY"; then
+    remove_bypass_rules ipv6 "$primary_v6_subnet"
+  fi
+  while IFS= read -r subnet; do
+    [ -n "$subnet" ] || continue
+    remove_bypass_rules ipv6 "$subnet"
+  done <<EOF
+$(iterate_configured_bypass_subnets ipv6)
+EOF
 }
 
 ensure_local_network_bypass() {
@@ -611,18 +694,27 @@ ensure_local_network_bypass() {
 
   # 旁路规则必须动态保持在当前 wg-quick 自动规则之前。
   # 否则 endpoint 轮换或同一容器内重复 down/up 后，wg-quick 新拿到的更高优先级规则仍会把局域网回包抢走。
-  ensure_ipv4_bypass "$primary_v4_subnet" "$ipv4_bypass_priority"
-  ensure_ipv4_bypass "10.0.0.0/8" "$ipv4_bypass_priority"
-  ensure_ipv4_bypass "172.16.0.0/12" "$ipv4_bypass_priority"
-  ensure_ipv4_bypass "192.168.0.0/16" "$ipv4_bypass_priority"
-  ensure_ipv4_bypass "100.64.0.0/10" "$ipv4_bypass_priority"
-  ensure_ipv4_bypass "169.254.0.0/16" "$ipv4_bypass_priority"
+  if is_true "$LOCAL_BYPASS_INCLUDE_PRIMARY"; then
+    ensure_ipv4_bypass "$primary_v4_subnet" "$ipv4_bypass_priority"
+  fi
+  while IFS= read -r subnet; do
+    [ -n "$subnet" ] || continue
+    ensure_ipv4_bypass "$subnet" "$ipv4_bypass_priority"
+  done <<EOF
+$(iterate_configured_bypass_subnets ipv4)
+EOF
 
-  ensure_ipv6_bypass "$primary_v6_subnet" "$ipv6_bypass_priority"
-  ensure_ipv6_bypass "fc00::/7" "$ipv6_bypass_priority"
-  ensure_ipv6_bypass "fe80::/10" "$ipv6_bypass_priority"
+  if is_true "$LOCAL_BYPASS_INCLUDE_PRIMARY"; then
+    ensure_ipv6_bypass "$primary_v6_subnet" "$ipv6_bypass_priority"
+  fi
+  while IFS= read -r subnet; do
+    [ -n "$subnet" ] || continue
+    ensure_ipv6_bypass "$subnet" "$ipv6_bypass_priority"
+  done <<EOF
+$(iterate_configured_bypass_subnets ipv6)
+EOF
 
-  log "已为本地网络添加旁路: ${primary_v4_subnet:-none}${primary_v6_subnet:+, ${primary_v6_subnet}} + RFC1918/ULA（策略优先级 v4=${ipv4_bypass_priority}, v6=${ipv6_bypass_priority}）"
+  log "已为本地网络添加旁路: v4=[$(configured_bypass_summary ipv4 "$primary_v4_subnet")] v6=[$(configured_bypass_summary ipv6 "$primary_v6_subnet")]（策略优先级 v4=${ipv4_bypass_priority}, v6=${ipv6_bypass_priority}）"
 }
 
 wait_for_egress_ready() {
@@ -701,7 +793,7 @@ start_tunnel() {
     [ "$candidate_count" -gt 0 ] && apply_endpoint_override_to_wg_conf "$index"
 
     log "正在启动 wg0"
-    wg-quick up wg0
+    run_with_formatted_logs "wg-quick" "INFO" "" wg-quick up wg0
     ensure_local_network_bypass
 
     if wait_for_egress_ready; then
@@ -725,17 +817,32 @@ start_tunnel() {
 }
 
 start_socks5() {
+  microsocks_log_pipe="/tmp/warp-socks-microsocks.log.pipe"
   log "启动无认证 SOCKS5（容器内监听）: ${LISTEN_ADDR}:${LISTEN_PORT}"
   if [ -n "$HOST_LISTEN_PORT" ]; then
     log "Docker 发布端口（宿主机入口）: ${HOST_LISTEN_ADDR:-0.0.0.0}:${HOST_LISTEN_PORT} -> 容器 ${LISTEN_ADDR}:${LISTEN_PORT}"
   fi
-  exec microsocks -i "$LISTEN_ADDR" -p "$LISTEN_PORT"
+
+  if is_true "$MICROSOCKS_LOG_ACCESS"; then
+    if is_true "$MICROSOCKS_LOG_LOCAL_CLIENTS"; then
+      log "microsocks 连接日志已启用，包含本地 127.0.0.1/::1 探测流量。"
+    else
+      log "microsocks 连接日志已启用，默认隐藏本地 127.0.0.1/::1 探测流量。"
+    fi
+    start_log_pipe_formatter "$microsocks_log_pipe" "microsocks" "INFO" "should_emit_microsocks_log_line"
+    exec microsocks -i "$LISTEN_ADDR" -p "$LISTEN_PORT" >"$microsocks_log_pipe" 2>&1
+  fi
+
+  log "microsocks 连接日志已关闭。"
+  exec microsocks -q -i "$LISTEN_ADDR" -p "$LISTEN_PORT"
 }
 
 mkdir -p "$WG_DIR"
 prepare_runtime
 
 requested_backend="$(detect_requested_backend "$(current_state_backend)")"
+LOG_MODE="$requested_backend"
+export LOG_MODE LOG_MODE_STATE_FILE
 log "当前注册后端: ${requested_backend}"
 ensure_backend_state "$requested_backend"
 

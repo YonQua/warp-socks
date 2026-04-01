@@ -12,9 +12,11 @@ state_dir="/tmp/warp-socks-healthcheck"
 fail_count_file="${state_dir}/fail-count"
 auto_recover="${HEALTHCHECK_AUTO_RECOVER:-1}"
 failure_threshold="${HEALTHCHECK_AUTO_RECOVER_THRESHOLD:-3}"
+LOG_MODE_STATE_FILE="${LOG_MODE_STATE_FILE:-/etc/wireguard/state.json}"
+LOG_COMPONENT="healthcheck"
 
 log() {
-  printf '%s %s\n' "==> [warp-socks][healthcheck]" "$*" >&2
+  emit_log_line "$LOG_COMPONENT" "INFO" "$*" >&2
 }
 
 read_fail_count() {
