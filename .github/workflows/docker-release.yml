@@ -1,13 +1,75 @@
-name: Tag Release
+name: Release
 
 on:
   push:
+    branches:
+      - main
     tags:
       - 'v*'
 
 jobs:
+  prepare:
+    name: Resolve Release Version
+    runs-on: ubuntu-latest
+    outputs:
+      skip: ${{ steps.meta.outputs.skip }}
+      release_tag: ${{ steps.meta.outputs.release_tag }}
+      version: ${{ steps.meta.outputs.version }}
+      major_minor: ${{ steps.meta.outputs.major_minor }}
+      prerelease: ${{ steps.meta.outputs.prerelease }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Fetch tags
+        shell: bash
+        run: git fetch --force --tags origin
+
+      - name: Resolve release tag
+        id: meta
+        shell: bash
+        run: |
+          skip=false
+
+          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
+            release_tag="${GITHUB_REF_NAME}"
+          else
+            existing_tag="$(git tag --points-at "${GITHUB_SHA}" | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$' | head -n1 || true)"
+            if [[ -n "${existing_tag}" ]]; then
+              skip=true
+              release_tag="${existing_tag}"
+            else
+              latest_tag="$(git tag --list | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -n1 || true)"
+              if [[ -z "${latest_tag}" ]]; then
+                release_tag="v0.1.0"
+              else
+                version="${latest_tag#v}"
+                IFS='.' read -r major minor patch <<< "${version}"
+                release_tag="v${major}.${minor}.$((patch + 1))"
+              fi
+            fi
+          fi
+
+          version="${release_tag#v}"
+          IFS='.' read -r major minor _ <<< "${version}"
+          major_minor="${major}.${minor}"
+          prerelease=false
+          if [[ "${release_tag}" == *-* ]]; then
+            prerelease=true
+          fi
+
+          echo "skip=${skip}" >> "$GITHUB_OUTPUT"
+          echo "release_tag=${release_tag}" >> "$GITHUB_OUTPUT"
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "major_minor=${major_minor}" >> "$GITHUB_OUTPUT"
+          echo "prerelease=${prerelease}" >> "$GITHUB_OUTPUT"
+
   publish:
     name: Publish Image And GitHub Release
+    needs: prepare
+    if: needs.prepare.outputs.skip != 'true'
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -40,10 +102,10 @@ jobs:
         with:
           images: ${{ steps.image.outputs.name }}
           tags: |
-            type=ref,event=tag
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
-            type=raw,value=latest,enable=${{ !contains(github.ref_name, '-') }}
+            type=raw,value=${{ needs.prepare.outputs.release_tag }}
+            type=raw,value=${{ needs.prepare.outputs.version }}
+            type=raw,value=${{ needs.prepare.outputs.major_minor }},enable=${{ needs.prepare.outputs.prerelease != 'true' }}
+            type=raw,value=latest,enable=${{ needs.prepare.outputs.prerelease != 'true' }}
 
       - name: Build and push image
         uses: docker/build-push-action@v6
@@ -63,17 +125,19 @@ jobs:
         shell: bash
         run: |
           prerelease_flag=()
-          if [[ "${GITHUB_REF_NAME}" == *-* ]]; then
+          release_tag="${{ needs.prepare.outputs.release_tag }}"
+          if [[ "${{ needs.prepare.outputs.prerelease }}" == "true" ]]; then
             prerelease_flag+=(--prerelease)
           fi
 
-          if gh release view "${GITHUB_REF_NAME}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
-            echo "GitHub release ${GITHUB_REF_NAME} already exists; skipping creation."
+          if gh release view "${release_tag}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+            echo "GitHub release ${release_tag} already exists; skipping creation."
             exit 0
           fi
 
-          gh release create "${GITHUB_REF_NAME}" \
+          gh release create "${release_tag}" \
             --repo "${GITHUB_REPOSITORY}" \
-            --title "${GITHUB_REF_NAME}" \
+            --title "${release_tag}" \
+            --target "${GITHUB_SHA}" \
             --generate-notes \
             "${prerelease_flag[@]}"
