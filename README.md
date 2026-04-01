@@ -108,28 +108,32 @@ curl --socks5 127.0.0.1:1080 https://cloudflare.com/cdn-cgi/trace
 
 ## 预构建镜像
 
-推送 `v*` tag 时，GitHub Actions 会自动做两件事：
+发布版本时，GitHub Actions 会同步把镜像发布到 `ghcr.io/yonqua/warp-socks`。下游使用建议固定版本 tag，而不是长期跟随 `latest`。
 
-- 发布 GHCR 镜像到 `ghcr.io/yonqua/warp-socks`
-- 创建同名 GitHub Release
+### 直接使用 GHCR 镜像
 
-自动化范围到 tag 为止，版本号本身仍需要维护者显式决定；如果你是在别的 VPS 或配置仓库里复用它，建议显式写版本 tag，而不是长期跟随 `latest`。
-
-例如，把 `compose.yaml` 里的 `build:` 换成 `image:`：
+下面这份 `docker-compose.yaml` 可以直接拿来跑预构建镜像：
 
 ```yaml
 services:
   warp-socks:
     image: ghcr.io/yonqua/warp-socks:v0.3.0
+    container_name: warp-socks
+    restart: unless-stopped
+    cap_add:
+      - NET_ADMIN
+      - SYS_MODULE
+    sysctls:
+      net.ipv4.conf.all.src_valid_mark: '1'
+    ports:
+      - '${HOST_BIND_IP:-127.0.0.1}:${HOST_BIND_PORT:-1080}:${BIND_PORT:-1080}'
+    volumes:
+      - ./wireguard:/etc/wireguard
+    env_file:
+      - .env
 ```
 
-或者在外部配置里写成：
-
-```env
-WARP_SOCKS_IMAGE=ghcr.io/yonqua/warp-socks:v0.3.0
-```
-
-GHCR 只是分发层，不会替代运行时的 `.env`、`cap_add`、`./wireguard` 持久化状态和目标 VPS 的 WireGuard / iptables 能力。
+`.env` 可以直接从 [.env.example](/Users/leishao/Docker/warp-socks/.env.example) 复制；生产或长期使用建议固定版本 tag，后续升级时再显式改版本。GHCR 只是分发层，不会替代运行时的 `.env`、`cap_add`、`./wireguard` 持久化状态和目标 VPS 的 WireGuard / iptables 能力。
 
 ## 端口与地址层级
 

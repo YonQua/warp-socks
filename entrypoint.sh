@@ -54,20 +54,6 @@ fail() {
   exit 1
 }
 
-start_log_pipe_formatter() {
-  pipe_path="$1"
-  component="$2"
-  level="${3:-INFO}"
-  filter_fn="${4:-}"
-
-  rm -f "$pipe_path"
-  mkfifo "$pipe_path"
-  (
-    format_log_stream "$component" "$level" "$filter_fn" <"$pipe_path"
-    rm -f "$pipe_path"
-  ) &
-}
-
 should_emit_microsocks_log_line() {
   line="$1"
   if ! is_true "$MICROSOCKS_LOG_LOCAL_CLIENTS"; then
@@ -829,8 +815,8 @@ start_socks5() {
     else
       log "microsocks 连接日志已启用，默认隐藏本地 127.0.0.1/::1 探测流量。"
     fi
-    start_log_pipe_formatter "$microsocks_log_pipe" "microsocks" "INFO" "should_emit_microsocks_log_line"
-    exec microsocks -i "$LISTEN_ADDR" -p "$LISTEN_PORT" >"$microsocks_log_pipe" 2>&1
+    create_formatted_log_pipe "$microsocks_log_pipe" "microsocks" "INFO" "should_emit_microsocks_log_line"
+    exec microsocks -i "$LISTEN_ADDR" -p "$LISTEN_PORT" >"$FORMATTED_LOG_PIPE" 2>&1
   fi
 
   log "microsocks 连接日志已关闭。"

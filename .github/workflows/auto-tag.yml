@@ -1,0 +1,62 @@
+name: Auto Tag Main
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: write
+
+concurrency:
+  group: auto-tag-main
+  cancel-in-progress: false
+
+jobs:
+  tag:
+    name: Create Next Patch Tag
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Fetch tags
+        shell: bash
+        run: git fetch --force --tags origin
+
+      - name: Check whether this commit is already tagged
+        id: existing
+        shell: bash
+        run: |
+          if git tag --points-at "${GITHUB_SHA}" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Compute next patch tag
+        if: steps.existing.outputs.skip != 'true'
+        id: next
+        shell: bash
+        run: |
+          latest_tag="$(git tag --list 'v[0-9]*.[0-9]*.[0-9]*' --sort=-v:refname | head -n1)"
+          if [ -z "${latest_tag}" ]; then
+            next_tag="v0.1.0"
+          else
+            version="${latest_tag#v}"
+            IFS='.' read -r major minor patch <<< "${version}"
+            next_tag="v${major}.${minor}.$((patch + 1))"
+          fi
+
+          echo "tag=${next_tag}" >> "$GITHUB_OUTPUT"
+
+      - name: Create and push tag
+        if: steps.existing.outputs.skip != 'true'
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag "${{ steps.next.outputs.tag }}" "${GITHUB_SHA}"
+          git push origin "${{ steps.next.outputs.tag }}"

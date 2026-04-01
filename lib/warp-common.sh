@@ -72,28 +72,44 @@ format_log_stream() {
   done
 }
 
+create_formatted_log_pipe() {
+  pipe_path="${1:-}"
+  component="$2"
+  level="${3:-INFO}"
+  filter_fn="${4:-}"
+
+  if [ -n "$pipe_path" ]; then
+    rm -f "$pipe_path"
+  else
+    pipe_path="$(mktemp /tmp/warp-socks-log.XXXXXX)"
+    rm -f "$pipe_path"
+  fi
+
+  mkfifo "$pipe_path"
+  (
+    format_log_stream "$component" "$level" "$filter_fn" <"$pipe_path"
+    rm -f "$pipe_path"
+  ) &
+
+  FORMATTED_LOG_PIPE="$pipe_path"
+  FORMATTED_LOG_READER_PID="$!"
+}
+
 run_with_formatted_logs() {
   component="$1"
   level="${2:-INFO}"
   filter_fn="${3:-}"
   shift 3
 
-  pipe_path="$(mktemp -u /tmp/warp-socks-log.XXXXXX)"
-  rm -f "$pipe_path"
-  mkfifo "$pipe_path"
-  (
-    format_log_stream "$component" "$level" "$filter_fn" <"$pipe_path"
-    rm -f "$pipe_path"
-  ) &
-  reader_pid=$!
+  create_formatted_log_pipe "" "$component" "$level" "$filter_fn"
 
-  if "$@" >"$pipe_path" 2>&1; then
+  if "$@" >"$FORMATTED_LOG_PIPE" 2>&1; then
     cmd_status=0
   else
     cmd_status=$?
   fi
 
-  wait "$reader_pid" || true
+  wait "$FORMATTED_LOG_READER_PID" || true
   return "$cmd_status"
 }
 
