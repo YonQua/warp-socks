@@ -31,6 +31,10 @@ WARP_LICENSE_KEY="${WARP_LICENSE_KEY:-}"
 STARTUP_EGRESS_PROBE_RETRIES="${STARTUP_EGRESS_PROBE_RETRIES:-3}"
 STARTUP_EGRESS_PROBE_DELAY="${STARTUP_EGRESS_PROBE_DELAY:-2}"
 STARTUP_EGRESS_PROBE_TIMEOUT="${STARTUP_EGRESS_PROBE_TIMEOUT:-5}"
+HEALTHCHECK_STATE_DIR="/tmp/warp-socks-healthcheck"
+HEALTHCHECK_FAIL_COUNT_FILE="${HEALTHCHECK_STATE_DIR}/fail-count"
+HEALTHCHECK_RESTART_REQUEST_FILE="${HEALTHCHECK_STATE_DIR}/restart-requested"
+HEALTHCHECK_READY_FILE="${HEALTHCHECK_STATE_DIR}/runtime-ready"
 # 这是注册 API 的兼容客户端标识，不等同于 Cloudflare 官方桌面客户端的发布版本号。
 CF_CLIENT_VERSION="${CF_CLIENT_VERSION:-a-6.10-2158}"
 CURRENT_ENDPOINT_OVERRIDE=""
@@ -40,6 +44,7 @@ VALIDATE_ENDPOINT_ONLY="${VALIDATE_ENDPOINT_ONLY:-0}"
 MICROSOCKS_LOG_ACCESS="${MICROSOCKS_LOG_ACCESS:-1}"
 MICROSOCKS_LOG_LOCAL_CLIENTS="${MICROSOCKS_LOG_LOCAL_CLIENTS:-0}"
 LOG_COMPONENT=""
+MICROSOCKS_PID=""
 
 log() {
   log_info "$LOG_COMPONENT" "$*"
@@ -71,6 +76,15 @@ log_endpoint_candidate_plan() {
   if has_explicit_endpoint_candidates && [ "$candidate_total" -gt 0 ]; then
     log "检测到显式 endpoint 候选，共 ${candidate_total} 个。"
   fi
+}
+
+clear_healthcheck_runtime_state() {
+  rm -f "$HEALTHCHECK_FAIL_COUNT_FILE" "$HEALTHCHECK_RESTART_REQUEST_FILE" "$HEALTHCHECK_READY_FILE"
+}
+
+mark_healthcheck_runtime_ready() {
+  mkdir -p "$HEALTHCHECK_STATE_DIR"
+  : >"$HEALTHCHECK_READY_FILE"
 }
 
 prepare_runtime() {
@@ -768,6 +782,53 @@ bring_down_tunnel_if_present() {
   cleanup_local_network_bypass
 }
 
+stop_microsocks_child() {
+  child_pid="${1:-}"
+  [ -n "$child_pid" ] || return 0
+
+  if kill -0 "$child_pid" 2>/dev/null; then
+    kill -TERM "$child_pid" 2>/dev/null || true
+    sleep 1
+    if kill -0 "$child_pid" 2>/dev/null; then
+      kill -KILL "$child_pid" 2>/dev/null || true
+    fi
+  fi
+
+  wait "$child_pid" 2>/dev/null || true
+}
+
+handle_runtime_shutdown() {
+  signal_name="$1"
+  log "收到 ${signal_name}，正在停止 SOCKS5 并清理隧道。"
+  exit_runtime_supervisor 0
+}
+
+exit_runtime_supervisor() {
+  exit_code="$1"
+  clear_healthcheck_runtime_state
+  stop_microsocks_child "$MICROSOCKS_PID"
+  bring_down_tunnel_if_present
+  exit "$exit_code"
+}
+
+supervise_microsocks() {
+  child_pid="$1"
+
+  while :; do
+    if [ -f "$HEALTHCHECK_RESTART_REQUEST_FILE" ]; then
+      log "检测到 healthcheck 写入重启请求，停止 SOCKS5 并退出容器。"
+      exit_runtime_supervisor 1
+    fi
+
+    if ! kill -0 "$child_pid" 2>/dev/null; then
+      wait "$child_pid"
+      return $?
+    fi
+
+    sleep 1
+  done
+}
+
 start_tunnel() {
   candidate_count="$(endpoint_candidate_count)"
   # 无候选时视为单次尝试（不覆盖 Endpoint）；有候选时依次轮询每个候选。
@@ -804,6 +865,8 @@ start_tunnel() {
 
 start_socks5() {
   microsocks_log_pipe="/tmp/warp-socks-microsocks.log.pipe"
+  mkdir -p "$HEALTHCHECK_STATE_DIR"
+  clear_healthcheck_runtime_state
   log "启动无认证 SOCKS5（容器内监听）: ${LISTEN_ADDR}:${LISTEN_PORT}"
   if [ -n "$HOST_LISTEN_PORT" ]; then
     log "Docker 发布端口（宿主机入口）: ${HOST_LISTEN_ADDR:-0.0.0.0}:${HOST_LISTEN_PORT} -> 容器 ${LISTEN_ADDR}:${LISTEN_PORT}"
@@ -816,15 +879,26 @@ start_socks5() {
       log "microsocks 连接日志已启用，默认隐藏本地 127.0.0.1/::1 探测流量。"
     fi
     create_formatted_log_pipe "$microsocks_log_pipe" "microsocks" "INFO" "should_emit_microsocks_log_line"
-    exec microsocks -i "$LISTEN_ADDR" -p "$LISTEN_PORT" >"$FORMATTED_LOG_PIPE" 2>&1
+    microsocks -i "$LISTEN_ADDR" -p "$LISTEN_PORT" >"$FORMATTED_LOG_PIPE" 2>&1 &
+    MICROSOCKS_PID="$!"
+    mark_healthcheck_runtime_ready
+    supervise_microsocks "$MICROSOCKS_PID"
+    return $?
   fi
 
   log "microsocks 连接日志已关闭。"
-  exec microsocks -q -i "$LISTEN_ADDR" -p "$LISTEN_PORT"
+  microsocks -q -i "$LISTEN_ADDR" -p "$LISTEN_PORT" &
+  MICROSOCKS_PID="$!"
+  mark_healthcheck_runtime_ready
+  supervise_microsocks "$MICROSOCKS_PID"
 }
 
 mkdir -p "$WG_DIR"
 prepare_runtime
+clear_healthcheck_runtime_state
+trap 'handle_runtime_shutdown TERM' TERM
+trap 'handle_runtime_shutdown INT' INT
+trap 'handle_runtime_shutdown HUP' HUP
 
 requested_backend="$(detect_requested_backend "$(current_state_backend)")"
 LOG_MODE="$requested_backend"

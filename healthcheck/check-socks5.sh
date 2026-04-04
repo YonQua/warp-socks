@@ -10,13 +10,36 @@ port="${BIND_PORT:-1080}"
 trace_url="https://cloudflare.com/cdn-cgi/trace"
 state_dir="/tmp/warp-socks-healthcheck"
 fail_count_file="${state_dir}/fail-count"
+restart_request_file="${state_dir}/restart-requested"
+ready_file="${state_dir}/runtime-ready"
 auto_recover="${HEALTHCHECK_AUTO_RECOVER:-1}"
 failure_threshold="${HEALTHCHECK_AUTO_RECOVER_THRESHOLD:-3}"
+# 运行期健康检查会顺序探测 socks5h 和 socks5 两条路径。
+# 这里保留 10 秒单探测窗口，兼顾抖动网络下的容忍度；
+# Dockerfile 里的 HEALTHCHECK timeout 必须始终大于“两次探测总耗时 + 脚本开销”，
+# 否则 Docker 会先把脚本杀掉，后面的失败计数和 TERM 自恢复逻辑根本来不及执行。
+probe_timeout_seconds=10
 LOG_MODE_STATE_FILE="${LOG_MODE_STATE_FILE:-/etc/wireguard/state.json}"
 LOG_COMPONENT="healthcheck"
 
 log() {
   emit_log_line "$LOG_COMPONENT" "INFO" "$*" >&2
+}
+
+clear_restart_request() {
+  rm -f "$restart_request_file"
+}
+
+request_container_restart() {
+  requested_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  printf '{"requested_at":"%s","failures":"%s"}\n' "$requested_at" "$current_failures" >"$restart_request_file"
+  chmod 600 "$restart_request_file"
+  log "连续失败达到阈值，已写入重启请求标记，等待 PID 1 监督进程退出容器。"
+}
+
+clear_recovery_state() {
+  clear_fail_count
+  clear_restart_request
 }
 
 read_fail_count() {
@@ -57,20 +80,28 @@ latest_handshake() {
 
 failure_threshold="$(sanitize_positive_int "$failure_threshold" 3)"
 mkdir -p "$state_dir"
+
+# 启动阶段由入口脚本自己的出口探测与失败退出负责。
+# 只有当 PID 1 明确标记“运行态已 ready”后，healthcheck 才接管运行期恢复。
+if [ ! -f "$ready_file" ]; then
+  clear_recovery_state
+  exit 0
+fi
+
 previous_failures="$(read_fail_count)"
 
 remote_reason=""
-if remote_reason="$(probe_socks_trace remote_dns "$port" 10 "$trace_url")"; then
+if remote_reason="$(probe_socks_trace remote_dns "$port" "$probe_timeout_seconds" "$trace_url")"; then
   if [ "$previous_failures" -gt 0 ]; then
     log "远端解析路径恢复，已清除连续失败计数 ${previous_failures}。"
   fi
-  clear_fail_count
+  clear_recovery_state
   exit 0
 fi
 
 local_dns_ok=0
 local_reason=""
-if local_reason="$(probe_socks_trace local_dns "$port" 10 "$trace_url")"; then
+if local_reason="$(probe_socks_trace local_dns "$port" "$probe_timeout_seconds" "$trace_url")"; then
   local_dns_ok=1
 else
   :
@@ -92,8 +123,7 @@ if is_true "$auto_recover" && [ "$current_failures" -ge "$failure_threshold" ]; 
   if [ "$endpoint_total" -gt 1 ]; then
     log "连续失败达到阈值，容器重启后会按显式 endpoint 候选顺序重新尝试。"
   fi
-  log "连续失败达到阈值，发送 TERM 给 PID 1 触发容器重启。"
-  kill -TERM 1 || log "向 PID 1 发送 TERM 失败。"
+  request_container_restart
 fi
 
 exit 1

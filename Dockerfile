@@ -47,7 +47,9 @@ COPY healthcheck/check-socks5.sh /usr/local/bin/healthcheck-check-socks5.sh
 
 RUN chmod +x /usr/local/bin/entrypoint.sh /usr/local/bin/healthcheck-check-socks5.sh /usr/local/lib/warp-common.sh
 
-HEALTHCHECK --interval=30s --timeout=12s --start-period=20s --retries=3 \
+# 健康检查脚本会顺序做两次最坏 10 秒的 trace 探测；
+# 这里留出额外余量，确保脚本能跑完整个失败计数和自恢复分支。
+HEALTHCHECK --interval=30s --timeout=25s --start-period=20s --retries=3 \
   CMD ["/usr/local/bin/healthcheck-check-socks5.sh"]
 
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]

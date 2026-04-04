@@ -82,7 +82,7 @@ docker compose ps
 
 启动阶段会先探测公网出口：只有在拿到出口 IP 后才会启动 `microsocks`；如果连续探测失败，容器会直接退出，交给 Docker 按 `restart` 策略重试，而不是起一个实际上不可用的 SOCKS5 端口。
 
-镜像内置了一个极简 `HEALTHCHECK`：它会在容器内通过本地 SOCKS5 访问 `https://cloudflare.com/cdn-cgi/trace`，并检查是否返回 `warp=on` 或 `warp=plus`。默认情况下，连续失败达到阈值后它会终止容器主进程，交给 Docker 按 `restart` 策略自动拉起容器并重建隧道；如果你只想观测不恢复，可设置 `HEALTHCHECK_AUTO_RECOVER=0`。
+镜像内置了一个极简 `HEALTHCHECK`：它会在容器内通过本地 SOCKS5 访问 `https://cloudflare.com/cdn-cgi/trace`，并检查是否返回 `warp=on` 或 `warp=plus`。运行期会顺序测一次 `socks5h` 远端解析路径和一次 `socks5` 本地解析路径；默认每次单探测超时是 10 秒，Docker healthcheck 总超时是 25 秒，目的是既给短时网络抖动留一点恢复窗口，也避免健康检查自己先被 Docker timeout 杀掉。启动期仍由入口脚本自己的出口探测与失败退出负责；只有当 PID 1 明确标记“运行态已 ready”后，healthcheck 才接管运行期恢复。默认情况下，连续失败达到阈值后，healthcheck 会写入一个“请求重启”标记，由 PID 1 监督进程主动停止 `microsocks` 并退出容器，再交给 Docker 按 `restart` 策略自动拉起新实例并重建隧道；如果你只想观测不恢复，可设置 `HEALTHCHECK_AUTO_RECOVER=0`。注意：如果 `RESTART_POLICY=no`，那么达到阈值后容器会退出，但不会自动拉起新实例。
 
 默认配置还包含三类运行保护：
 
@@ -97,8 +97,9 @@ docker compose ps
 6. 验证代理：
 
 ```bash
-# 默认 HOST_BIND_PORT=1080；如果你把它改成 2080，这里也要改成 2080
-curl --socks5 127.0.0.1:1080 https://cloudflare.com/cdn-cgi/trace
+# 这里走的是容器内 curl -> 容器内 microsocks，默认看 BIND_PORT；只有你改了 BIND_PORT 时这里才需要一起改
+docker exec -it warp-socks curl --socks5 127.0.0.1:1080 https://cloudflare.com/cdn-cgi/trace
+
 ```
 
 正常情况下：
@@ -117,7 +118,7 @@ curl --socks5 127.0.0.1:1080 https://cloudflare.com/cdn-cgi/trace
 ```yaml
 services:
   warp-socks:
-    image: ghcr.io/yonqua/warp-socks:v0.3.0
+    image: ghcr.io/yonqua/warp-socks:v0.3.2
     container_name: warp-socks
     restart: unless-stopped
     cap_add:
@@ -133,7 +134,7 @@ services:
       - .env
 ```
 
-`.env` 可以直接从 [.env.example](/Users/leishao/Docker/warp-socks/.env.example) 复制；生产或长期使用建议固定版本 tag，后续升级时再显式改版本。GHCR 只是分发层，不会替代运行时的 `.env`、`cap_add`、`./wireguard` 持久化状态和目标 VPS 的 WireGuard / iptables 能力。
+`.env` 可以直接从 [.env.example](./.env.example) 复制；生产或长期使用建议固定版本 tag，后续升级时再显式改版本。GHCR 只是分发层，不会替代运行时的 `.env`、`cap_add`、`./wireguard` 持久化状态和目标 VPS 的 WireGuard / iptables 能力。
 
 ## 端口与地址层级
 
@@ -247,13 +248,19 @@ docker compose logs --tail=80
 docker compose ps
 ```
 
-如果不是 `healthy`，再看日志：
+如果不是 `healthy`，先看容器日志：
 
 ```bash
 docker compose logs --tail=120
 ```
 
-健康检查默认会在连续失败达到阈值后触发一次容器重启，以便重新建立隧道；如果你把 `HEALTHCHECK_AUTO_RECOVER=0`，它就只负责探测。常见原因包括：
+再看 healthcheck 自己的最近探测记录：
+
+```bash
+docker inspect --format '{{json .State.Health.Log}}' warp-socks
+```
+
+健康检查默认会在连续失败达到阈值后写入重启请求，由 PID 1 监督进程退出容器，以便重新建立隧道；如果你把 `HEALTHCHECK_AUTO_RECOVER=0`，它就只负责探测。如果 `RESTART_POLICY=no`，达到阈值后容器会退出，但不会自动拉起。常见原因包括：
 
 - `wg0` 没拉起来
 - 注册后端状态与当前请求不一致
