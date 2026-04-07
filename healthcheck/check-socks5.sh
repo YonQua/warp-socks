@@ -6,20 +6,20 @@ COMMON_SH="${SCRIPT_DIR}/../lib/warp-common.sh"
 [ -f "$COMMON_SH" ] || COMMON_SH="/usr/local/lib/warp-common.sh"
 . "$COMMON_SH"
 
-port="${BIND_PORT:-1080}"
+port="1080"
 trace_url="https://cloudflare.com/cdn-cgi/trace"
 state_dir="/tmp/warp-socks-healthcheck"
 fail_count_file="${state_dir}/fail-count"
 restart_request_file="${state_dir}/restart-requested"
 ready_file="${state_dir}/runtime-ready"
-auto_recover="${HEALTHCHECK_AUTO_RECOVER:-1}"
-failure_threshold="${HEALTHCHECK_AUTO_RECOVER_THRESHOLD:-3}"
+auto_recover="1"
+failure_threshold="3"
 # 运行期健康检查会顺序探测 socks5h 和 socks5 两条路径。
 # 这里保留 10 秒单探测窗口，兼顾抖动网络下的容忍度；
 # Dockerfile 里的 HEALTHCHECK timeout 必须始终大于“两次探测总耗时 + 脚本开销”，
-# 否则 Docker 会先把脚本杀掉，后面的失败计数和 TERM 自恢复逻辑根本来不及执行。
+# 否则 Docker 会先把脚本杀掉，后面的失败计数和重启请求逻辑根本来不及执行。
 probe_timeout_seconds=10
-LOG_MODE_STATE_FILE="${LOG_MODE_STATE_FILE:-/etc/wireguard/state.json}"
+LOG_MODE="${LOG_MODE:-teams}"
 LOG_COMPONENT="healthcheck"
 
 log() {
@@ -119,8 +119,7 @@ fi
 log "$message"
 
 if is_true "$auto_recover" && [ "$current_failures" -ge "$failure_threshold" ]; then
-  endpoint_total="$(endpoint_candidate_count)"
-  if [ "$endpoint_total" -gt 1 ]; then
+  if [ -n "${ENDPOINT_CANDIDATES:-}" ]; then
     log "连续失败达到阈值，容器重启后会按显式 endpoint 候选顺序重新尝试。"
   fi
   request_container_restart

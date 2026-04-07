@@ -4,6 +4,7 @@ TRACE_URL_DEFAULT="https://cloudflare.com/cdn-cgi/trace"
 TRACE_IP_URL_DEFAULT="https://1.1.1.1/cdn-cgi/trace"
 LOG_TIMEZONE_DEFAULT="CST-8"
 LOG_TIME_FORMAT_DEFAULT="%Y-%m-%d %H:%M:%S %Z"
+LOG_MODE_DEFAULT="teams"
 
 log_timestamp() {
   TZ="${LOG_TIMEZONE:-$LOG_TIMEZONE_DEFAULT}" \
@@ -16,12 +17,7 @@ current_log_mode() {
     return 0
   fi
 
-  state_file="${LOG_MODE_STATE_FILE:-/etc/wireguard/state.json}"
-  [ -s "$state_file" ] || return 0
-
-  mode="$(sed -n 's/.*"backend":"\([^"]*\)".*/\1/p' "$state_file" | head -n 1)"
-  [ -n "$mode" ] || return 0
-  printf '%s' "$mode"
+  printf '%s' "$LOG_MODE_DEFAULT"
 }
 
 emit_log_line() {
@@ -197,31 +193,4 @@ probe_socks_trace() {
   rm -f "$trace_file" "$err_file"
   printf '%s' "$reason"
   return 1
-}
-
-has_explicit_endpoint_candidates() {
-  [ -n "${ENDPOINT_IP:-}" ] || [ -n "${ENDPOINT_CANDIDATES:-}" ]
-}
-
-normalize_endpoint_list() {
-  {
-    printf '%s\n' "${ENDPOINT_IP:-}"
-    printf '%s\n' "${ENDPOINT_CANDIDATES:-}"
-  } \
-    | tr ',' '\n' \
-    | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' \
-    | awk 'NF && !seen[$0]++'
-}
-
-endpoint_candidate_count() {
-  normalize_endpoint_list | awk 'NF {count++} END {print count+0}'
-}
-
-endpoint_candidate_at() {
-  index="$(sanitize_positive_int "${1:-0}" 0)"
-  if [ "$index" -le 0 ]; then
-    return 1
-  fi
-
-  normalize_endpoint_list | sed -n "${index}p" | head -n 1
 }

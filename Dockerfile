@@ -18,27 +18,10 @@ RUN apk add --no-cache build-base ca-certificates curl \
 
 FROM alpine:${ALPINE_VERSION}
 
-ARG WGCF_VERSION=v2.2.30
-
-# 固化 Docker 里的 wg-quick 兼容修补，避免容器启动时写只读 sysctl 导致退出。
-RUN apk add --no-cache ca-certificates curl iproute2 iptables wireguard-tools \
- && sed -i '/sysctl -q net\.ipv4\.conf\.all\.src_valid_mark=1/d' /usr/bin/wg-quick \
- && arch="$(apk --print-arch)" \
- && case "$arch" in \
-      x86_64) wgcf_arch="amd64" ;; \
-      aarch64) wgcf_arch="arm64" ;; \
-      x86) wgcf_arch="386" ;; \
-      armv7) wgcf_arch="armv7" ;; \
-      armhf) wgcf_arch="armv6" ;; \
-      s390x) wgcf_arch="s390x" ;; \
-      *) echo "Unsupported architecture for wgcf: $arch" >&2; exit 1 ;; \
-    esac \
- && curl --fail --show-error --location \
-      --retry 5 --retry-all-errors --retry-delay 2 \
-      --connect-timeout 20 \
-      "https://github.com/ViRb3/wgcf/releases/download/${WGCF_VERSION}/wgcf_${WGCF_VERSION#v}_linux_${wgcf_arch}" \
-      -o /usr/local/bin/wgcf \
- && chmod +x /usr/local/bin/wgcf
+# 当前版本只保留 Teams registration + WireGuard。
+# 同时固化 Docker 里的 wg-quick 兼容修补，避免容器启动时写只读 sysctl 导致退出。
+RUN apk add --no-cache ca-certificates curl iproute2 iptables jq wireguard-tools \
+ && sed -i '/sysctl -q net\.ipv4\.conf\.all\.src_valid_mark=1/d' /usr/bin/wg-quick
 
 COPY --from=builder /src/microsocks/microsocks /usr/local/bin/microsocks
 COPY lib/warp-common.sh /usr/local/lib/warp-common.sh

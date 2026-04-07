@@ -8,10 +8,8 @@ services:
     image: warp-socks:latest
     container_name: warp-socks
     restart: ${RESTART_POLICY:-unless-stopped}
-    # 当前仓库的主运行方式是 docker compose up，而不是 Swarm；
-    # 这里直接使用 Compose 服务级限制，避免 deploy.resources 在不同平台上语义漂移。
-    mem_limit: ${MEM_LIMIT:-256m}
-    cpus: ${CPU_LIMIT:-0.50}
+    mem_limit: 256m
+    cpus: 0.50
     cap_add:
       - NET_ADMIN
       - SYS_MODULE
@@ -19,30 +17,11 @@ services:
       # wg-quick 依赖这个标记做策略路由；容器内实际兼容处理已在镜像里固化。
       net.ipv4.conf.all.src_valid_mark: '1'
     environment:
-      AUTH_MODE: ${AUTH_MODE:-auto}
       TEAMS_TOKEN: ${TEAMS_TOKEN:-}
-      WARP_LICENSE_KEY: ${WARP_LICENSE_KEY:-}
-      FORCE_REREGISTER: ${FORCE_REREGISTER:-0}
       # 仅用于容器启动日志，帮助区分“宿主机入口”与“容器内监听”。
       HOST_BIND_IP: ${HOST_BIND_IP:-127.0.0.1}
       HOST_BIND_PORT: ${HOST_BIND_PORT:-1080}
-      BIND_ADDR: ${BIND_ADDR:-0.0.0.0}
-      BIND_PORT: ${BIND_PORT:-1080}
-      WARP_STACK: ${WARP_STACK:-dual}
-      REGISTER_RETRIES: ${REGISTER_RETRIES:-3}
-      REGISTER_RETRY_DELAY: ${REGISTER_RETRY_DELAY:-5}
-      STARTUP_EGRESS_PROBE_RETRIES: ${STARTUP_EGRESS_PROBE_RETRIES:-3}
-      STARTUP_EGRESS_PROBE_DELAY: ${STARTUP_EGRESS_PROBE_DELAY:-2}
-      STARTUP_EGRESS_PROBE_TIMEOUT: ${STARTUP_EGRESS_PROBE_TIMEOUT:-5}
-      LOCAL_BYPASS_INCLUDE_PRIMARY: ${LOCAL_BYPASS_INCLUDE_PRIMARY:-1}
-      LOCAL_BYPASS_IPV4_SUBNETS: ${LOCAL_BYPASS_IPV4_SUBNETS:-10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,100.64.0.0/10,169.254.0.0/16}
-      LOCAL_BYPASS_IPV6_SUBNETS: ${LOCAL_BYPASS_IPV6_SUBNETS:-fc00::/7,fe80::/10}
-      # 兼容注册 API 的客户端标识；默认沿用社区验证过的旧值，需要试新值时可在 .env 覆盖。
-      CF_CLIENT_VERSION: ${CF_CLIENT_VERSION:-a-6.10-2158}
-      ENDPOINT_IP: ${ENDPOINT_IP:-}
       ENDPOINT_CANDIDATES: ${ENDPOINT_CANDIDATES:-}
-      HEALTHCHECK_AUTO_RECOVER: ${HEALTHCHECK_AUTO_RECOVER:-1}
-      HEALTHCHECK_AUTO_RECOVER_THRESHOLD: ${HEALTHCHECK_AUTO_RECOVER_THRESHOLD:-3}
       LOG_TIMEZONE: ${LOG_TIMEZONE:-CST-8}
       LOG_TIME_FORMAT: ${LOG_TIME_FORMAT:-%Y-%m-%d %H:%M:%S %Z}
       MICROSOCKS_LOG_ACCESS: ${MICROSOCKS_LOG_ACCESS:-1}
@@ -50,11 +29,11 @@ services:
     logging:
       driver: json-file
       options:
-        max-size: ${LOG_MAX_SIZE:-1m}
-        max-file: ${LOG_MAX_FILE:-1}
+        max-size: 1m
+        max-file: '1'
     ports:
       # 默认只绑定到本机，先确保代理可用；需要对外暴露时再改 HOST_BIND_IP=0.0.0.0
-      - '${HOST_BIND_IP:-127.0.0.1}:${HOST_BIND_PORT:-1080}:${BIND_PORT:-1080}'
+      - '${HOST_BIND_IP:-127.0.0.1}:${HOST_BIND_PORT:-1080}:1080'
     volumes:
       # 把注册结果和 WireGuard 配置直接落到当前目录，便于查看和备份。
       - ./wireguard:/etc/wireguard
