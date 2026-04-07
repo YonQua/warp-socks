@@ -5,6 +5,10 @@ TRACE_IP_URL_DEFAULT="https://1.1.1.1/cdn-cgi/trace"
 LOG_TIMEZONE_DEFAULT="CST-8"
 LOG_TIME_FORMAT_DEFAULT="%Y-%m-%d %H:%M:%S %Z"
 LOG_MODE_DEFAULT="teams"
+ENDPOINT_STATE_FILE_DEFAULT="/etc/wireguard/endpoint-state.json"
+ENDPOINT_COOLDOWN_SECONDS_DEFAULT="600"
+PROBE_DIRECT_TRACE_REASON=""
+PROBE_DIRECT_TRACE_IP=""
 
 log_timestamp() {
   TZ="${LOG_TIMEZONE:-$LOG_TIMEZONE_DEFAULT}" \
@@ -133,6 +137,184 @@ sanitize_positive_int() {
   esac
 }
 
+endpoint_state_file() {
+  printf '%s' "${ENDPOINT_STATE_FILE:-$ENDPOINT_STATE_FILE_DEFAULT}"
+}
+
+ensure_endpoint_state_file() {
+  state_file="$(endpoint_state_file)"
+  mkdir -p "$(dirname "$state_file")"
+  if [ ! -s "$state_file" ]; then
+    printf '%s\n' '{"last_good_endpoint":"","active_endpoint":"","cooldowns":{}}' >"$state_file"
+    chmod 600 "$state_file"
+  fi
+}
+
+endpoint_state_prune_cooldowns() {
+  ensure_endpoint_state_file
+  state_file="$(endpoint_state_file)"
+  now="$(date +%s)"
+  tmp_file="$(mktemp)"
+
+  if jq --argjson now "$now" \
+    '.cooldowns = ((.cooldowns // {}) | with_entries(select((((.value | tonumber?) // 0)) > $now)))' \
+    "$state_file" >"$tmp_file" 2>/dev/null; then
+    mv "$tmp_file" "$state_file"
+    chmod 600 "$state_file"
+  else
+    rm -f "$tmp_file"
+  fi
+}
+
+endpoint_state_get_last_good() {
+  state_file="$(endpoint_state_file)"
+  [ -s "$state_file" ] || return 0
+  jq -r '.last_good_endpoint // empty' "$state_file" 2>/dev/null || true
+}
+
+endpoint_state_get_active() {
+  state_file="$(endpoint_state_file)"
+  [ -s "$state_file" ] || return 0
+  jq -r '.active_endpoint // empty' "$state_file" 2>/dev/null || true
+}
+
+endpoint_state_set_active() {
+  endpoint="$1"
+  ensure_endpoint_state_file
+  state_file="$(endpoint_state_file)"
+  tmp_file="$(mktemp)"
+
+  if jq --arg endpoint "$endpoint" '.active_endpoint = $endpoint' \
+    "$state_file" >"$tmp_file" 2>/dev/null; then
+    mv "$tmp_file" "$state_file"
+    chmod 600 "$state_file"
+  else
+    rm -f "$tmp_file"
+  fi
+}
+
+endpoint_state_record_success() {
+  endpoint="$1"
+  ensure_endpoint_state_file
+  state_file="$(endpoint_state_file)"
+  tmp_file="$(mktemp)"
+
+  if jq --arg endpoint "$endpoint" \
+    '.last_good_endpoint = $endpoint
+     | .active_endpoint = $endpoint
+     | .cooldowns = ((.cooldowns // {}) | del(.[$endpoint]))' \
+    "$state_file" >"$tmp_file" 2>/dev/null; then
+    mv "$tmp_file" "$state_file"
+    chmod 600 "$state_file"
+  else
+    rm -f "$tmp_file"
+  fi
+}
+
+endpoint_state_get_cooldown_until() {
+  endpoint="$1"
+  state_file="$(endpoint_state_file)"
+  [ -s "$state_file" ] || return 0
+  jq -r --arg endpoint "$endpoint" '.cooldowns[$endpoint] // empty' \
+    "$state_file" 2>/dev/null || true
+}
+
+endpoint_state_cooldown_remaining() {
+  endpoint="$1"
+  cooldown_until="$(endpoint_state_get_cooldown_until "$endpoint")"
+  now="$(date +%s)"
+
+  case "$cooldown_until" in
+    ''|*[!0-9]*)
+      printf '0'
+      ;;
+    *)
+      if [ "$cooldown_until" -le "$now" ]; then
+        printf '0'
+      else
+        printf '%s' $((cooldown_until - now))
+      fi
+      ;;
+  esac
+}
+
+endpoint_state_is_cooling_down() {
+  endpoint="$1"
+  [ "$(endpoint_state_cooldown_remaining "$endpoint")" -gt 0 ]
+}
+
+endpoint_state_mark_cooldown() {
+  endpoint="$1"
+  cooldown_seconds="$(sanitize_positive_int "${2:-$ENDPOINT_COOLDOWN_SECONDS_DEFAULT}" "$ENDPOINT_COOLDOWN_SECONDS_DEFAULT")"
+  cooldown_until=$(( $(date +%s) + cooldown_seconds ))
+  ensure_endpoint_state_file
+  state_file="$(endpoint_state_file)"
+  tmp_file="$(mktemp)"
+
+  if jq --arg endpoint "$endpoint" --argjson cooldown_until "$cooldown_until" \
+    '.cooldowns = (.cooldowns // {})
+     | .cooldowns[$endpoint] = $cooldown_until' \
+    "$state_file" >"$tmp_file" 2>/dev/null; then
+    mv "$tmp_file" "$state_file"
+    chmod 600 "$state_file"
+  else
+    rm -f "$tmp_file"
+  fi
+}
+
+endpoint_host_from_value() {
+  endpoint="$1"
+  case "$endpoint" in
+    \[*\]:*)
+      sed -n 's/^\[\(.*\)\]:[0-9][0-9]*$/\1/p' <<EOF
+$endpoint
+EOF
+      ;;
+    *:*)
+      printf '%s' "${endpoint%:*}"
+      ;;
+    *)
+      printf '%s' "$endpoint"
+      ;;
+  esac
+}
+
+endpoint_port_from_value() {
+  endpoint="$1"
+  case "$endpoint" in
+    \[*\]:*)
+      sed -n 's/^.*]:\([0-9][0-9]*\)$/\1/p' <<EOF
+$endpoint
+EOF
+      ;;
+    *:*)
+      printf '%s' "${endpoint##*:}"
+      ;;
+    *)
+      printf ''
+      ;;
+  esac
+}
+
+format_endpoint_value() {
+  host="$1"
+  port="$2"
+  case "$host" in
+    *:*)
+      printf '[%s]:%s' "$host" "$port"
+      ;;
+    *)
+      printf '%s:%s' "$host" "$port"
+      ;;
+  esac
+}
+
+current_wg_conf_endpoint() {
+  wg_conf="${1:-/etc/wireguard/wg0.conf}"
+  [ -s "$wg_conf" ] || return 0
+  sed -n 's/^Endpoint[[:space:]]*=[[:space:]]*//p' "$wg_conf" | head -n 1
+}
+
 extract_trace_field() {
   field="$1"
   sed -n "s/^${field}=\(.*\)$/\1/p" | head -n 1
@@ -141,8 +323,37 @@ extract_trace_field() {
 probe_direct_trace_ip() {
   timeout_seconds="$(sanitize_positive_int "$1" 5)"
   trace_url="${2:-$TRACE_IP_URL_DEFAULT}"
-  trace="$(curl -s --max-time "$timeout_seconds" "$trace_url" || true)"
-  printf '%s\n' "$trace" | extract_trace_field ip
+  trace_file="$(mktemp)"
+  err_file="$(mktemp)"
+  PROBE_DIRECT_TRACE_REASON=""
+  PROBE_DIRECT_TRACE_IP=""
+
+  if ! curl \
+    --silent \
+    --show-error \
+    --fail \
+    --location \
+    --max-time "$timeout_seconds" \
+    "$trace_url" \
+    >"$trace_file" \
+    2>"$err_file"; then
+    PROBE_DIRECT_TRACE_REASON="$(tr '\n' ' ' <"$err_file" | tr -s ' ' | cut -c 1-180)"
+    rm -f "$trace_file" "$err_file"
+    return 1
+  fi
+
+  trace_ip="$(extract_trace_field ip <"$trace_file")"
+  trace_warp="$(extract_trace_field warp <"$trace_file")"
+  if [ -n "$trace_ip" ] && printf '%s' "$trace_warp" | grep -qE '^(on|plus)$'; then
+    PROBE_DIRECT_TRACE_IP="$trace_ip"
+    rm -f "$trace_file" "$err_file"
+    return 0
+  fi
+
+  PROBE_DIRECT_TRACE_REASON="$(tr '\n' ' ' <"$trace_file" | tr -s ' ' | cut -c 1-180)"
+  [ -n "$PROBE_DIRECT_TRACE_REASON" ] || PROBE_DIRECT_TRACE_REASON="响应缺少 warp=on 或出口 IP。"
+  rm -f "$trace_file" "$err_file"
+  return 1
 }
 
 probe_socks_trace() {

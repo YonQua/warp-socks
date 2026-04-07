@@ -1,29 +1,21 @@
 # warp-socks
 
-一个只做一件事的 WARP SOCKS5 Docker 方案：用 Cloudflare Teams registration token 注册一次，生成 WireGuard 配置，然后稳定提供一个本机可访问的 SOCKS5 出口。
+一个面向单机部署的 WARP SOCKS5 Docker 方案：使用 Cloudflare Teams registration token 注册一次，生成 WireGuard 配置，然后稳定提供一个本机可访问的 SOCKS5 出口。
 
-当前版本明确不再支持多后端选择，也不再暴露大批运行时调参开关。
+当前版本明确只支持 Teams，不再支持多后端模式，也不暴露大批运行时调参开关。
 
-对外只保留一组很小的配置面：
+## 特性
 
-核心配置：
-
-- `TEAMS_TOKEN`
-- `HOST_BIND_IP`
-- `HOST_BIND_PORT`
-- `ENDPOINT_CANDIDATES`
-
-标准运行配置：
-
-- `RESTART_POLICY`
-- `LOG_TIMEZONE`
-- `LOG_TIME_FORMAT`
-- `MICROSOCKS_LOG_ACCESS`
-- `MICROSOCKS_LOG_LOCAL_CLIENTS`
+- Teams-only：单一注册链路，减少兼容复杂度
+- 薄状态模型：`account.json` 是唯一账户状态，`wg0.conf` 是派生文件
+- 启动期硬门禁：隧道未拿到 WARP 出口前，不启动 SOCKS5
+- 运行期自恢复：healthcheck 只判定失败，PID 1 负责退出容器交给 Docker 拉起
+- endpoint 记忆：记录最近一次成功的 endpoint，并对连续失败的 endpoint 做临时冷却
+- 小配置面：默认只需要一个 `TEAMS_TOKEN`
 
 ## 快速开始
 
-1. 复制模板：
+1. 复制模板并编辑 `.env`：
 
 ```bash
 cp .env.example .env
@@ -41,13 +33,13 @@ TEAMS_TOKEN=com.cloudflare.warp://<your-team>.cloudflareaccess.com/auth?token=<y
 docker compose up --build -d
 ```
 
-4. 看日志：
+4. 查看日志：
 
 ```bash
 docker compose logs -f
 ```
 
-5. 验证：
+5. 验证代理：
 
 ```bash
 docker exec warp-socks curl --socks5 127.0.0.1:1080 https://cloudflare.com/cdn-cgi/trace
@@ -55,68 +47,80 @@ docker exec warp-socks curl --socks5 127.0.0.1:1080 https://cloudflare.com/cdn-c
 
 正常情况下应至少看到 `warp=on`；Teams 路径通常还会带 `gateway=on`。
 
-## 设计边界
+## 配置
 
-从第一性原理看，这个仓库只需要三段逻辑：
+### 核心配置
+
+| 变量 | 必填 | 说明 |
+| --- | --- | --- |
+| `TEAMS_TOKEN` | 是 | Cloudflare Teams registration token，推荐直接填完整 `com.cloudflare.warp://...auth?token=...` 链接 |
+| `HOST_BIND_IP` | 否 | 宿主机发布地址，默认 `127.0.0.1` |
+| `HOST_BIND_PORT` | 否 | 宿主机发布端口，默认 `1080` |
+| `ENDPOINT_CANDIDATES` | 否 | 手工覆盖 endpoint 列表；留空时使用项目内置候选池 |
+
+### 标准运行配置
+
+| 变量 | 默认值 | 说明 |
+| --- | --- | --- |
+| `RESTART_POLICY` | `unless-stopped` | Docker 重启策略 |
+| `LOG_TIMEZONE` | `CST-8` | 容器日志时区 |
+| `LOG_TIME_FORMAT` | `%Y-%m-%d %H:%M:%S %Z` | 容器日志时间格式 |
+| `MICROSOCKS_LOG_ACCESS` | `1` | 是否输出 microsocks 连接日志 |
+| `MICROSOCKS_LOG_LOCAL_CLIENTS` | `0` | 是否显示本地 `127.0.0.1` / `::1` 探测流量 |
+
+## Endpoint 策略
+
+`ENDPOINT_CANDIDATES` 是唯一手工覆盖入口。
+
+- 如果你显式填写了 `ENDPOINT_CANDIDATES`，启动阶段会按你给定的顺序逐个尝试。
+- 如果你留空，启动阶段会使用项目内置的实测候选池：
+  - `162.159.193.5:2408`
+  - `162.159.193.9:2408`
+  - `162.159.193.8:2408`
+  - `162.159.193.3:2408`
+  - `162.159.193.7:2408`
+
+运行期如果 healthcheck 连续失败达到阈值，当前 active endpoint 会被临时标记为冷却；容器重启后，启动链会优先尝试最近一次成功的 endpoint，并把进入冷却的 endpoint 排到后面。内部恢复状态会持久化到 `./wireguard/endpoint-state.json`。
+
+## 运行模型
+
+当前实现的主链只有三段：
 
 1. `TEAMS_TOKEN -> account.json`
 2. `account.json -> wg0.conf`
 3. `wg0 + healthcheck + microsocks`
 
-因此当前实现里：
+对应边界也很简单：
 
 - `account.json` 是唯一真实账户状态
 - `wg0.conf` 是派生文件
-- 如果 `account.json` 已存在，就直接复用
-- 如果你想重建状态，就删除 `./wireguard/account.json` 和 `./wireguard/wg0.conf`
-- `ENDPOINT_CANDIDATES` 默认留空；只有当默认 endpoint 在你当前网络环境里不稳定时，再显式配置候选池
+- 启动阶段先拉起 `wg0`，再探测 WARP 出口，成功后才启动 `microsocks`
+- 运行期健康检查只负责判定失败和写重启请求，不直接做修复动作
+- PID 1 监督者收到重启请求后退出容器，再交给 Docker 重新拉起
 
-## 运行说明
+容器内 SOCKS5 固定监听 `0.0.0.0:1080`，宿主机入口由 `HOST_BIND_IP:HOST_BIND_PORT` 决定。默认只监听 `127.0.0.1:1080`。`microsocks` 是无认证 SOCKS5，不建议直接暴露到公网。
 
-- 容器内 SOCKS5 固定监听 `0.0.0.0:1080`
-- 宿主机入口由 `HOST_BIND_IP:HOST_BIND_PORT` 决定
-- 默认只监听 `127.0.0.1:1080`
-- `microsocks` 无认证，不建议直接暴露到公网
-
-启动阶段会先拉起 `wg0`，再做出口探测；只有探测成功后才启动 `microsocks`。如果启动阶段没有拿到出口 IP，容器会直接退出，交给 Docker 重启，而不是留下一个假可用端口。
-
-运行期健康检查只做一件事：通过本地 SOCKS5 访问 `https://cloudflare.com/cdn-cgi/trace`，确认出口仍然是 WARP。如果连续失败，healthcheck 会请求 PID 1 主动退出容器，让 Docker 重新拉起新实例。
-
-如果你配置了多个 endpoint 候选，启动阶段会按顺序逐个重建 `wg0.conf` 并逐个测试；运行期异常重启后，新实例会再次从候选列表头部开始尝试。这样保留了“多个 IP 轮换测试”的能力，但仍然维持单一 Teams 主链和简单恢复模型。只填一个时，就等价于固定单个 endpoint；留空时则直接使用 Teams 返回的默认 endpoint。
-
-日志时间格式和 microsocks 访问日志也保留成了少量标准运行配置：
-
-- `LOG_TIMEZONE` / `LOG_TIME_FORMAT` 控制容器内脚本日志时间格式
-- `MICROSOCKS_LOG_ACCESS=0` 时完全关闭 microsocks 连接日志
-- `MICROSOCKS_LOG_LOCAL_CLIENTS=1` 时显示本地 `127.0.0.1` / `::1` 探测流量，便于排障
-
-入口在复用或新建 `account.json` 后，会自动清理旧模型遗留的 `state.json` 和 `wgcf-*` 文件；因此完成一次新的 Teams 启动后，`./wireguard` 会自然收敛到当前模型。
+入口在复用或新建 `account.json` 后，会自动清理旧模型遗留的 `state.json` 和 `wgcf-*` 文件；完成一次新的 Teams 启动后，`./wireguard` 会自然收敛到当前模型。
 
 ## 获取 Teams Token
 
 `TEAMS_TOKEN` 推荐直接填完整的 `com.cloudflare.warp://...auth?token=...` 链接。
 
-1. 打开：
-
-```text
-https://<team-name>.cloudflareaccess.com/warp
-```
-
-2. 完成登录。
-
+1. 打开 `https://<team-name>.cloudflareaccess.com/warp`
+2. 完成登录
 3. 在开发者工具里找到：
 
 ```text
 com.cloudflare.warp://<team-name>.cloudflareaccess.com/auth?token=...
 ```
 
-4. 复制整条链接到 `.env`。
+4. 把整条链接复制到 `.env`
 
 这类 token 时效很短，复制后尽量立刻启动。
 
 ## 故障排查
 
-### 1. 容器起不来
+### 容器起不来
 
 先看：
 
@@ -130,9 +134,9 @@ docker compose logs --tail=80
 - token 已过期
 - Cloudflare 返回 `429 Too Many Requests`
 
-当前实现遇到 `429` 时会按线性退避重试，并尊重服务端 `Retry-After`，避免立刻重启后继续撞接口。
+当前实现遇到 `429` 时会按线性退避重试，并尊重服务端 `Retry-After`，避免容器立刻重启后继续撞接口。
 
-### 2. 代理端口有了，但没有流量
+### 代理端口有了，但没有流量
 
 先看：
 
@@ -144,25 +148,22 @@ docker inspect --format '{{json .State.Health.Log}}' warp-socks
 重点关注：
 
 - `当前出口 IP: ...`
+- `启动后第 ... 次出口探测未通过: ...`
 - `远端解析路径探测失败`
 - `本地解析路径也失败`
 
-如果默认 endpoint 在你当前网络环境里经常握手失败，可以在 `.env` 里设置：
+如果你已经知道一组更适合当前网络环境的 endpoint，可以在 `.env` 里显式设置：
 
 ```env
 ENDPOINT_CANDIDATES=ip1:port,ip2:port,ip3:port
 ```
 
-每次候选切换时，入口脚本都会重新从 `account.json` 生成一份新的 `wg0.conf`，而不是在旧文件上继续打补丁。
-
-### 3. 想重建状态
+### 想重建状态
 
 ```bash
-rm -f wireguard/account.json wireguard/wg0.conf
+rm -f wireguard/account.json wireguard/wg0.conf wireguard/endpoint-state.json
 docker compose up --build -d
 ```
-
-这次成功启动也会顺手清掉旧的历史文件。
 
 ## 预构建镜像
 

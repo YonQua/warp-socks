@@ -9,6 +9,7 @@ COMMON_SH="${SCRIPT_DIR}/lib/warp-common.sh"
 WG_DIR="/etc/wireguard"
 WG_CONF="${WG_DIR}/wg0.conf"
 ACCOUNT_JSON="${WG_DIR}/account.json"
+ENDPOINT_STATE_FILE="${WG_DIR}/endpoint-state.json"
 
 REGISTER_URL="https://api.cloudflareclient.com/v0a2158/reg"
 CF_CLIENT_VERSION="a-6.10-2158"
@@ -27,6 +28,8 @@ REGISTER_RETRY_DELAY=5
 STARTUP_EGRESS_PROBE_RETRIES=3
 STARTUP_EGRESS_PROBE_DELAY=2
 STARTUP_EGRESS_PROBE_TIMEOUT=5
+ENDPOINT_COOLDOWN_SECONDS="600"
+DEFAULT_ENDPOINT_CANDIDATES="162.159.193.5:2408,162.159.193.9:2408,162.159.193.8:2408,162.159.193.3:2408,162.159.193.7:2408"
 
 LOCAL_BYPASS_RULE_PRIORITY_FALLBACK=97
 LOCAL_BYPASS_IPV4_SUBNETS="10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,100.64.0.0/10,169.254.0.0/16"
@@ -39,6 +42,7 @@ HEALTHCHECK_READY_FILE="${HEALTHCHECK_STATE_DIR}/runtime-ready"
 
 LOG_COMPONENT=""
 MICROSOCKS_PID=""
+ENDPOINT_SOURCE=""
 
 log() {
   log_info "$LOG_COMPONENT" "$*"
@@ -66,26 +70,107 @@ should_emit_microsocks_log_line() {
   return 0
 }
 
-normalize_endpoint_list() {
-  printf '%s\n' "$ENDPOINT_CANDIDATES" \
+normalize_endpoint_value() {
+  raw_endpoint="$1"
+  trimmed_endpoint="$(printf '%s\n' "$raw_endpoint" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+  [ -n "$trimmed_endpoint" ] || return 1
+
+  endpoint_host="$(endpoint_host_from_value "$trimmed_endpoint")"
+  endpoint_port="$(endpoint_port_from_value "$trimmed_endpoint")"
+  [ -n "$endpoint_host" ] || return 1
+  [ -n "$endpoint_port" ] || endpoint_port="2408"
+  format_endpoint_value "$endpoint_host" "$endpoint_port"
+}
+
+emit_manual_endpoint_candidates() {
+  source_candidates="$1"
+  printf '%s\n' "$source_candidates" \
     | tr ',' '\n' \
-    | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' \
+    | while IFS= read -r raw_endpoint; do
+      normalized_endpoint="$(normalize_endpoint_value "$raw_endpoint" || true)"
+      [ -n "$normalized_endpoint" ] || continue
+      printf '%s\n' "$normalized_endpoint"
+    done \
     | awk 'NF && !seen[$0]++'
 }
 
-endpoint_candidate_count() {
-  normalize_endpoint_list | awk 'NF {count++} END {print count+0}'
+emit_auto_endpoint_candidates() {
+  emit_manual_endpoint_candidates "$DEFAULT_ENDPOINT_CANDIDATES"
 }
 
-endpoint_candidate_at() {
-  index="$1"
-  normalize_endpoint_list | sed -n "${index}p" | head -n 1
+count_endpoint_candidates() {
+  candidate_file="$1"
+  awk 'NF {count++} END {print count+0}' "$candidate_file"
+}
+
+reorder_endpoint_candidates() {
+  candidate_file="$1"
+  endpoint_state_prune_cooldowns
+  last_good_endpoint="$(endpoint_state_get_last_good)"
+  merged_file="$(mktemp)"
+  ready_file="$(mktemp)"
+  cooled_file="$(mktemp)"
+
+  {
+    [ -n "$last_good_endpoint" ] && printf '%s\n' "$last_good_endpoint"
+    cat "$candidate_file"
+  } | awk 'NF && !seen[$0]++' >"$merged_file"
+
+  while IFS= read -r endpoint; do
+    [ -n "$endpoint" ] || continue
+    if endpoint_state_is_cooling_down "$endpoint"; then
+      printf '%s\n' "$endpoint" >>"$cooled_file"
+    else
+      printf '%s\n' "$endpoint" >>"$ready_file"
+    fi
+  done <"$merged_file"
+
+  cat "$ready_file" "$cooled_file" >"$candidate_file"
+  rm -f "$merged_file" "$ready_file" "$cooled_file"
+}
+
+build_endpoint_candidate_file() {
+  candidate_file="$1"
+  manual_candidates="$(emit_manual_endpoint_candidates "$ENDPOINT_CANDIDATES")"
+
+  if [ -n "$manual_candidates" ]; then
+    ENDPOINT_SOURCE="manual"
+    printf '%s\n' "$manual_candidates" >"$candidate_file"
+  else
+    ENDPOINT_SOURCE="auto"
+    emit_auto_endpoint_candidates | awk 'NF && !seen[$0]++' >"$candidate_file"
+  fi
+
+  reorder_endpoint_candidates "$candidate_file"
 }
 
 log_endpoint_candidate_plan() {
-  candidate_total="$(endpoint_candidate_count)"
-  if [ "$candidate_total" -gt 0 ]; then
-    log "检测到显式 endpoint 候选，共 ${candidate_total} 个。"
+  candidate_file="${1:-}"
+  [ -n "$candidate_file" ] || return 0
+  candidate_total="$(count_endpoint_candidates "$candidate_file")"
+  cooled_total=0
+  while IFS= read -r endpoint; do
+    [ -n "$endpoint" ] || continue
+    if endpoint_state_is_cooling_down "$endpoint"; then
+      cooled_total=$((cooled_total + 1))
+    fi
+  done <"$candidate_file"
+
+  case "$ENDPOINT_SOURCE" in
+    manual)
+      log "endpoint 策略: 手工候选，共 ${candidate_total} 个。"
+      ;;
+    *)
+      log "endpoint 策略: 自动候选，共 ${candidate_total} 个。"
+      ;;
+  esac
+
+  last_good_endpoint="$(endpoint_state_get_last_good)"
+  if [ -n "$last_good_endpoint" ]; then
+    log "最近成功 endpoint: ${last_good_endpoint}"
+  fi
+  if [ "$cooled_total" -gt 0 ]; then
+    log "当前有 ${cooled_total} 个 endpoint 处于冷却，会排到候选列表后部。"
   fi
 }
 
@@ -165,11 +250,19 @@ iterate_default_bypass_subnets() {
 configured_bypass_summary() {
   family="$1"
   primary_subnet="$2"
-  summary="$primary_subnet"
+  summary=""
+
+  if [ -n "$primary_subnet" ]; then
+    summary="$primary_subnet"
+  fi
 
   while IFS= read -r subnet; do
     [ -n "$subnet" ] || continue
-    summary="${summary},${subnet}"
+    if [ -n "$summary" ]; then
+      summary="${summary},${subnet}"
+    else
+      summary="$subnet"
+    fi
   done <<EOF
 $(iterate_default_bypass_subnets "$family")
 EOF
@@ -274,11 +367,12 @@ register_via_teams() {
 ensure_account_state() {
   if [ -s "$ACCOUNT_JSON" ]; then
     cleanup_obsolete_runtime_files
+    endpoint_state_prune_cooldowns
     log "检测到已有 Teams 账户，跳过重新注册。"
     return 0
   fi
 
-  rm -f "$WG_CONF"
+  rm -f "$WG_CONF" "$ENDPOINT_STATE_FILE"
   register_via_teams
   cleanup_obsolete_runtime_files
 }
@@ -535,14 +629,14 @@ wait_for_egress_ready() {
   attempt=1
 
   while [ "$attempt" -le "$STARTUP_EGRESS_PROBE_RETRIES" ]; do
-    egress_ip="$(probe_direct_trace_ip "$STARTUP_EGRESS_PROBE_TIMEOUT")"
-    if [ -n "$egress_ip" ]; then
+    if probe_direct_trace_ip "$STARTUP_EGRESS_PROBE_TIMEOUT"; then
+      egress_ip="$PROBE_DIRECT_TRACE_IP"
       log "当前出口 IP: ${egress_ip}"
       return 0
     fi
 
     if [ "$attempt" -lt "$STARTUP_EGRESS_PROBE_RETRIES" ]; then
-      warn "启动后第 ${attempt}/${STARTUP_EGRESS_PROBE_RETRIES} 次出口探测未获取到 IP，${STARTUP_EGRESS_PROBE_DELAY} 秒后重试。"
+      warn "启动后第 ${attempt}/${STARTUP_EGRESS_PROBE_RETRIES} 次出口探测未通过: ${PROBE_DIRECT_TRACE_REASON:-unknown}，${STARTUP_EGRESS_PROBE_DELAY} 秒后重试。"
       sleep "$STARTUP_EGRESS_PROBE_DELAY"
     fi
     attempt=$((attempt + 1))
@@ -606,17 +700,19 @@ supervise_microsocks() {
 }
 
 start_tunnel() {
-  candidate_count="$(endpoint_candidate_count)"
-  max_attempts="$([ "$candidate_count" -le 0 ] && echo 1 || echo "$candidate_count")"
+  candidate_file="$(mktemp)"
+  build_endpoint_candidate_file "$candidate_file"
+  log_endpoint_candidate_plan "$candidate_file"
+  candidate_count="$(count_endpoint_candidates "$candidate_file")"
+  [ "$candidate_count" -gt 0 ] || fail "未生成任何可用 endpoint 候选。"
+
+  endpoint_state_set_active ""
   index=1
 
-  while [ "$index" -le "$max_attempts" ]; do
+  while IFS= read -r endpoint_override; do
+    [ -n "$endpoint_override" ] || continue
     bring_down_tunnel_if_present
 
-    endpoint_override=""
-    if [ "$candidate_count" -gt 0 ]; then
-      endpoint_override="$(endpoint_candidate_at "$index")"
-    fi
     build_wg_config_from_account "$endpoint_override"
 
     log "正在启动 wg0"
@@ -624,21 +720,30 @@ start_tunnel() {
     ensure_local_network_bypass
 
     if wait_for_egress_ready; then
+      endpoint_state_record_success "$endpoint_override"
+      rm -f "$candidate_file"
       return 0
     fi
 
-    warn "启动后连续 ${STARTUP_EGRESS_PROBE_RETRIES} 次出口探测仍未获取到出口 IP。"
+    warn "当前 endpoint ${endpoint_override} 未通过出口探测: ${PROBE_DIRECT_TRACE_REASON:-unknown}。"
+    endpoint_state_mark_cooldown "$endpoint_override" "$ENDPOINT_COOLDOWN_SECONDS"
+    endpoint_state_set_active ""
+    cooldown_remaining="$(endpoint_state_cooldown_remaining "$endpoint_override")"
+    if [ "$cooldown_remaining" -gt 0 ]; then
+      warn "当前 endpoint ${endpoint_override} 已进入 ${cooldown_remaining} 秒冷却。"
+    fi
     bring_down_tunnel_if_present
 
     if [ "$candidate_count" -gt 1 ] && [ "$index" -lt "$candidate_count" ]; then
       next_index=$((index + 1))
-      next_endpoint="$(endpoint_candidate_at "$next_index")"
+      next_endpoint="$(sed -n "${next_index}p" "$candidate_file" | head -n 1)"
       warn "当前 endpoint ${endpoint_override:-unknown} 未通过出口探测，切换到候选 ${next_index}/${candidate_count}: ${next_endpoint:-unknown}。"
     fi
 
     index=$((index + 1))
-  done
+  done <"$candidate_file"
 
+  rm -f "$candidate_file"
   fail "启动阶段出口探测失败，退出等待容器重启。"
 }
 
@@ -683,6 +788,5 @@ export LOG_MODE
 
 log "当前注册后端: teams"
 ensure_account_state
-log_endpoint_candidate_plan
 start_tunnel
 start_socks5

@@ -119,8 +119,21 @@ fi
 log "$message"
 
 if is_true "$auto_recover" && [ "$current_failures" -ge "$failure_threshold" ]; then
+  active_endpoint="$(endpoint_state_get_active)"
+  if [ -z "$active_endpoint" ]; then
+    active_endpoint="$(current_wg_conf_endpoint "/etc/wireguard/wg0.conf")"
+  fi
+
+  if [ -n "$active_endpoint" ]; then
+    endpoint_state_mark_cooldown "$active_endpoint" "$ENDPOINT_COOLDOWN_SECONDS_DEFAULT"
+    cooldown_remaining="$(endpoint_state_cooldown_remaining "$active_endpoint")"
+    log "当前 endpoint ${active_endpoint} 已标记冷却 ${cooldown_remaining} 秒，容器重启后会优先尝试其他候选。"
+  fi
+
   if [ -n "${ENDPOINT_CANDIDATES:-}" ]; then
     log "连续失败达到阈值，容器重启后会按显式 endpoint 候选顺序重新尝试。"
+  else
+    log "连续失败达到阈值，容器重启后会按自动 endpoint 策略重新尝试。"
   fi
   request_container_restart
 fi
