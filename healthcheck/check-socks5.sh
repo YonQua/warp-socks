@@ -125,7 +125,7 @@ if is_true "$auto_recover" && [ "$current_failures" -ge "$failure_threshold" ]; 
   fi
 
   if [ -n "$active_endpoint" ]; then
-    endpoint_state_mark_cooldown "$active_endpoint" "$ENDPOINT_COOLDOWN_SECONDS_DEFAULT"
+    endpoint_state_mark_cooldown "$active_endpoint" "$RUNTIME_ENDPOINT_COOLDOWN_SECONDS_DEFAULT"
     cooldown_remaining="$(endpoint_state_cooldown_remaining "$active_endpoint")"
     log "当前 endpoint ${active_endpoint} 已标记冷却 ${cooldown_remaining} 秒，容器重启后会优先尝试其他候选。"
   fi

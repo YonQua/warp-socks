@@ -28,7 +28,7 @@ REGISTER_RETRY_DELAY=5
 STARTUP_EGRESS_PROBE_RETRIES=3
 STARTUP_EGRESS_PROBE_DELAY=2
 STARTUP_EGRESS_PROBE_TIMEOUT=5
-ENDPOINT_COOLDOWN_SECONDS="600"
+STARTUP_ENDPOINT_COOLDOWN_SECONDS="30"
 DEFAULT_ENDPOINT_CANDIDATES="162.159.193.5:2408,162.159.193.9:2408,162.159.193.8:2408,162.159.193.3:2408,162.159.193.7:2408"
 
 LOCAL_BYPASS_RULE_PRIORITY_FALLBACK=97
@@ -726,7 +726,7 @@ start_tunnel() {
     fi
 
     warn "当前 endpoint ${endpoint_override} 未通过出口探测: ${PROBE_DIRECT_TRACE_REASON:-unknown}。"
-    endpoint_state_mark_cooldown "$endpoint_override" "$ENDPOINT_COOLDOWN_SECONDS"
+    endpoint_state_mark_cooldown "$endpoint_override" "$STARTUP_ENDPOINT_COOLDOWN_SECONDS"
     endpoint_state_set_active ""
     cooldown_remaining="$(endpoint_state_cooldown_remaining "$endpoint_override")"
     if [ "$cooldown_remaining" -gt 0 ]; then

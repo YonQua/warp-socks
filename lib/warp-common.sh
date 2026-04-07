@@ -6,7 +6,7 @@ LOG_TIMEZONE_DEFAULT="CST-8"
 LOG_TIME_FORMAT_DEFAULT="%Y-%m-%d %H:%M:%S %Z"
 LOG_MODE_DEFAULT="teams"
 ENDPOINT_STATE_FILE_DEFAULT="/etc/wireguard/endpoint-state.json"
-ENDPOINT_COOLDOWN_SECONDS_DEFAULT="600"
+RUNTIME_ENDPOINT_COOLDOWN_SECONDS_DEFAULT="60"
 PROBE_DIRECT_TRACE_REASON=""
 PROBE_DIRECT_TRACE_IP=""
 
@@ -245,7 +245,7 @@ endpoint_state_is_cooling_down() {
 
 endpoint_state_mark_cooldown() {
   endpoint="$1"
-  cooldown_seconds="$(sanitize_positive_int "${2:-$ENDPOINT_COOLDOWN_SECONDS_DEFAULT}" "$ENDPOINT_COOLDOWN_SECONDS_DEFAULT")"
+  cooldown_seconds="$(sanitize_positive_int "${2:-$RUNTIME_ENDPOINT_COOLDOWN_SECONDS_DEFAULT}" "$RUNTIME_ENDPOINT_COOLDOWN_SECONDS_DEFAULT")"
   cooldown_until=$(( $(date +%s) + cooldown_seconds ))
   ensure_endpoint_state_file
   state_file="$(endpoint_state_file)"
