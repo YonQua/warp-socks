@@ -24,15 +24,15 @@ RUN apk add --no-cache ca-certificates curl iproute2 iptables jq wireguard-tools
  && sed -i '/sysctl -q net\.ipv4\.conf\.all\.src_valid_mark=1/d' /usr/bin/wg-quick
 
 COPY --from=builder /src/microsocks/microsocks /usr/local/bin/microsocks
-COPY lib/warp-common.sh /usr/local/lib/warp-common.sh
+COPY lib /usr/local/lib/warp-socks
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh
 COPY healthcheck/check-socks5.sh /usr/local/bin/healthcheck-check-socks5.sh
 
-RUN chmod +x /usr/local/bin/entrypoint.sh /usr/local/bin/healthcheck-check-socks5.sh /usr/local/lib/warp-common.sh
+RUN chmod +x /usr/local/bin/entrypoint.sh /usr/local/bin/healthcheck-check-socks5.sh /usr/local/lib/warp-socks/warp-common.sh
 
-# 健康检查脚本会顺序做两次最坏 10 秒的 trace 探测；
-# 这里留出额外余量，确保脚本能跑完整个失败计数和自恢复分支。
-HEALTHCHECK --interval=30s --timeout=25s --start-period=20s --retries=3 \
+# Docker 只负责定时调用 healthcheck；连续失败阈值完全由脚本内的
+# WARP_SOCKS_HEALTHCHECK_FAILURE_THRESHOLD 控制，避免双重阈值来源。
+HEALTHCHECK --interval=30s --timeout=25s --start-period=20s --retries=1 \
   CMD ["/usr/local/bin/healthcheck-check-socks5.sh"]
 
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
