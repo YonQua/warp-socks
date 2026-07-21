@@ -4,8 +4,6 @@ WARP_ERR_CONFIG=10
 WARP_ERR_REGISTER=20
 WARP_ERR_STATE=30
 WARP_ERR_TUNNEL=40
-WARP_ERR_PROXY=50
-WARP_ERR_RECOVERY=60
 
 warp_error() {
   error_type="$1"
@@ -33,8 +31,4 @@ fail_state() {
 
 fail_tunnel() {
   fail "$WARP_ERR_TUNNEL" "$1"
-}
-
-fail_proxy() {
-  fail "$WARP_ERR_PROXY" "$1"
 }

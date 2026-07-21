@@ -23,3 +23,16 @@ sanitize_positive_int() {
       ;;
   esac
 }
+
+sanitize_nonnegative_int() {
+  value="$1"
+  fallback="$2"
+  case "$value" in
+    ''|*[!0-9]*)
+      printf '%s' "$fallback"
+      ;;
+    *)
+      printf '%s' "$value"
+      ;;
+  esac
+}

@@ -22,18 +22,42 @@ ensure_v6_cidr() {
   esac
 }
 
-tunnel_current_wg_conf_endpoint() {
-  wg_conf="${1:-/etc/wireguard/wg0.conf}"
-  [ -s "$wg_conf" ] || return 0
-  sed -n 's/^Endpoint[[:space:]]*=[[:space:]]*//p' "$wg_conf" | head -n 1
+account_client_id() {
+  json_extract '.config.client_id // .client_id'
 }
 
+# WARP 用 client_id 派生的 3 字节 reserved 做协议层账户标识（对照 warp-plus 官方
+# generateWireguardConfig() 的算法：取 client_id base64 解码后的前 3 个字节）。
+# warp-plus 在 --wgconf 模式下只认 [Peer] 段的 Reserved 字段，--reserved 这个 CLI
+# flag 会被忽略（app/app.go 的 runWireguard() 不读 opts.Reserved）。
+# 用 set -- 精确取前 3 个字节，不管解码出多少字节，保证输出永远是合法的
+# "a,b,c" 三段格式——否则 warp-plus 解析 wgconf 会直接报错退出。
+account_reserved_csv() {
+  client_id="$(account_client_id)"
+  decoded_bytes=""
+
+  if [ -n "$client_id" ]; then
+    padded="$client_id"
+    while [ $(( ${#padded} % 4 )) -ne 0 ]; do
+      padded="${padded}="
+    done
+    decoded_bytes="$(printf '%s' "$padded" | base64 -d 2>/dev/null | od -An -tu1 | tr -s '[:space:]' ' ')"
+  fi
+
+  set -- ${decoded_bytes:-}
+  printf '%s,%s,%s' "${1:-0}" "${2:-0}" "${3:-0}"
+}
+
+# DNS / MTU / PersistentKeepalive 不写在这里：warp-plus 的 --wgconf 分支
+# (app/app.go runWireguard()) 会无条件覆盖这三个字段（DNS 用 --dns 覆盖，
+# MTU 硬编码成 1330，PersistentKeepalive 硬编码成 5 秒），写了也不会生效。
 write_wg_config() {
   private_key="$1"
   peer_public_key="$2"
   endpoint_host="$3"
   address_v4="$4"
   address_v6="$5"
+  reserved_csv="$6"
 
   [ -n "$private_key" ] || fail_state "WireGuard 配置缺少 PrivateKey。"
   [ -n "$peer_public_key" ] || fail_state "WireGuard 配置缺少 Peer PublicKey。"
@@ -45,19 +69,18 @@ write_wg_config() {
 PrivateKey = ${private_key}
 Address = $(ensure_v4_cidr "$address_v4")
 Address = $(ensure_v6_cidr "$address_v6")
-MTU = 1280
 
 [Peer]
 PublicKey = ${peer_public_key}
 AllowedIPs = 0.0.0.0/0,::/0
 Endpoint = ${endpoint_host}
-PersistentKeepalive = 15
+Reserved = ${reserved_csv}
 EOF
 
   chmod 600 "$WG_CONF"
 }
 
-tunnel_build_wg_config_from_account() {
+build_wg_config_from_account() {
   endpoint_override="${1:-}"
   [ -s "$ACCOUNT_JSON" ] || fail_state "缺少 ${ACCOUNT_JSON}，无法构建 WireGuard 配置。"
 
@@ -66,15 +89,12 @@ tunnel_build_wg_config_from_account() {
   endpoint_host="$(json_extract '.config.peers[0].endpoint.host // .peers[0].endpoint.host')"
   address_v4="$(json_extract '.config.interface.addresses.v4 // .interface.addresses.v4')"
   address_v6="$(json_extract '.config.interface.addresses.v6 // .interface.addresses.v6')"
+  reserved_csv="$(account_reserved_csv)"
 
   if [ -n "$endpoint_override" ]; then
     endpoint_host="$endpoint_override"
   fi
   endpoint_host="${endpoint_host:-engage.cloudflareclient.com:2408}"
-  write_wg_config "$private_key" "$peer_public_key" "$endpoint_host" "$address_v4" "$address_v6"
-  if [ -n "$endpoint_override" ]; then
-    log "已生成 ${WG_CONF}，Endpoint = ${endpoint_override}"
-  else
-    log "已生成 ${WG_CONF}"
-  fi
+  write_wg_config "$private_key" "$peer_public_key" "$endpoint_host" "$address_v4" "$address_v6" "$reserved_csv"
+  log "已生成 ${WG_CONF}：endpoint=${endpoint_host}, reserved=${reserved_csv}"
 }
