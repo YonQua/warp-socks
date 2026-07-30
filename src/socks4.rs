@@ -8,7 +8,6 @@
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
 use anyhow::{bail, Context, Result};
-use log::info;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
@@ -61,8 +60,8 @@ pub(crate) async fn handle_client(
     let _username = read_cstring(&mut client).await?; // 不校验，只读掉
 
     let (host, port, target_display) = if is_socks4a {
-        let host = read_cstring(&mut client).await?;
-        (Host::Domain(host.clone()), port, format!("{host}:{port}"))
+        let name = read_cstring(&mut client).await?;
+        (Host::parse(&name), port, format!("{name}:{port}"))
     } else {
         let ip = IpAddr::V4(Ipv4Addr::from(ip_buf));
         (Host::Ip(ip), port, format!("{ip}:{port}"))
@@ -76,7 +75,6 @@ pub(crate) async fn handle_client(
         }
     };
     reply(&mut client, GRANTED).await?;
-    info!("连接 {peer} -> {target_display}: 已建立");
 
-    relay::tunnel_tcp(client, conn).await
+    relay::tunnel_tcp(peer, &target_display, outbound.name(), client, conn).await
 }

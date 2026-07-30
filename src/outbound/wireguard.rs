@@ -12,7 +12,7 @@ use tokio_smoltcp::smoltcp::iface::Config as IfaceConfig;
 use tokio_smoltcp::smoltcp::wire::{HardwareAddress, IpAddress, IpCidr};
 use tokio_smoltcp::{BufferSize, Net, NetConfig, UdpSocket as TunnelUdpSocket};
 
-use super::{Datagram, Host, Outbound, Stream};
+use super::{Connected, Datagram, Host, Outbound};
 use crate::config::WgConfig;
 use crate::dns::{resolve, RecordType};
 use crate::tunnel::{Trick, WgTunnel};
@@ -117,7 +117,11 @@ impl Datagram for WgDatagram {
 
 #[async_trait]
 impl Outbound for WgOutbound {
-    async fn connect_tcp(&self, host: Host, port: u16) -> std::io::Result<Box<dyn Stream>> {
+    fn name(&self) -> &'static str {
+        "WireGuard"
+    }
+
+    async fn connect_tcp(&self, host: Host, port: u16) -> std::io::Result<Connected> {
         // smoltcp 对未响应的 SYN 只会把重传间隔倍增到 60s 封顶，不加超时会永远挂着。
         let addr = self.resolve_target(host, port).await?;
         let stream = tokio::time::timeout(CONNECT_TIMEOUT, self.net.tcp_connect(addr))
@@ -128,7 +132,10 @@ impl Outbound for WgOutbound {
                     format!("连接 {addr} 超时（{CONNECT_TIMEOUT:?}）"),
                 )
             })??;
-        Ok(Box::new(stream))
+        Ok(Connected {
+            stream: Box::new(stream),
+            note: None,
+        })
     }
 
     async fn connect_udp(&self, host: Host, port: u16) -> std::io::Result<Box<dyn Datagram>> {

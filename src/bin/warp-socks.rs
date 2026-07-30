@@ -7,6 +7,7 @@
 //   warp-socks register del <path>      向 API 注销并删除本地文件
 //   warp-socks healthcheck              无状态单次探测，探测失败以非零退出码结束
 
+use std::io::Write as _;
 use std::path::PathBuf;
 
 use anyhow::{bail, Context, Result};
@@ -17,9 +18,33 @@ use warp_rs::health::SocksTraceProbe;
 use warp_rs::registration;
 use warp_rs::supervisor::Supervisor;
 
+// 固定 UTC+8（东八区），与容器/宿主机的本地时区设置无关，日志时间戳始终
+// 按这个偏移展示，避免跨时区部署时时间戳含义不一致。
+const CST_OFFSET: time::UtcOffset = match time::UtcOffset::from_hms(8, 0, 0) {
+    Ok(offset) => offset,
+    Err(_) => unreachable!(),
+};
+
 #[tokio::main]
 async fn main() -> Result<()> {
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
+        .format(|buf, record| {
+            let now = time::OffsetDateTime::now_utc().to_offset(CST_OFFSET);
+            writeln!(
+                buf,
+                "[{:04}-{:02}-{:02} {:02}:{:02}:{:02} {:<5} {}] {}",
+                now.year(),
+                u8::from(now.month()),
+                now.day(),
+                now.hour(),
+                now.minute(),
+                now.second(),
+                record.level(),
+                record.target(),
+                record.args()
+            )
+        })
+        .init();
 
     let args: Vec<String> = std::env::args().collect();
     match args.get(1).map(String::as_str) {

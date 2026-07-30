@@ -56,9 +56,9 @@ impl Supervisor {
 
         if self.config.enable_masque && self.config.reg_json.is_file() {
             match self.try_masque().await {
-                Ok(serve_handle) => {
+                Ok((serve_handle, backend)) => {
                     info!("✓ MASQUE 隧道已建立（{}）", self.config.reg_json.display());
-                    return self.serve_and_watch(serve_handle, "MASQUE", None).await;
+                    return self.serve_and_watch(serve_handle, backend, None).await;
                 }
                 Err(reason) => warn!("{reason}，回退 WireGuard ..."),
             }
@@ -75,14 +75,14 @@ impl Supervisor {
         let total = candidates.len();
         for (index, endpoint) in candidates.iter().enumerate() {
             match self.try_wg_candidate(&account, endpoint).await {
-                Ok(serve_handle) => {
+                Ok((serve_handle, backend)) => {
                     store.record_success(endpoint)?;
                     info!("隧道与 SOCKS 已就绪：endpoint={endpoint}");
                     let cooldown = self.config.runtime_endpoint_cooldown;
                     return self
                         .serve_and_watch(
                             serve_handle,
-                            "WireGuard",
+                            backend,
                             Some((&mut store, endpoint, cooldown)),
                         )
                         .await;
@@ -154,7 +154,7 @@ impl Supervisor {
     }
 
     /// 尝试加载 reg.json 并建立 MASQUE 隧道 + 起 SOCKS5 监听。
-    async fn try_masque(&self) -> Result<JoinHandle<Result<()>>, String> {
+    async fn try_masque(&self) -> Result<(JoinHandle<Result<()>>, &'static str), String> {
         let creds = registration::load(&self.config.reg_json)
             .map_err(|e| format!("加载 {} 失败（{e}）", self.config.reg_json.display()))?;
         let masque = Masque::new(creds)
@@ -171,7 +171,7 @@ impl Supervisor {
         &self,
         account: &WgAccount,
         endpoint: &str,
-    ) -> Result<JoinHandle<Result<()>>> {
+    ) -> Result<(JoinHandle<Result<()>>, &'static str)> {
         registration::write_wg_conf(account, Some(endpoint), &self.config.wg_conf)?;
         let wg_conf_str = self
             .config
@@ -192,7 +192,13 @@ impl Supervisor {
     }
 
     /// 起 SOCKS5 监听并反复探测直到就绪或启动预算耗尽；失败时监听任务会被中止。
-    async fn spawn_and_probe(&self, outbound: Arc<dyn Outbound>) -> Result<JoinHandle<Result<()>>> {
+    /// 返回值带上 `outbound.name()`：后端名只由 `Outbound` 实现自己定义
+    /// （见 `Outbound::name`），这里原样透传给调用方，不再各自维护一份字面量。
+    async fn spawn_and_probe(
+        &self,
+        outbound: Arc<dyn Outbound>,
+    ) -> Result<(JoinHandle<Result<()>>, &'static str)> {
+        let backend = outbound.name();
         let listen_addr: std::net::SocketAddr = format!("0.0.0.0:{}", self.config.listen_port)
             .parse()
             .expect("固定监听地址格式正确");
@@ -224,7 +230,7 @@ impl Supervisor {
                     if let Some(ip) = outcome.ip {
                         info!("当前出口 IP: {ip}");
                     }
-                    return Ok(serve_handle);
+                    return Ok((serve_handle, backend));
                 }
                 Err(_) => {
                     sleep(self.config.startup_probe_delay.min(remaining)).await;

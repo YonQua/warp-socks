@@ -124,9 +124,8 @@ async fn handle_connect(
         }
     };
     reply(&mut client, REP_SUCCEEDED).await?;
-    info!("连接 {peer} -> {}: 已建立", target.display);
 
-    relay::tunnel_tcp(client, conn).await
+    relay::tunnel_tcp(peer, &target.display, outbound.name(), client, conn).await
 }
 
 // RFC 1928 UDP 请求/响应头：RSV(2)+FRAG(1)+ATYP(1)+ADDR+PORT，之后是负载。
@@ -186,7 +185,7 @@ enum SocketAddrOrName {
 fn target_host_port(target: &SocketAddrOrName) -> (Host, u16) {
     match target {
         SocketAddrOrName::Addr(a) => (Host::Ip(a.ip()), a.port()),
-        SocketAddrOrName::Name(name, port) => (Host::Domain(name.clone()), *port),
+        SocketAddrOrName::Name(name, port) => (Host::parse(name), *port),
     }
 }
 
@@ -404,7 +403,7 @@ async fn read_target(client: &mut TcpStream, atyp: u8) -> Result<Target> {
             let name = String::from_utf8(name).context("域名不是合法 UTF-8")?;
             let port = u16::from_be_bytes(port);
             Ok(Target {
-                host: Host::Domain(name.clone()),
+                host: Host::parse(&name),
                 port,
                 display: format!("{name}:{port}"),
             })

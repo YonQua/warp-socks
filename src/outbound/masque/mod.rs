@@ -1,7 +1,7 @@
 // MASQUE 隧道：到 WARP 边缘的 QUIC 连接，每次 connect 产出一条 H3 CONNECT 双向流。
 //
 // 核心流程（对照 warp-go/tunnel/masque.go）：
-//   1. 拨号到边缘（20 字节 SCID 对齐 warp-svc，端口 443 因 DAE 拦截放最后）
+//   1. 并发拨号所有候选边缘（20 字节 SCID 对齐 warp-svc），最先握手成功的中标
 //   2. 建立常驻 H3 控制流（stream type 0x00 + 空 SETTINGS frame）
 //   3. 域名目标先经隧道内 DoH 解析成 IP（见 doh.rs）
 //   4. 每个连接请求：open_bi → 发 HEADERS(CONNECT, :authority=ip:port) → 读 :status
@@ -28,10 +28,11 @@ use log::{info, warn};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::Mutex;
 
-use crate::outbound::{Host, Outbound, Stream};
+use crate::outbound::{Connected, Host, Outbound, Stream};
 use crate::registration::RegCredentials;
 
 mod doh;
+mod huffman;
 mod qpack;
 mod tls;
 
@@ -144,17 +145,22 @@ impl Masque {
 
 #[async_trait]
 impl Outbound for Masque {
-    async fn connect_tcp(&self, host: Host, port: u16) -> io::Result<Box<dyn Stream>> {
-        let authority = match host {
-            Host::Domain(d) => {
-                let ip = self
-                    .resolve_domain(&d)
-                    .await
-                    .map_err(|e| io_err(format!("DoH 解析 {d} 失败: {e:#}")))?;
-                format!("{ip}:{port}")
-            }
-            Host::Ip(ip) => format!("{ip}:{port}"),
+    fn name(&self) -> &'static str {
+        "MASQUE"
+    }
+
+    async fn connect_tcp(&self, host: Host, port: u16) -> io::Result<Connected> {
+        let ip = match host {
+            Host::Domain(d) => self
+                .resolve_domain(&d)
+                .await
+                .map_err(|e| io_err(format!("DoH 解析 {d} 失败: {e:#}")))?,
+            Host::Ip(ip) => ip,
         };
+        // authority 用 SocketAddr 的 Display 而非裸 `{ip}:{port}` 拼接：IPv6 字面量
+        // 按 RFC 3986 §3.2.2 必须括在方括号里，否则地址内的冒号与端口分隔符冲突，
+        // 边缘会当作非法 authority 以 H3_MESSAGE_ERROR reset 流。
+        let authority = SocketAddr::new(ip, port).to_string();
 
         let (mut send, mut recv) = tokio::time::timeout(EXCHANGE_TIMEOUT, self.open())
             .await
@@ -162,8 +168,13 @@ impl Outbound for Masque {
             .map_err(|e| io_err(format!("打开隧道流失败: {e}")))?;
 
         // CONNECT 交换失败统一在这里释放两侧，防僵尸流耗尽并发流配额。
+        // colo 不在这里打日志：连上后交给调用方跟"已建立"合并成一行，
+        // 避免同一次连接的信息分散在两个模块、并发时靠时间戳猜配对。
         match exchange(&mut send, &mut recv, &authority, &self.token).await {
-            Ok(()) => Ok(wrap_data_framing(send, recv)),
+            Ok(colo) => Ok(Connected {
+                stream: wrap_data_framing(send, recv),
+                note: colo.map(|c| format!("colo={c}")),
+            }),
             Err(e) => {
                 let _ = (recv.stop(0u32.into()), send.reset(0u32.into()));
                 Err(io_err(format!("MASQUE CONNECT {authority} 失败: {e:#}")))
@@ -172,13 +183,14 @@ impl Outbound for Masque {
     }
 }
 
-/// 发 HEADERS(CONNECT) 并读 :status，200 才算隧道建立。
+/// 发 HEADERS(CONNECT) 并读 :status，200 才算隧道建立；返回边缘落地的 colo
+/// （如 "LAX"，取自 `cf-warp-colo` 响应头，纯展示用，取不到就是 `None`）。
 async fn exchange(
     send: &mut quinn::SendStream,
     recv: &mut quinn::RecvStream,
     authority: &str,
     token: &str,
-) -> Result<()> {
+) -> Result<Option<String>> {
     let headers = qpack::headers_frame(&qpack::encode_connect_request(authority, token));
     tokio::time::timeout(EXCHANGE_TIMEOUT, send.write_all(&headers))
         .await
@@ -203,11 +215,11 @@ async fn exchange(
         }
         bail!("连续 {MAX_SKIPPED_FRAMES} 个非 HEADERS 帧后仍未收到响应");
     };
-    let status = qpack::decode_status(&payload).map_err(anyhow::Error::msg)?;
-    if status != 200 {
-        bail!("边缘拒绝 CONNECT，状态 {status}");
+    let headers = qpack::decode_headers(&payload).map_err(anyhow::Error::msg)?;
+    if headers.status != 200 {
+        bail!("边缘拒绝 CONNECT，状态 {}", headers.status);
     }
-    Ok(())
+    Ok(headers.colo)
 }
 
 /// CONNECT 成功后，把仍带 H3 DATA frame 分帧的裸双向流包成上层不用关心分帧
@@ -264,46 +276,61 @@ fn build_endpoint() -> Result<quinn::Endpoint> {
     Ok(quinn::Endpoint::new(epc, None, socket, runtime)?)
 }
 
-/// 遍历候选边缘（443 因 DAE 拦截放最后），首个握手成功的用。
+/// 并发拨号所有候选边缘，最先握手成功的中标，其余候选直接丢弃（未完成的
+/// QUIC 握手 drop 时自然放弃，无需显式取消）。
+///
+/// 之所以并发而非逐个尝试：`open()` 重连时持有 `link` 锁调用这里，期间所有
+/// 并发的隧道操作（业务连接/DNS/健康检查探测）都会阻塞在锁上；逐个尝试在
+/// 候选数多、DIAL_TIMEOUT 较大时最坏耗时是"候选数 × DIAL_TIMEOUT"，容易超过
+/// 健康检查轮询间隔导致探测连续失败触发容器重启。并发拨号把最坏耗时压到
+/// 接近单次 DIAL_TIMEOUT。
 async fn connect(
     endpoint: &quinn::Endpoint,
     cfg: &quinn::ClientConfig,
     addrs: &[SocketAddr],
 ) -> Result<Link> {
-    let mut last: Option<anyhow::Error> = None;
-    for &addr in addrs {
-        info!("QUIC 拨号 {addr}（SNI={SNI}）...");
-        let connecting = match endpoint.connect_with(cfg.clone(), addr, SNI) {
-            Ok(c) => c,
-            Err(e) => {
-                last = Some(anyhow::Error::from(e));
-                continue;
-            }
-        };
-        match tokio::time::timeout(DIAL_TIMEOUT, connecting).await {
-            Ok(Ok(conn)) => {
-                let mut control = conn.open_uni().await.context("打开 H3 控制流失败")?;
-                control
-                    .write_all(&qpack::control_stream_prelude())
-                    .await
-                    .context("发送控制流 SETTINGS 失败")?;
-                info!("✓ QUIC 已连接到 {addr}");
-                return Ok(Link {
-                    conn,
-                    _control: control,
-                });
-            }
-            Ok(Err(e)) => {
-                warn!("边缘 {addr} 不可达（{e}），尝试下一个端口 ...");
-                last = Some(anyhow::Error::from(e));
-            }
-            Err(_) => {
-                warn!("边缘 {addr} 拨号超时（{DIAL_TIMEOUT:?}），尝试下一个端口 ...");
-                last = Some(anyhow!("拨号 {addr} 超时"));
-            }
+    if addrs.is_empty() {
+        bail!("无候选边缘地址");
+    }
+    let dials = addrs
+        .iter()
+        .map(|&addr| Box::pin(dial_one(endpoint, cfg, addr)));
+    let (conn, _rest) = futures::future::select_ok(dials).await?;
+    let mut control = conn.open_uni().await.context("打开 H3 控制流失败")?;
+    control
+        .write_all(&qpack::control_stream_prelude())
+        .await
+        .context("发送控制流 SETTINGS 失败")?;
+    Ok(Link {
+        conn,
+        _control: control,
+    })
+}
+
+/// 拨号单个候选边缘地址，独立超时。
+async fn dial_one(
+    endpoint: &quinn::Endpoint,
+    cfg: &quinn::ClientConfig,
+    addr: SocketAddr,
+) -> Result<quinn::Connection> {
+    info!("QUIC 拨号 {addr}（SNI={SNI}）...");
+    let connecting = endpoint
+        .connect_with(cfg.clone(), addr, SNI)
+        .with_context(|| format!("发起 {addr} 拨号失败"))?;
+    match tokio::time::timeout(DIAL_TIMEOUT, connecting).await {
+        Ok(Ok(conn)) => {
+            info!("✓ QUIC 已连接到 {addr}");
+            Ok(conn)
+        }
+        Ok(Err(e)) => {
+            warn!("边缘 {addr} 不可达（{e}）");
+            Err(anyhow!("边缘 {addr} 不可达（{e}）"))
+        }
+        Err(_) => {
+            warn!("边缘 {addr} 拨号超时（{DIAL_TIMEOUT:?}）");
+            Err(anyhow!("边缘 {addr} 拨号超时（{DIAL_TIMEOUT:?}）"))
         }
     }
-    Err(last.unwrap_or_else(|| anyhow!("无候选边缘地址")))
 }
 
 /// 注册端口展开成候选地址，443 移末尾。

@@ -6,10 +6,9 @@
 // origin-form（去掉 scheme/host，与 Go 版 URL.RequestURI() 效果一致）转发给
 // 目标后同样双向转发，不单独处理 chunked/Content-Length 分包语义。
 
-use std::net::{IpAddr, SocketAddr};
+use std::net::SocketAddr;
 
 use anyhow::{anyhow, bail, Context, Result};
-use log::info;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
@@ -131,10 +130,7 @@ pub(crate) async fn handle_client(
     let is_connect = parsed.method.eq_ignore_ascii_case("CONNECT");
     let target_info = parse_target(&parsed.method, &parsed.path, parsed.host_header.as_deref())?;
     // 域名交给后端解析（MASQUE 交边缘，WireGuard 走虚拟网卡 DNS）。
-    let host = match target_info.host.parse::<IpAddr>() {
-        Ok(ip) => Host::Ip(ip),
-        Err(_) => Host::Domain(target_info.host.clone()),
-    };
+    let host = Host::parse(&target_info.host);
     let target_display = format!("{}:{}", target_info.host, target_info.port);
 
     if is_connect {
@@ -148,8 +144,7 @@ pub(crate) async fn handle_client(
         client
             .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
             .await?;
-        info!("连接 {peer} -> {target_display}: 已建立");
-        relay::tunnel_tcp(client, conn).await
+        relay::tunnel_tcp(peer, &target_display, outbound.name(), client, conn).await
     } else {
         let mut conn = match relay::connect(outbound, host, target_info.port).await {
             Ok(s) => s,
@@ -177,11 +172,12 @@ pub(crate) async fn handle_client(
             .map(|p| p + 2)
             .unwrap_or(parsed.head_len);
         rewritten.extend_from_slice(&parsed.raw_head[headers_start..parsed.head_len]);
-        conn.write_all(&rewritten).await?;
+        conn.stream.write_all(&rewritten).await?;
         // 已经读入但属于 body 的那部分字节（比如 POST 数据的开头）先转发过去。
-        conn.write_all(&parsed.raw_head[parsed.head_len..]).await?;
+        conn.stream
+            .write_all(&parsed.raw_head[parsed.head_len..])
+            .await?;
 
-        info!("连接 {peer} -> {target_display}: 已建立");
-        relay::tunnel_tcp(client, conn).await
+        relay::tunnel_tcp(peer, &target_display, outbound.name(), client, conn).await
     }
 }

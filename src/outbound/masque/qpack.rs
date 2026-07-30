@@ -140,18 +140,29 @@ pub fn control_stream_prelude() -> Vec<u8> {
     out
 }
 
-/// 从响应 HEADERS frame 的 QPACK 负载里提取 :status 码。
+/// H3 CONNECT 响应里我们关心的字段：状态码 + 可选的 Cloudflare 边缘落地 colo
+/// （如 "LAX"），后者只用于日志展示，取不到不算错误。
+pub struct ResponseHeaders {
+    pub status: u16,
+    pub colo: Option<String>,
+}
+
+/// 解析响应 HEADERS frame 的完整 QPACK field section。
 ///
-/// 响应通常是 Indexed Static #25（:status=200）→ 字节 0xD9，但为稳健起见
-/// 通用解析：跳过 QPACK 前缀，逐行解析直到找到 :status。
+/// 逐行解析：Indexed Field Line 取静态表状态码；Literal with Name Reference
+/// （值来自动态/静态表引用的头，我们不关心，只跳过）；Literal with Literal Name
+/// （字段名也是字面量，`cf-warp-colo` 这类自定义头必然走这条，值和名字常见 Huffman
+/// 压缩，见 huffman.rs）。
 ///
 /// # Errors
-/// 解析失败或数据不足时返回错误。
-pub fn decode_status(payload: &[u8]) -> Result<u16, &'static str> {
+/// 解析失败、数据不足、或字段序列中未出现 :status 时返回错误。
+pub fn decode_headers(payload: &[u8]) -> Result<ResponseHeaders, &'static str> {
     // QPACK 前缀至少 2 字节：Required Insert Count(8) + Base(1+7)。这里只需跳过。
-    // Required Insert Count 用 8-bit prefix；若 ≥255 还会有续字节，跳过到读完。
     let mut pos = skip_integer(payload, 0, 8)?;
     pos = skip_integer(payload, pos, 7)?; // Base
+
+    let mut status = None;
+    let mut colo = None;
 
     while pos < payload.len() {
         let b = payload[pos];
@@ -160,33 +171,71 @@ pub fn decode_status(payload: &[u8]) -> Result<u16, &'static str> {
             let static_table = b & 0x40 != 0;
             let (idx, n) = decode_integer(payload, pos, 6)?;
             pos = n;
-            if static_table && idx == 25 {
-                return Ok(200);
-            }
-            // 其它 status 索引（如 26=304, 27=404, 28=503, 63=100, 64=204...）
             if static_table {
-                if let Some(code) = static_status(idx) {
-                    return Ok(code);
+                if idx == 25 {
+                    status = Some(200);
+                } else if let Some(code) = static_status(idx) {
+                    status = Some(code);
                 }
             }
         } else if b & 0xc0 == 0x40 {
-            // Literal with Name Ref: 01 N T NameIndex(4) + value
+            // Literal with Name Ref: 01 N T NameIndex(4) + value。这类字段的名字
+            // 来自表，我们关心的自定义头都不在表里，值也不用管，跳过即可。
             let (_, n) = decode_integer(payload, pos, 4)?;
-            pos = n;
-            let (name_is_status, after_name) = (false, pos); // 名字引用无法直接判定 :status
-            let _ = name_is_status;
-            pos = skip_string(payload, after_name)?;
+            pos = skip_literal_value(payload, n)?;
         } else if b & 0xe0 == 0x20 {
-            // Literal with Literal Name: 001 N NameLen(4-ish) ... 复杂，跳过整行
-            // 名字长度在 4-bit prefix（实际编码见 §4.5.6，这里宽松跳过 value 即可）
-            // 为健壮性：遇到无法确定的行直接报错，调用方应只收到纯 indexed 响应。
-            return Err("响应包含 literal-name 字段，无法最小解析 status");
+            // Literal with Literal Name（RFC 9204 §4.5.6）：001 N H NameLen(3) +
+            // name + H Len(7) + value，name/value 各自独立标记是否 Huffman 压缩。
+            let name_huffman = b & 0x08 != 0;
+            let (name_len, n) = decode_integer(payload, pos, 3)?;
+            let name_end = n.checked_add(name_len as usize).ok_or("字段名长度溢出")?;
+            if name_end > payload.len() {
+                return Err("字段名内容越界");
+            }
+            let name = decode_string(&payload[n..name_end], name_huffman)?;
+            let (value, new_pos) = read_literal_value(payload, name_end)?;
+            pos = new_pos;
+            if name == b"cf-warp-colo" {
+                colo = String::from_utf8(value).ok();
+            }
         } else {
-            // post-base indexed/literal，MASQUE 响应不会用到
-            return Err("响应包含 post-base 字段，未预期");
+            return Err("响应包含未预期的 post-base 字段");
         }
     }
-    Err("响应头中未找到 :status")
+    let status = status.ok_or("响应头中未找到 :status")?;
+    Ok(ResponseHeaders { status, colo })
+}
+
+/// 读一个 H+Length(7 位前缀) + 字节串，按 H 标记决定是否过 Huffman 解码。
+fn read_literal_value(payload: &[u8], pos: usize) -> Result<(Vec<u8>, usize), &'static str> {
+    if pos >= payload.len() {
+        return Err("值长度解析越界");
+    }
+    let huffman = payload[pos] & 0x80 != 0;
+    let (len, start) = decode_integer(payload, pos, 7)?;
+    let end = start.checked_add(len as usize).ok_or("值长度溢出")?;
+    if end > payload.len() {
+        return Err("值内容越界");
+    }
+    Ok((decode_string(&payload[start..end], huffman)?, end))
+}
+
+/// 只跳过一个值字段，不关心内容（Literal with Name Ref 分支用）。
+fn skip_literal_value(payload: &[u8], pos: usize) -> Result<usize, &'static str> {
+    let (len, start) = decode_integer(payload, pos, 7)?;
+    let end = start.checked_add(len as usize).ok_or("值长度溢出")?;
+    if end > payload.len() {
+        return Err("值内容越界");
+    }
+    Ok(end)
+}
+
+fn decode_string(raw: &[u8], huffman: bool) -> Result<Vec<u8>, &'static str> {
+    if huffman {
+        super::huffman::decode(raw).map_err(|_| "Huffman 解码失败")
+    } else {
+        Ok(raw.to_vec())
+    }
 }
 
 /// QPACK 静态表 :status 索引到状态码的映射（仅常见的几个）。
@@ -244,19 +293,6 @@ fn decode_integer(buf: &[u8], pos: usize, prefix_bits: u8) -> Result<(u64, usize
 /// 跳过一个前缀整数（不关心值），返回新位置。
 fn skip_integer(buf: &[u8], pos: usize, prefix_bits: u8) -> Result<usize, &'static str> {
     decode_integer(buf, pos, prefix_bits).map(|(_, p)| p)
-}
-
-/// 跳过一个 8-bit 前缀字符串字面量（H + Length(7) + bytes），返回新位置。
-fn skip_string(buf: &[u8], pos: usize) -> Result<usize, &'static str> {
-    if pos >= buf.len() {
-        return Err("字符串解析越界");
-    }
-    let (len, p) = decode_integer(buf, pos, 7)?;
-    let end = p.checked_add(len as usize).ok_or("字符串长度溢出")?;
-    if end > buf.len() {
-        return Err("字符串内容越界");
-    }
-    Ok(end)
 }
 
 #[cfg(test)]
@@ -326,13 +362,34 @@ mod tests {
     fn decode_status_200_indexed() {
         // 响应：前缀 00 00 + Indexed Static #25 = 0xD9
         let resp = [0x00, 0x00, 0xD9];
-        assert_eq!(decode_status(&resp).unwrap(), 200);
+        assert_eq!(decode_headers(&resp).unwrap().status, 200);
     }
 
     #[test]
     fn decode_status_404_indexed() {
         let resp = [0x00, 0x00, 0xDB]; // #27 = 404
-        assert_eq!(decode_status(&resp).unwrap(), 404);
+        assert_eq!(decode_headers(&resp).unwrap().status, 404);
+    }
+
+    #[test]
+    fn decode_headers_extracts_colo_from_real_response() {
+        // 真实 MASQUE CONNECT 响应抓包（见 outbound/masque/mod.rs 的手工解析记录）：
+        // :status=200 + cf-warp-metal + cf-warp-colo=LAX（Huffman）+ cf-team。
+        let resp = hex(
+            "0000d92f0324ab781d95ad49523a3f8508a57db6bf2f0224ab781d95ac43d07f\
+             83cf0fe72d24ab24a3a796640db6196429630000d32db446a42942d0000000000f",
+        );
+        let headers = decode_headers(&resp).unwrap();
+        assert_eq!(headers.status, 200);
+        assert_eq!(headers.colo.as_deref(), Some("LAX"));
+    }
+
+    fn hex(s: &str) -> Vec<u8> {
+        let s: String = s.chars().filter(|c| !c.is_whitespace()).collect();
+        s.as_bytes()
+            .chunks(2)
+            .map(|c| u8::from_str_radix(std::str::from_utf8(c).unwrap(), 16).unwrap())
+            .collect()
     }
 
     #[test]
