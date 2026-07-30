@@ -1,0 +1,44 @@
+[package]
+name = "warp-rs"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "handshake_probe"
+path = "src/bin/handshake_probe.rs"
+
+[[bin]]
+name = "warp-socks"
+path = "src/bin/warp-socks.rs"
+
+[dependencies]
+boringtun = "0.7"
+base64 = "0.22"
+rand = "0.8"
+anyhow = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "macros", "signal", "time", "sync"] }
+tokio-smoltcp = "0.6"
+futures = "0.3"
+httparse = "1"
+quinn = "0.11"
+quinn-proto = "0.11"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+async-trait = "0.1"
+log = "0.4"
+env_logger = "0.11"
+
+# MASQUE over QUIC/H3 相关
+p256 = { version = "0.13", features = ["ecdsa", "pem"] }
+rcgen = "0.13"
+time = "0.3"
+x509-parser = "0.16"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "socks"] }
+# 隧道内 DoH 解析用：标准证书校验 TLS（非边缘的 pinned-key 校验）。
+# 关掉 tokio-rustls 默认的 aws_lc_rs 后端，全项目统一用 ring（同 tls.rs）。
+tokio-rustls = { version = "0.26", default-features = false }
+webpki-roots = "1"
+
+[dev-dependencies]
+tempfile = "3"

@@ -1,4 +1,5 @@
 .env
+/target
 wireguard/
 wireguard-*/
 task_plan.md

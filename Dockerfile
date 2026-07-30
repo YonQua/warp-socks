@@ -11,10 +11,11 @@ FROM rust:${RUST_VERSION} AS rust-builder
 
 ARG CARGO_REGISTRY_MIRROR
 
-# 隧道+SOCKS 实现（参考 warp-plus 思路用 Rust 重写，见 warp-rs/），
-# 只编译生产用的 warp-socks 二进制，跳过验证阶段遗留的 handshake_probe。
+# 隧道、SOCKS、注册、健康探测均已收口到自研 warp-socks-rs 单一二进制
+# （子命令 serve/register/healthcheck），只需编译一个 bin。
 WORKDIR /build
-COPY warp-rs/ .
+COPY Cargo.toml Cargo.lock ./
+COPY src ./src
 RUN set -eu \
  && if [ -n "${CARGO_REGISTRY_MIRROR}" ]; then \
       mkdir -p .cargo \
@@ -28,30 +29,25 @@ FROM alpine:${ALPINE_VERSION}
 
 ARG APK_MIRROR_PREFIX
 
-# 仅保留：
-# - curl/jq：注册与探测
-# - wireguard-tools：注册时 wg genkey/pubkey
-# 隧道与 SOCKS 由自研 warp-socks-rs 提供。
+# 注册、健康探测、密钥生成均已用 Rust 原生实现（reqwest/boringtun），
+# 不再需要 curl/jq/wireguard-tools；ca-certificates 保留给 reqwest 的
+# rustls-tls 校验证书链用。
 RUN set -eu \
  && if [ -n "${APK_MIRROR_PREFIX}" ]; then \
       sed -i "s#https://dl-cdn.alpinelinux.org#${APK_MIRROR_PREFIX}#g" /etc/apk/repositories; \
     fi \
- && apk add --no-cache ca-certificates curl jq wireguard-tools
+ && apk add --no-cache ca-certificates
 
 COPY --from=rust-builder /usr/local/bin/warp-socks-rs /usr/local/bin/warp-socks-rs
-COPY lib /usr/local/lib/warp-socks
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh
-COPY healthcheck/check-socks5.sh /usr/local/bin/healthcheck-check-socks5.sh
 
 RUN chmod +x \
       /usr/local/bin/entrypoint.sh \
-      /usr/local/bin/healthcheck-check-socks5.sh \
-      /usr/local/lib/warp-socks/warp-common.sh \
       /usr/local/bin/warp-socks-rs
 
-# Docker 只负责定时调用 healthcheck；连续失败阈值完全由脚本内的
-# WARP_SOCKS_HEALTHCHECK_FAILURE_THRESHOLD 控制，避免双重阈值来源。
+# Docker 只负责定时展示健康状态；连续失败阈值判定与重启触发完全在
+# warp-socks-rs 自己的运行期健康检查循环里（见 src/supervisor.rs）。
 HEALTHCHECK --interval=30s --timeout=25s --start-period=30s --retries=1 \
-  CMD ["/usr/local/bin/healthcheck-check-socks5.sh"]
+  CMD ["/usr/local/bin/warp-socks-rs", "healthcheck"]
 
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
