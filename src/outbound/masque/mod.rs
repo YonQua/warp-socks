@@ -25,7 +25,7 @@ use std::time::Duration;
 use anyhow::{anyhow, bail, Context as _, Result};
 use async_trait::async_trait;
 use log::{info, warn};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::Mutex;
 
 use crate::outbound::{Connected, Host, Outbound, Stream};
@@ -39,6 +39,13 @@ mod tls;
 const SNI: &str = "consumer-masque-proxy.cloudflareclient.com";
 const DIAL_TIMEOUT: Duration = Duration::from_secs(8);
 const EXCHANGE_TIMEOUT: Duration = Duration::from_secs(15);
+// 对照 warp-go relayDrainGrace：客户端半关（上行结束）后，最多再等这么久的
+// 下行数据；超时强制放弃，避免边缘一侧还在发送、但客户端早已消失（视频类
+// 播放器频繁跳转/中止请求就是这种模式）时，这条 H3 流被无限期占着——大量
+// 这种"孤儿流"累积起来会耗尽边缘对这条 QUIC 连接分配的并发流配额，表现为
+// 之后所有新连接的 open_bi 都挂起超时。
+const DRAIN_GRACE: Duration = Duration::from_secs(30);
+const RELAY_BUF: usize = 64 * 1024;
 
 /// 一条到边缘的 MASQUE 连接。控制流随 Link 一起存活/释放，避免 forget 的内存语义模糊。
 struct Link {
@@ -79,18 +86,31 @@ impl Masque {
         })
     }
 
-    /// 取一条双向流；连接失效则整体重建一次（持锁期间完成，避免并发重连）。
+    /// 取一条双向流；连接失效则整体重建一次（重连过程仍互斥，避免并发重复重建）。
+    ///
+    /// `conn.open_bi()` 在对端并发流配额耗尽时会挂起等待（而非报错返回），
+    /// 视频等大流量长连接一多就容易触发。锁只用来保护"读/替换 link"这个瞬时
+    /// 操作，克隆出 `Connection`（quinn 内部是 Arc handle，克隆是廉价的引用计数）
+    /// 后立刻释放锁，真正可能长时间挂起的 `open_bi().await` 在锁外进行——否则
+    /// 一次挂起会把所有并发调用者（业务连接/DNS 解析/健康检查探测）串行阻塞在
+    /// 这把锁上，逐个等到各自超时，而非各自独立等待/超时。
     async fn open(&self) -> Result<(quinn::SendStream, quinn::RecvStream)> {
-        {
-            let link = self.link.lock().await;
-            if let Ok(pair) = link.conn.open_bi().await {
-                return Ok(pair);
-            }
+        let conn = self.link.lock().await.conn.clone();
+        if let Ok(pair) = conn.open_bi().await {
+            return Ok(pair);
         }
+
+        // open_bi 真正返回 Err 说明连接本身已失效（配额不足只会挂起，不会走到
+        // 这里），需要重连。stable_id 判断避免多个调用者同时发现失效时重复重建：
+        // 若锁到手时 link 已经被别人重连过，直接用新连接，不再重复拨号。
         let mut link = self.link.lock().await;
-        warn!("open_bi 失败，重连 ...");
-        *link = connect(&self.endpoint, &self.cfg, &self.addrs).await?;
-        link.conn.open_bi().await.context("重连后 open_bi 仍失败")
+        if link.conn.stable_id() == conn.stable_id() {
+            warn!("open_bi 失败，重连 ...");
+            *link = connect(&self.endpoint, &self.cfg, &self.addrs).await?;
+        }
+        let conn = link.conn.clone();
+        drop(link);
+        conn.open_bi().await.context("重连后 open_bi 仍失败")
     }
 
     /// 域名解析：命中缓存直接返回，否则依次尝试 DoH 候选 IP 查 A/AAAA。
@@ -129,17 +149,29 @@ impl Masque {
         domain: &str,
         qtype: doh::QueryType,
     ) -> Result<IpAddr> {
-        let (mut send, mut recv) = tokio::time::timeout(EXCHANGE_TIMEOUT, self.open())
+        let (stream, _colo) = self
+            .connect_stream(doh_addr)
             .await
-            .context("打开 DoH 隧道流超时")??;
-        tokio::time::timeout(
-            EXCHANGE_TIMEOUT,
-            exchange(&mut send, &mut recv, doh_addr, &self.token),
-        )
-        .await
-        .context("DoH CONNECT 超时")??;
-        let stream = wrap_data_framing(send, recv);
+            .context("建立 DoH 隧道失败")?;
         self.dns.resolve_over(stream, domain, qtype).await
+    }
+
+    /// 打开一条隧道流并完成 H3 CONNECT 握手，返回可直接读写业务字节的流。
+    /// `doh_query_via` 和 `connect_tcp` 都要"开流 → CONNECT → 失败就释放两侧"
+    /// 这一套，统一到这一处，避免两份各自维护、超时/清理覆盖不一致。
+    async fn connect_stream(&self, authority: &str) -> Result<(Box<dyn Stream>, Option<String>)> {
+        tokio::time::timeout(EXCHANGE_TIMEOUT, async {
+            let (mut send, mut recv) = self.open().await?;
+            match exchange(&mut send, &mut recv, authority, &self.token).await {
+                Ok(colo) => Ok((wrap_data_framing(send, recv), colo)),
+                Err(e) => {
+                    let _ = (recv.stop(0u32.into()), send.reset(0u32.into()));
+                    Err(e)
+                }
+            }
+        })
+        .await
+        .context("打开隧道流超时")?
     }
 }
 
@@ -162,24 +194,16 @@ impl Outbound for Masque {
         // 边缘会当作非法 authority 以 H3_MESSAGE_ERROR reset 流。
         let authority = SocketAddr::new(ip, port).to_string();
 
-        let (mut send, mut recv) = tokio::time::timeout(EXCHANGE_TIMEOUT, self.open())
+        // colo 不在这里打日志：连上后交给调用方跟"已建立"合并成一行，避免
+        // 同一次连接的信息分散在两个模块、并发时靠时间戳猜配对。
+        let (stream, colo) = self
+            .connect_stream(&authority)
             .await
-            .map_err(|_| io_err(format!("打开隧道流超时: {authority}")))?
-            .map_err(|e| io_err(format!("打开隧道流失败: {e}")))?;
-
-        // CONNECT 交换失败统一在这里释放两侧，防僵尸流耗尽并发流配额。
-        // colo 不在这里打日志：连上后交给调用方跟"已建立"合并成一行，
-        // 避免同一次连接的信息分散在两个模块、并发时靠时间戳猜配对。
-        match exchange(&mut send, &mut recv, &authority, &self.token).await {
-            Ok(colo) => Ok(Connected {
-                stream: wrap_data_framing(send, recv),
-                note: colo.map(|c| format!("colo={c}")),
-            }),
-            Err(e) => {
-                let _ = (recv.stop(0u32.into()), send.reset(0u32.into()));
-                Err(io_err(format!("MASQUE CONNECT {authority} 失败: {e:#}")))
-            }
-        }
+            .map_err(|e| io_err(format!("MASQUE CONNECT {authority} 失败: {e:#}")))?;
+        Ok(Connected {
+            stream,
+            note: colo.map(|c| format!("colo={c}")),
+        })
     }
 }
 
@@ -223,47 +247,68 @@ async fn exchange(
 }
 
 /// CONNECT 成功后，把仍带 H3 DATA frame 分帧的裸双向流包成上层不用关心分帧
-/// 的字节流：起两个泵任务做编解码，中间用一对 duplex 转发；调用方拿到的
+/// 的字节流：起一个泵任务做编解码，中间用一对 duplex 转发；调用方拿到的
 /// `remote` 端只看到裸隧道字节。收方向遇到非 DATA 帧（如 GREASE）直接丢弃。
-fn wrap_data_framing(mut send: quinn::SendStream, mut recv: quinn::RecvStream) -> Box<dyn Stream> {
-    const RELAY_BUF: usize = 64 * 1024;
+fn wrap_data_framing(send: quinn::SendStream, recv: quinn::RecvStream) -> Box<dyn Stream> {
     let (local, remote) = tokio::io::duplex(RELAY_BUF);
+    tokio::spawn(pump(send, recv, local));
+    Box::new(remote)
+}
+
+/// 两个方向在同一个任务内并发跑；上行先结束就只给下行 DRAIN_GRACE 的宽限
+/// 期（见该常量注释），超时或下行先结束都会让 send/recv 被 drop 掉。
+async fn pump(
+    mut send: quinn::SendStream,
+    mut recv: quinn::RecvStream,
+    local: tokio::io::DuplexStream,
+) {
     let (mut local_read, mut local_write) = tokio::io::split(local);
 
-    tokio::spawn(async move {
-        loop {
-            let frame_type = match read_varint(&mut recv).await {
-                Ok(v) => v,
-                Err(_) => return,
-            };
-            let len = match read_varint(&mut recv).await {
-                Ok(v) => v as usize,
-                Err(_) => return,
-            };
-            let mut buf = vec![0u8; len];
-            if recv.read_exact(&mut buf).await.is_err() {
-                return;
-            }
-            if frame_type == 0x00 && local_write.write_all(&buf).await.is_err() {
-                return;
-            }
-        }
-    });
+    let download = drain_download(&mut recv, &mut local_write);
+    tokio::pin!(download);
+    let upload = drain_upload(&mut local_read, &mut send);
+    tokio::pin!(upload);
 
-    tokio::spawn(async move {
-        let mut buf = vec![0u8; RELAY_BUF];
-        loop {
-            let n = match local_read.read(&mut buf).await {
-                Ok(0) | Err(_) => return,
-                Ok(n) => n,
-            };
-            if send.write_all(&qpack::data_frame(&buf[..n])).await.is_err() {
-                return;
-            }
-        }
-    });
+    tokio::select! {
+        () = &mut download => return,
+        () = &mut upload => {}
+    }
+    let _ = tokio::time::timeout(DRAIN_GRACE, download).await;
+}
 
-    Box::new(remote)
+/// 边缘 → 本地：收 H3 DATA frame 解出负载写回本地；非 DATA 帧（如 GREASE）直接丢弃。
+async fn drain_download(recv: &mut quinn::RecvStream, out: &mut (impl AsyncWrite + Unpin)) {
+    loop {
+        let frame_type = match read_varint(recv).await {
+            Ok(v) => v,
+            Err(_) => return,
+        };
+        let len = match read_varint(recv).await {
+            Ok(v) => v as usize,
+            Err(_) => return,
+        };
+        let mut buf = vec![0u8; len];
+        if recv.read_exact(&mut buf).await.is_err() {
+            return;
+        }
+        if frame_type == 0x00 && out.write_all(&buf).await.is_err() {
+            return;
+        }
+    }
+}
+
+/// 本地 → 边缘：读本地字节，包成 H3 DATA frame 发出。
+async fn drain_upload(input: &mut (impl AsyncRead + Unpin), send: &mut quinn::SendStream) {
+    let mut buf = vec![0u8; RELAY_BUF];
+    loop {
+        let n = match input.read(&mut buf).await {
+            Ok(0) | Err(_) => return,
+            Ok(n) => n,
+        };
+        if send.write_all(&qpack::data_frame(&buf[..n])).await.is_err() {
+            return;
+        }
+    }
 }
 
 /// 绑定本地 UDP socket，源连接 ID 用 20 字节（对齐 warp-svc，避免 4 字节 SCID 触发边缘 PROTOCOL_VIOLATION）。
