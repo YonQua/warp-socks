@@ -11,8 +11,13 @@ TRACE_URL_DEFAULT="https://cloudflare.com/cdn-cgi/trace"
 
 TEAMS_TOKEN="${TEAMS_TOKEN:-}"
 ENDPOINT_CANDIDATES="${ENDPOINT_CANDIDATES:-}"
-WARP_PLUS_BIN="${WARP_PLUS_BIN:-warp-plus}"
-WARP_PLUS_LOG_VERBOSE="${WARP_PLUS_LOG_VERBOSE:-0}"
+
+# 隧道实现：自研 Rust 重写（warp-rs/），见 docs/module-boundaries.md。
+WARP_RS_BIN="${WARP_RS_BIN:-warp-socks-rs}"
+# t1/t2 反审查伪装包：Phase 0 验证过 reserved bytes 才是握手必需机制，trick
+# 本身不是必需项，默认关闭更快；保留开关应对未来审查策略变化。
+WARP_RS_TRICK="${WARP_RS_TRICK:-none}"
+TUNNEL_LOG_VERBOSE="${TUNNEL_LOG_VERBOSE:-0}"
 
 LISTEN_ADDR="0.0.0.0"
 LISTEN_PORT="1080"
@@ -38,8 +43,10 @@ LOG_COMPONENT=""
 LOG_TIMEZONE_DEFAULT="CST-8"
 LOG_TIME_FORMAT_DEFAULT="%Y-%m-%d %H:%M:%S %Z"
 
-WARP_PLUS_PID=""
+TUNNEL_LOG_FILE="/tmp/tunnel.log"
+TUNNEL_PID=""
 WARP_LOG_TAIL_PID=""
+WARP_LOG_RAW_TAIL_PID=""
 TUNNEL_WAIT_ATTEMPTS=""
 TUNNEL_WAIT_ELAPSED_SECONDS=""
 ENDPOINT_SOURCE=""
@@ -59,7 +66,7 @@ normalize_runtime_tuning() {
 }
 
 verify_runtime_environment() {
-  required_cmds="curl jq wg $WARP_PLUS_BIN"
+  required_cmds="curl jq wg $WARP_RS_BIN"
 
   for required_cmd in $required_cmds; do
     command -v "$required_cmd" >/dev/null 2>&1 || fail_tunnel "缺少运行依赖: ${required_cmd}"

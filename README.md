@@ -2,15 +2,17 @@
 
 一个面向单机部署的 WARP SOCKS5 Docker 方案：用 Cloudflare Teams registration token 注册一次，然后稳定提供一个本机可访问的 SOCKS5 出口。
 
-主链路：`TEAMS_TOKEN -> account.json -> wg0.conf -> warp-plus --wgconf wg0.conf`
+主链路：`TEAMS_TOKEN -> account.json -> wg0.conf -> 隧道进程（userspace WireGuard + SOCKS5）`
 
 1. `TEAMS_TOKEN -> account.json`（首次启动注册，之后重启直接复用）
 2. `account.json -> wg0.conf`
-3. `warp-plus`（userspace WireGuard + 内置 SOCKS5）起进程
+3. 隧道进程起进程（userspace WireGuard + 内置 SOCKS5）
 4. 经 SOCKS5 出口探测通过（`warp=on`）后进入运行态
 5. 运行期 healthcheck 连续失败达到阈值后，请求容器重启
 
 说明：不再使用内核 `wg-quick` / `microsocks`。在中国等网络环境下，内核 WireGuard 常卡在 `0 B received`；当前实现改用带 WARP tricks 的 userspace 客户端。
+
+隧道与 SOCKS5 由本项目自研的 Rust 实现提供（`warp-rs/`，参考 bepass-org/warp-plus 思路重写，同一份 `wg0.conf` 格式、同样的 reserved bytes/trick 反审查机制）。
 
 当前状态和恢复规则也很简单：
 
@@ -23,7 +25,7 @@
 
 - `lib/core/`：日志、错误、工具、探测、endpoint 状态
 - `lib/domain/`：Teams 注册、endpoint 候选、WireGuard 配置
-- `lib/runtime/`：`warp-plus` 生命周期、SOCKS 监督、healthcheck 恢复
+- `lib/runtime/`：隧道进程生命周期、SOCKS 监督、healthcheck 恢复
 - `lib/app/`：环境装配与主流程
 
 入口文件只有两个：
@@ -80,7 +82,7 @@ docker exec warp-socks curl --socks5 127.0.0.1:1080 https://cloudflare.com/cdn-c
 | `RESTART_POLICY`        | `unless-stopped`       | Docker 重启策略                                                                                    |
 | `LOG_TIMEZONE`          | `CST-8`                | 容器日志时区                                                                                       |
 | `LOG_TIME_FORMAT`       | `%Y-%m-%d %H:%M:%S %Z` | 容器日志时间格式                                                                                   |
-| `WARP_PLUS_LOG_VERBOSE` | `0`                    | 是否输出 warp-plus 详细调试日志                                                                    |
+| `TUNNEL_LOG_VERBOSE`    | `0`                    | 是否额外输出隧道进程完整原始调试日志；连接建立/失败默认已会过滤接入容器日志，不受此项影响          |
 
 ### 高级调优参数
 
@@ -93,6 +95,8 @@ docker exec warp-socks curl --socks5 127.0.0.1:1080 https://cloudflare.com/cdn-c
 | `WARP_SOCKS_STARTUP_SOCKS_READY_TIMEOUT`   | `20`   | 启动阶段等待隧道+SOCKS 就绪的总秒数    |
 | `WARP_SOCKS_HEALTHCHECK_PROBE_TIMEOUT`     | `4`    | 运行期单次健康检查探测超时秒数         |
 | `WARP_SOCKS_HEALTHCHECK_FAILURE_THRESHOLD` | `3`    | 运行期连续失败达到多少次后请求容器重启 |
+| `WARP_RS_TRICK`                            | `none` | 反审查伪装包模式，`none`/`t1`/`t2` |
+| `WARP_RS_BIN`                              | `warp-socks-rs` | 覆盖隧道二进制路径/名称 |
 
 ### 启动等待调优建议
 

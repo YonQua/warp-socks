@@ -6,6 +6,7 @@
 !.env.example
 wireguard/
 wireguard-*/
+warp-rs/target/
 README.md
 CHANGELOG.md
 compose.yaml

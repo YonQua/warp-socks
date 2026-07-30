@@ -1,6 +1,7 @@
 #!/bin/sh
 set -eu
 
+# shellcheck disable=SC1007
 SCRIPT_DIR="$(CDPATH= cd -- "$(dirname "$0")" && pwd)"
 WARP_LIB_DIR="${SCRIPT_DIR}/../lib"
 COMMON_SH="${WARP_LIB_DIR}/warp-common.sh"

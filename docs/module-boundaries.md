@@ -6,11 +6,13 @@
 
 1. `TEAMS_TOKEN -> account.json`（首次启动注册，之后重启直接复用）
 2. `account.json -> wg0.conf`
-3. `warp-plus --wgconf wg0.conf`（userspace WireGuard + 内置 SOCKS5）
+3. 隧道进程（`warp-rs/` 自研 Rust 实现，userspace WireGuard + 内置 SOCKS5）读取 `wg0.conf` 起进程
 4. 经 SOCKS5 出口探测通过（`warp=on`）后进入运行态
 5. 运行期 healthcheck 连续失败达到阈值后，请求容器重启
 
 说明：内核 `wg-quick` / `microsocks` 路径已废弃。中国等网络环境下，内核 WireGuard 常表现为 `0 B received`；带 WARP tricks 的 userspace 实现才能稳定握手。
+
+隧道与 SOCKS5 由 `warp-rs/`（参考 bepass-org/warp-plus 思路用 Rust 重写）提供，`Dockerfile` 的 `rust-builder` stage 编译。同一份 `wg0.conf` 格式、同样的 reserved bytes/trick 反审查机制，CLI 为 `warp-socks <wg0.conf> <listen_addr> [none|t1|t2]`，日志行以 `连接 ` 开头。第三方 `warp-plus` 二进制和 `TUNNEL_IMPL` 切换开关已在 warp-rs 生产验证通过后移除。
 
 ## 状态文件
 
@@ -18,7 +20,7 @@
   - Teams 注册结果
   - 唯一账户状态来源
   - `config.client_id` base64 解码后取前 3 字节，写入 `wg0.conf` 的 `Reserved =`
-    （warp-plus 在 `--wgconf` 模式下只认文件里的 `Reserved`，不认 `--reserved` flag）
+    （`warp-rs` 的 `config.rs` 只读文件里的 `Reserved` 字段）
 
 - `wireguard/wg0.conf`
   - 由 `account.json` 和 endpoint 派生
@@ -52,13 +54,13 @@
 
 - `lib/runtime/`
   - 运行期控制
-  - `tunnel.sh`：warp-plus 单进程生命周期（起、探测、监督、退出）
+  - `tunnel.sh`：隧道单进程生命周期（起、探测、监督、退出）
   - `recovery.sh`：healthcheck 恢复
 
 ## 当前约束
 
 - 只支持 Teams 注册登录
-- 隧道与代理统一由 `warp-plus` 提供
+- 隧道与代理由 `warp-rs` 单一二进制提供
 - 启动阶段必须先拿到可用 SOCKS 出口，再标记 runtime ready
 - 运行期恢复策略固定为“连续失败后重启容器”
 

@@ -1,0 +1,22 @@
+[package]
+name = "warp-rs"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "handshake_probe"
+path = "src/bin/handshake_probe.rs"
+
+[[bin]]
+name = "warp-socks"
+path = "src/bin/warp-socks.rs"
+
+[dependencies]
+boringtun = "0.7"
+base64 = "0.22"
+rand = "0.8"
+anyhow = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "macros", "signal", "time", "sync"] }
+tokio-smoltcp = "0.6"
+futures = "0.3"
+httparse = "1"

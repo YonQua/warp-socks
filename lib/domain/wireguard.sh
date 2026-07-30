@@ -26,12 +26,11 @@ account_client_id() {
   json_extract '.config.client_id // .client_id'
 }
 
-# WARP 用 client_id 派生的 3 字节 reserved 做协议层账户标识（对照 warp-plus 官方
-# generateWireguardConfig() 的算法：取 client_id base64 解码后的前 3 个字节）。
-# warp-plus 在 --wgconf 模式下只认 [Peer] 段的 Reserved 字段，--reserved 这个 CLI
-# flag 会被忽略（app/app.go 的 runWireguard() 不读 opts.Reserved）。
+# WARP 用 client_id 派生的 3 字节 reserved 做协议层账户标识（算法：取 client_id
+# base64 解码后的前 3 个字节，对照 bepass-org/warp-plus 的 generateWireguardConfig()）。
+# 隧道实现（warp-rs/src/config.rs）只认 wg0.conf 里 [Peer] 段的 Reserved 字段。
 # 用 set -- 精确取前 3 个字节，不管解码出多少字节，保证输出永远是合法的
-# "a,b,c" 三段格式——否则 warp-plus 解析 wgconf 会直接报错退出。
+# "a,b,c" 三段格式——否则解析 wg0.conf 会直接报错退出。
 account_reserved_csv() {
   client_id="$(account_client_id)"
   decoded_bytes=""
@@ -44,13 +43,14 @@ account_reserved_csv() {
     decoded_bytes="$(printf '%s' "$padded" | base64 -d 2>/dev/null | od -An -tu1 | tr -s '[:space:]' ' ')"
   fi
 
+  # shellcheck disable=SC2086
   set -- ${decoded_bytes:-}
   printf '%s,%s,%s' "${1:-0}" "${2:-0}" "${3:-0}"
 }
 
-# DNS / MTU / PersistentKeepalive 不写在这里：warp-plus 的 --wgconf 分支
-# (app/app.go runWireguard()) 会无条件覆盖这三个字段（DNS 用 --dns 覆盖，
-# MTU 硬编码成 1330，PersistentKeepalive 硬编码成 5 秒），写了也不会生效。
+# DNS / MTU / PersistentKeepalive 不写在这里：隧道实现固定用 DNS 1.1.1.1、
+# MTU 1330、PersistentKeepalive 5 秒（源自 bepass-org/warp-plus 的
+# --wgconf 分支实际生效值），写在 wg0.conf 里也不会被读取。
 write_wg_config() {
   private_key="$1"
   peer_public_key="$2"
