@@ -16,7 +16,7 @@ use tokio::time::sleep;
 use crate::appconfig::AppConfig;
 use crate::config::parse_wg_conf;
 use crate::endpoint::{candidate_pool, plan_candidates, JsonFileEndpointStore};
-use crate::health::{RecoveryAction, SocksTraceProbe, ThresholdRecovery};
+use crate::health::{heartbeat, RecoveryAction, SocksTraceProbe, ThresholdRecovery};
 use crate::mixed;
 use crate::outbound::{Masque, Outbound, WgOutbound};
 use crate::registration::{self, TeamsRegistrar, WgAccount};
@@ -258,6 +258,15 @@ impl Supervisor {
         );
         info!("隧道后端: {backend}");
 
+        // spawn_and_probe 里已经跑过一次成功的就绪探测，这里直接记一次心跳，
+        // 避免容器刚起来、第一轮 healthcheck_interval 还没到时，Docker
+        // HEALTHCHECK 读不到任何心跳而误判成不健康（见 heartbeat.rs 注释）。
+        heartbeat::record(true);
+
+        // 探测走的是跟真实业务连接完全相同的路径（SOCKS5 -> outbound），隧道
+        // 一时拥塞导致的自愈重连（如 masque::open() 内部换 QUIC 连接）也会在
+        // 这次探测里自然发生——前提是 healthcheck_probe_timeout 给得够长，
+        // 详见 appconfig.rs 里该字段默认值的注释。
         let probe = SocksTraceProbe::new(
             self.config.listen_port,
             self.config.healthcheck_probe_timeout,
@@ -283,9 +292,11 @@ impl Supervisor {
                 () = sleep(self.config.healthcheck_interval) => {
                     match probe.probe().await {
                         Ok(_) => {
+                            heartbeat::record(true);
                             recovery.on_success();
                         }
                         Err(e) => {
+                            heartbeat::record(false);
                             let action = recovery.on_failure(&e.to_string());
                             warn!(
                                 "SOCKS 出口探测失败: {e}; failures={}/{}",

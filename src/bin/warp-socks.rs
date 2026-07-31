@@ -14,7 +14,7 @@ use anyhow::{bail, Context, Result};
 
 use warp_rs::appconfig::AppConfig;
 use warp_rs::fsutil::restrict_to_owner;
-use warp_rs::health::SocksTraceProbe;
+use warp_rs::health::heartbeat;
 use warp_rs::registration;
 use warp_rs::supervisor::Supervisor;
 
@@ -89,16 +89,23 @@ async fn run_register(args: &[String]) -> Result<()> {
     Ok(())
 }
 
-/// 无状态单次探测：不读写任何失败计数/ready 标记文件，阈值判定完全在
-/// Supervisor 自己的运行期健康检查循环里，这里只是给 Docker HEALTHCHECK
-/// 一个状态展示信号。
+/// 只读 Supervisor 运行期健康检查循环写的心跳文件（见 health::heartbeat），
+/// 不再自己发起一次完整的 SOCKS→隧道探测——那条隧道本来就已经在被
+/// Supervisor 自己的循环真实探测，这里重复探测只是白白多打一次流量、多一
+/// 处要和内部超时预算保持同步的地方。阈值判定同样完全在 Supervisor 那边，
+/// 这里只是把它的最新结果转成 Docker HEALTHCHECK 的退出码。
 async fn run_healthcheck() -> Result<()> {
     let config = AppConfig::from_env();
-    let probe = SocksTraceProbe::new(config.listen_port, config.healthcheck_probe_timeout);
-    match probe.probe().await {
-        Ok(_) => Ok(()),
-        Err(e) => {
-            eprintln!("healthcheck 探测失败: {e}");
+    // 心跳最坏多久没更新一次：运行期循环每 healthcheck_interval 探测一次，
+    // 一次探测最坏能拖到 healthcheck_probe_timeout（隧道自愈重连的完整预
+    // 算），二者相加再留 10 秒余量，避免自愈还没跑完就被判成"心跳过期"。
+    let max_age = config.healthcheck_interval
+        + config.healthcheck_probe_timeout
+        + std::time::Duration::from_secs(10);
+    match heartbeat::check(max_age) {
+        Ok(()) => Ok(()),
+        Err(reason) => {
+            eprintln!("healthcheck 不健康: {reason}");
             std::process::exit(1);
         }
     }

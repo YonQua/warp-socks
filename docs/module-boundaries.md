@@ -68,6 +68,7 @@
 - `src/health/`
   - `probe.rs`：`SocksTraceProbe`，走本地 SOCKS5 请求 trace 接口检查 `warp=on|plus`
   - `recovery.rs`：连续失败达到阈值即请求退出进程的恢复策略
+  - `heartbeat.rs`：`Supervisor` 运行期探测结果落一份心跳文件，`healthcheck` 子命令只读这份心跳、不再自己重新发起一次真实探测
   - `mod.rs`：探测方式与恢复策略的 trait 抽象
 
 - `src/mixed.rs`

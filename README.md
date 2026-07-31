@@ -87,7 +87,7 @@ docker exec warp-socks curl --socks5 127.0.0.1:1080 https://cloudflare.com/cdn-c
 | `WARP_SOCKS_STARTUP_EGRESS_PROBE_DELAY`    | `1`    | 启动阶段两次探测之间的间隔秒数         |
 | `WARP_SOCKS_STARTUP_EGRESS_PROBE_TIMEOUT`  | `5`    | 单次启动阶段 SOCKS 出口探测超时秒数    |
 | `WARP_SOCKS_STARTUP_SOCKS_READY_TIMEOUT`   | `20`   | 启动阶段等待隧道+SOCKS 就绪的总秒数    |
-| `WARP_SOCKS_HEALTHCHECK_PROBE_TIMEOUT`     | `4`    | 运行期单次健康检查探测超时秒数         |
+| `WARP_SOCKS_HEALTHCHECK_PROBE_TIMEOUT`     | 派生值（约 63，见下方说明） | 运行期单次健康检查探测超时秒数         |
 | `WARP_SOCKS_HEALTHCHECK_FAILURE_THRESHOLD` | `3`    | 运行期连续失败达到多少次后请求容器重启 |
 | `WARP_RS_TRICK`                            | `none` | 反审查伪装包模式，`none`/`t1`/`t2` |
 | `WARP_SOCKS_ENABLE_MASQUE`                 | `0`    | 开启后自动确保 `reg.json` 存在（缺失则在进程内直接完成注册），warp-socks-rs 优先走 MASQUE，失败仍回退 WireGuard；关闭时行为与不开启完全一致 |
@@ -102,14 +102,13 @@ WARP_SOCKS_REGISTER_RETRY_DELAY=1
 WARP_SOCKS_STARTUP_EGRESS_PROBE_DELAY=1
 WARP_SOCKS_STARTUP_EGRESS_PROBE_TIMEOUT=4
 WARP_SOCKS_STARTUP_SOCKS_READY_TIMEOUT=15
-WARP_SOCKS_HEALTHCHECK_PROBE_TIMEOUT=3
 WARP_SOCKS_HEALTHCHECK_FAILURE_THRESHOLD=2
 ```
 
 说明：
 
 - userspace 握手通常 3~8 秒，遇到重试可能到 15 秒以上；`WARP_SOCKS_STARTUP_SOCKS_READY_TIMEOUT` 是这段总等待时间，不建议低于 `15`。
-- `WARP_SOCKS_HEALTHCHECK_PROBE_TIMEOUT` 决定运行期故障判定速度；调低后恢复更快，但误判概率也会上升。
+- `WARP_SOCKS_HEALTHCHECK_PROBE_TIMEOUT` 不建议手工调低：探测走的是和真实业务连接相同的路径，隧道自身的自愈重连（MASQUE 侧的 `open()`）需要完整跑完才能拿到真实结果；调低到低于隧道自愈预算，会把"正在自愈"误判成"探测失败"，反而更容易触发不必要的容器重启。默认值已经从隧道自愈预算自动派生，一般不需要覆盖。
 - `WARP_SOCKS_HEALTHCHECK_FAILURE_THRESHOLD` 是运行期恢复的唯一连续失败阈值来源；Docker `HEALTHCHECK` 只负责定时触发，不再叠加第二层 `retries` 语义。
 - 注册链路遇到 `429` 时仍会尊重服务端 `Retry-After`，这部分不会被本地更小的 delay 强行覆盖。
 

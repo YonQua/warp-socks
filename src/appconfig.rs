@@ -5,7 +5,14 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
+use crate::relay;
 use crate::tunnel::Trick;
+
+// 健康检查探测内部就是走 relay::connect()（同一条业务连接路径），这里在它
+// 的超时基础上再留 5 秒余量，避免探测自己的超时比它调用的 connect() 更没
+// 耐心。从 relay::CONNECT_TIMEOUT 派生而不是独立手抄一个数字，链路只有一
+// 个源头（masque::CONNECT_STREAM_TIMEOUT），逐层派生、逐层加一点余量。
+const HEALTHCHECK_PROBE_TIMEOUT_DEFAULT: u64 = relay::CONNECT_TIMEOUT.as_secs() + 5;
 
 pub struct AppConfig {
     pub wg_dir: PathBuf,
@@ -87,9 +94,17 @@ impl AppConfig {
                 20,
             ))),
             startup_endpoint_cooldown: Duration::from_secs(30),
+            // 探测走跟真实业务连接相同的路径，隧道拥塞时的自愈重连也会在这
+            // 次探测里自然发生——前提是这里给的时间够长；短于它会导致探测
+            // 在自愈跑完前就先报超时，把可自愈的拥塞误判成"连续失败"进而
+            // 触发整进程重启。默认值从 HEALTHCHECK_PROBE_TIMEOUT_DEFAULT 派
+            // 生（见上方常量及其注释里的完整链路），不再是独立手抄的数字。
             healthcheck_probe_timeout: Duration::from_secs(u64::from(sanitize_positive_int(
-                &env_var("WARP_SOCKS_HEALTHCHECK_PROBE_TIMEOUT", "4"),
-                4,
+                &env_var(
+                    "WARP_SOCKS_HEALTHCHECK_PROBE_TIMEOUT",
+                    &HEALTHCHECK_PROBE_TIMEOUT_DEFAULT.to_string(),
+                ),
+                HEALTHCHECK_PROBE_TIMEOUT_DEFAULT as u32,
             ))),
             healthcheck_failure_threshold: sanitize_positive_int(
                 &env_var("WARP_SOCKS_HEALTHCHECK_FAILURE_THRESHOLD", "3"),

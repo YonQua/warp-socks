@@ -47,7 +47,12 @@ RUN chmod +x \
 
 # Docker 只负责定时展示健康状态；连续失败阈值判定与重启触发完全在
 # warp-socks-rs 自己的运行期健康检查循环里（见 src/supervisor.rs）。
-HEALTHCHECK --interval=30s --timeout=25s --start-period=30s --retries=1 \
+#
+# healthcheck 子命令不再自己发起一次真实的隧道探测，只读运行期循环写的心跳
+# 文件（见 src/health/heartbeat.rs）——纯本地文件读取，跟隧道自愈重连需要
+# 多久完全无关，--timeout 不需要再跟着内部任何超时预算走，给个宽松的固定
+# 值即可。
+HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=1 \
   CMD ["/usr/local/bin/warp-socks-rs", "healthcheck"]
 
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]

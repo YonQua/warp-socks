@@ -11,9 +11,16 @@ use log::info;
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 
+use crate::outbound::masque;
 use crate::outbound::{Connected, Host, Outbound};
 
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
+// 从 masque::CONNECT_STREAM_TIMEOUT（各 Outbound 实现里最大的连接预算，即
+// open() 内部重连自愈需要的完整预算）直接派生，而不是手抄一个数字——
+// masque 那边的子超时改动后这里自动跟着变，不会再出现"改了内层却忘了同
+// 步外层"的漂移。留 5 秒余量：这里比内层更没耐心地提前取消，会把一次本
+// 可恢复的重连误判成超时失败。
+pub(crate) const CONNECT_TIMEOUT: Duration =
+    Duration::from_secs(masque::CONNECT_STREAM_TIMEOUT.as_secs() + 5);
 
 /// 通过出网抽象建立 TCP 连接。
 ///

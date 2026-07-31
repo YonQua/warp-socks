@@ -39,6 +39,32 @@ mod tls;
 const SNI: &str = "consumer-masque-proxy.cloudflareclient.com";
 const DIAL_TIMEOUT: Duration = Duration::from_secs(8);
 const EXCHANGE_TIMEOUT: Duration = Duration::from_secs(15);
+// open_bi 单次尝试的超时：对端并发流配额耗尽时 open_bi 会无限期挂起而非报
+// 错（视频等大量长连接同时在线时会真实触发），这里用超时把"挂起"也当成
+// "这条连接暂时用不了"，交给 open() 触发重连——对照 warp-go openRequestStream
+// 的 10s openCtx（masque.go:366）。
+const OPEN_TIMEOUT: Duration = Duration::from_secs(10);
+// 重连时建 H3 控制流（open_uni + 发 SETTINGS）的超时：这段是纯网络 I/O，
+// 边缘响应慢时会无限期挂起——对照 warp-go dialAddr 的 setupTimer（同样
+// 10s，masque.go:308-327）。没有这层超时时，一次控制流建立变慢会让
+// open() 持锁重连的过程被无限拉长（见 open() 注释）。
+const CONTROL_STREAM_TIMEOUT: Duration = Duration::from_secs(10);
+// open() 重连失败时最坏耗时：首次尝试超时(OPEN_TIMEOUT) + 重连拨号(至多
+// DIAL_TIMEOUT，候选并发拨号，不是累加) + 建控制流(至多 CONTROL_STREAM_TIMEOUT)
+// + 重试一次(OPEN_TIMEOUT)。
+const OPEN_RETRY_BUDGET: Duration = Duration::from_secs(
+    OPEN_TIMEOUT.as_secs() * 2 + DIAL_TIMEOUT.as_secs() + CONTROL_STREAM_TIMEOUT.as_secs(),
+);
+// connect_stream 的总预算，从上面两个子预算推导而非独立取一个数字：这样
+// OPEN_TIMEOUT/DIAL_TIMEOUT 改动后这里自动跟着变，不会出现"改了内层超时
+// 却忘了同步外层"的漂移。外层调用方（relay::CONNECT_TIMEOUT、健康检查的
+// healthcheck_probe_timeout）都必须 ≥ 这个值，否则会在这里的重连自愈还没
+// 跑完之前就被提前掐断，把一次本可恢复的重连误判成超时失败——这正是最初
+// 加上 open() 重连后仍然复现崩溃的根因：多层超时互不知情、外层比内层更没
+// 耐心。`pub(crate)` 是为了让 relay.rs / appconfig.rs 直接从这个值派生自己
+// 的外层超时，而不是各自手抄一个数字再靠注释提醒"记得保持同步"。
+pub(crate) const CONNECT_STREAM_TIMEOUT: Duration =
+    Duration::from_secs(OPEN_RETRY_BUDGET.as_secs() + EXCHANGE_TIMEOUT.as_secs());
 // 对照 warp-go relayDrainGrace：客户端半关（上行结束）后，最多再等这么久的
 // 下行数据；超时强制放弃，避免边缘一侧还在发送、但客户端早已消失（视频类
 // 播放器频繁跳转/中止请求就是这种模式）时，这条 H3 流被无限期占着——大量
@@ -61,6 +87,13 @@ pub struct Masque {
     addrs: Vec<SocketAddr>,
     token: String,
     link: Mutex<Link>,
+    // 只串行化"谁去拨号重连"，不覆盖对 link 的读取——重连期间其他调用者
+    // 仍能立刻读到（旧的）link 去尝试 open_bi，不会被一次慢重连卡住整条
+    // 读路径。对照 warp-go connMu（读，masque.go:331-345）与 reconnectMu
+    // （重连，masque.go:391-410）分离的设计；此前 link 锁被 `*link =
+    // connect(...).await?` 整段持有，是这次故障（大量并发调用者一起卡在
+    // 获取 link 锁上，直到唯一一次重连结束）的根因。
+    reconnecting: Mutex<()>,
     dns: doh::DnsCache,
 }
 
@@ -82,35 +115,60 @@ impl Masque {
             addrs,
             token,
             link: Mutex::new(link),
+            reconnecting: Mutex::new(()),
             dns,
         })
     }
 
-    /// 取一条双向流；连接失效则整体重建一次（重连过程仍互斥，避免并发重复重建）。
+    /// 取一条双向流；连接失效或配额耗尽则整体重建一次（重连过程仍互斥，
+    /// 避免并发重复重建）。
     ///
-    /// `conn.open_bi()` 在对端并发流配额耗尽时会挂起等待（而非报错返回），
-    /// 视频等大流量长连接一多就容易触发。锁只用来保护"读/替换 link"这个瞬时
-    /// 操作，克隆出 `Connection`（quinn 内部是 Arc handle，克隆是廉价的引用计数）
-    /// 后立刻释放锁，真正可能长时间挂起的 `open_bi().await` 在锁外进行——否则
-    /// 一次挂起会把所有并发调用者（业务连接/DNS 解析/健康检查探测）串行阻塞在
-    /// 这把锁上，逐个等到各自超时，而非各自独立等待/超时。
+    /// 锁只用来保护"读/替换 link"这个瞬时操作，克隆出 `Connection`（quinn
+    /// 内部是 Arc handle，克隆是廉价的引用计数）后立刻释放锁，真正可能长时间
+    /// 挂起的 `open_bi().await` 在锁外进行——否则一次挂起会把所有并发调用者
+    /// （业务连接/DNS 解析/健康检查探测）串行阻塞在这把锁上，逐个等到各自
+    /// 超时，而非各自独立等待/超时。
+    ///
+    /// `open_bi_bounded` 把"挂起"和"报错"统一处理为失败：对端并发流配额
+    /// 耗尽时 `open_bi()` 是挂起等待而非报错返回（大量视频等长连接同时在线
+    /// 时会真实触发），若不把挂起也当失败处理，这条连接会一直卡住、永远
+    /// 等不到重连，直至健康检查连续失败到阈值、整个进程被拖垮重启——重启
+    /// 能"治好"只是因为重启后连接是全新的、配额也是满的，纯属巧合式自愈。
     async fn open(&self) -> Result<(quinn::SendStream, quinn::RecvStream)> {
         let conn = self.link.lock().await.conn.clone();
-        if let Ok(pair) = conn.open_bi().await {
-            return Ok(pair);
+        // `close_reason()` 是非阻塞的同步查询：连接已被 keep_alive/max_idle_timeout
+        // （见 tls::client_config）判定失效、或对端主动关闭时立刻返回 Some，
+        // 不需要真去发一次 open_bi 才发现。对照 warp-go currentConnection()
+        // （masque.go:331-345）同样的"先查活性，已知失效就跳过尝试直接走
+        // 重连"模式——没有这一步时，已知已死的连接仍要白等一整个 OPEN_TIMEOUT
+        // 才会触发重连，而这种情况在有了 keep_alive/idle_timeout 之后是最常见
+        // 的失效路径，不该占满超时预算。
+        if conn.close_reason().is_none() {
+            if let Ok(pair) = open_bi_bounded(&conn).await {
+                return Ok(pair);
+            }
         }
 
-        // open_bi 真正返回 Err 说明连接本身已失效（配额不足只会挂起，不会走到
-        // 这里），需要重连。stable_id 判断避免多个调用者同时发现失效时重复重建：
-        // 若锁到手时 link 已经被别人重连过，直接用新连接，不再重复拨号。
-        let mut link = self.link.lock().await;
-        if link.conn.stable_id() == conn.stable_id() {
-            warn!("open_bi 失败，重连 ...");
-            *link = connect(&self.endpoint, &self.cfg, &self.addrs).await?;
+        // `reconnecting` 只串行化拨号本身，不占用 `link` 的锁：`connect()`
+        // 是可能耗时的网络 I/O（拨号 + 建控制流，即便都已限时），若像此前那样
+        // 在持有 `link` 锁的情况下 `.await` 它，会让所有并发调用者（包括只
+        // 是想读一下 link 去试 open_bi 的）一起卡在获取锁上，直到这一次重连
+        // 结束——这正是故障现场"上百个并发请求同时超时失败，但只有一次
+        // 重连日志"的根因。
+        let _reconnecting = self.reconnecting.lock().await;
+        // stable_id 判断避免多个调用者同时发现失效时重复重建：等到手上这把
+        // 拨号锁时，link 可能已经被排在前面的调用者换成新连接了。
+        let stale_id = self.link.lock().await.conn.stable_id();
+        if stale_id == conn.stable_id() {
+            warn!("open_bi 超时或失败，重连 ...");
+            let fresh = connect(&self.endpoint, &self.cfg, &self.addrs).await?;
+            *self.link.lock().await = fresh;
         }
-        let conn = link.conn.clone();
-        drop(link);
-        conn.open_bi().await.context("重连后 open_bi 仍失败")
+        drop(_reconnecting);
+        let conn = self.link.lock().await.conn.clone();
+        open_bi_bounded(&conn)
+            .await
+            .context("重连后 open_bi 仍超时或失败")
     }
 
     /// 域名解析：命中缓存直接返回，否则依次尝试 DoH 候选 IP 查 A/AAAA。
@@ -160,7 +218,7 @@ impl Masque {
     /// `doh_query_via` 和 `connect_tcp` 都要"开流 → CONNECT → 失败就释放两侧"
     /// 这一套，统一到这一处，避免两份各自维护、超时/清理覆盖不一致。
     async fn connect_stream(&self, authority: &str) -> Result<(Box<dyn Stream>, Option<String>)> {
-        tokio::time::timeout(EXCHANGE_TIMEOUT, async {
+        tokio::time::timeout(CONNECT_STREAM_TIMEOUT, async {
             let (mut send, mut recv) = self.open().await?;
             match exchange(&mut send, &mut recv, authority, &self.token).await {
                 Ok(colo) => Ok((wrap_data_framing(send, recv), colo)),
@@ -172,6 +230,19 @@ impl Masque {
         })
         .await
         .context("打开隧道流超时")?
+    }
+}
+
+/// 单次 `open_bi` 尝试，超时后视为失败（详见 `OPEN_TIMEOUT` 注释）。
+async fn open_bi_bounded(
+    conn: &quinn::Connection,
+) -> Result<(quinn::SendStream, quinn::RecvStream)> {
+    match tokio::time::timeout(OPEN_TIMEOUT, conn.open_bi()).await {
+        Ok(Ok(pair)) => Ok(pair),
+        Ok(Err(e)) => Err(anyhow!("open_bi 失败: {e}")),
+        Err(_) => Err(anyhow!(
+            "open_bi 超时（{OPEN_TIMEOUT:?}，多半是边缘并发流配额耗尽）"
+        )),
     }
 }
 
@@ -341,11 +412,16 @@ async fn connect(
         .iter()
         .map(|&addr| Box::pin(dial_one(endpoint, cfg, addr)));
     let (conn, _rest) = futures::future::select_ok(dials).await?;
-    let mut control = conn.open_uni().await.context("打开 H3 控制流失败")?;
-    control
-        .write_all(&qpack::control_stream_prelude())
-        .await
-        .context("发送控制流 SETTINGS 失败")?;
+    let control = tokio::time::timeout(CONTROL_STREAM_TIMEOUT, async {
+        let mut control = conn.open_uni().await.context("打开 H3 控制流失败")?;
+        control
+            .write_all(&qpack::control_stream_prelude())
+            .await
+            .context("发送控制流 SETTINGS 失败")?;
+        Ok::<_, anyhow::Error>(control)
+    })
+    .await
+    .context("建立 H3 控制流超时")??;
     Ok(Link {
         conn,
         _control: control,

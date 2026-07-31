@@ -26,7 +26,14 @@ services:
       WARP_SOCKS_STARTUP_EGRESS_PROBE_DELAY: ${WARP_SOCKS_STARTUP_EGRESS_PROBE_DELAY:-1}
       WARP_SOCKS_STARTUP_EGRESS_PROBE_TIMEOUT: ${WARP_SOCKS_STARTUP_EGRESS_PROBE_TIMEOUT:-5}
       WARP_SOCKS_STARTUP_SOCKS_READY_TIMEOUT: ${WARP_SOCKS_STARTUP_SOCKS_READY_TIMEOUT:-20}
-      WARP_SOCKS_HEALTHCHECK_PROBE_TIMEOUT: ${WARP_SOCKS_HEALTHCHECK_PROBE_TIMEOUT:-4}
+      # 故意不写字面默认值：compose 的 ${VAR:-N} 语法只要 N 非空，就会把 N
+      # 实实在在写成容器环境变量，而不是"不设置"——真正的派生链
+      # （masque::CONNECT_STREAM_TIMEOUT → relay::CONNECT_TIMEOUT → 这个字段
+      # 的默认值）只活在 appconfig.rs 里，这里如果镜像抄一份具体数字，链路
+      # 任何一层超时改动后就会跟这里的硬编码值悄悄漂移。留空时容器里这个
+      # 变量是空字符串，appconfig.rs::sanitize_positive_int 解析失败会自动
+      # 退回它自己算出来的默认值，链路永远只有一个源头。
+      WARP_SOCKS_HEALTHCHECK_PROBE_TIMEOUT: ${WARP_SOCKS_HEALTHCHECK_PROBE_TIMEOUT:-}
       WARP_SOCKS_HEALTHCHECK_FAILURE_THRESHOLD: ${WARP_SOCKS_HEALTHCHECK_FAILURE_THRESHOLD:-3}
     logging:
       driver: json-file
