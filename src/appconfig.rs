@@ -1,5 +1,5 @@
 // 运行时环境变量解析，对应 lib/app/env.sh + normalize_runtime_tuning。
-// WG_DIR/LISTEN_ADDR 等固定路径未做成环境变量——shell 版本里它们也不是
+// STATE_DIR/LISTEN_ADDR 等固定路径未做成环境变量——shell 版本里它们也不是
 // `${VAR:-default}` 形式的可覆盖项，是写死的常量。
 
 use std::path::PathBuf;
@@ -15,7 +15,7 @@ use crate::tunnel::Trick;
 const HEALTHCHECK_PROBE_TIMEOUT_DEFAULT: u64 = relay::CONNECT_TIMEOUT.as_secs() + 5;
 
 pub struct AppConfig {
-    pub wg_dir: PathBuf,
+    pub state_dir: PathBuf,
     pub wg_conf: PathBuf,
     pub account_json: PathBuf,
     pub endpoint_state_file: PathBuf,
@@ -49,17 +49,17 @@ pub struct AppConfig {
 impl AppConfig {
     #[must_use]
     pub fn from_env() -> Self {
-        let wg_dir = PathBuf::from("/etc/wireguard");
+        let state_dir = PathBuf::from("/etc/warp-socks");
         Self {
-            wg_conf: wg_dir.join("wg0.conf"),
-            account_json: wg_dir.join("account.json"),
-            endpoint_state_file: wg_dir.join("endpoint-state.json"),
-            reg_json: wg_dir.join("reg.json"),
-            wg_dir,
+            wg_conf: state_dir.join("wg0.conf"),
+            account_json: state_dir.join("account.json"),
+            endpoint_state_file: state_dir.join("endpoint-state.json"),
+            reg_json: state_dir.join("reg.json"),
+            state_dir,
 
             teams_token: env_var("TEAMS_TOKEN", ""),
             endpoint_candidates: env_var("ENDPOINT_CANDIDATES", ""),
-            enable_masque: is_true(&env_var("WARP_SOCKS_ENABLE_MASQUE", "0")),
+            enable_masque: is_true(&env_var("WARP_SOCKS_ENABLE_MASQUE", "1")),
             trick: match env_var("WARP_RS_TRICK", "none").as_str() {
                 "t1" => Trick::T1,
                 "t2" => Trick::T2,

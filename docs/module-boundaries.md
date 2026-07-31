@@ -4,8 +4,8 @@
 
 ## 主链路
 
-1. `TEAMS_TOKEN -> account.json`（首次启动注册，之后重启直接复用）
-2. `account.json -> wg0.conf`（WireGuard 路径用；MASQUE 路径是独立的 `reg.json`，见下方“状态文件”）
+1. `WARP_SOCKS_ENABLE_MASQUE=1` 时优先尝试独立的 `reg.json`（MASQUE，见下方“状态文件”），成功则不需要 `TEAMS_TOKEN`/`account.json`
+2. MASQUE 未开启，或开启但注册/建隧道失败需要回退时，才走 `TEAMS_TOKEN -> account.json`（首次注册，之后重启直接复用）-> `wg0.conf`（WireGuard 路径用）
 3. `Supervisor`（`src/supervisor.rs`）在进程内起隧道（`WARP_SOCKS_ENABLE_MASQUE=1` 时优先 MASQUE，失败或未开启则 userspace WireGuard）+ 内置 SOCKS5
 4. 经 SOCKS5 出口探测通过（`warp=on`）后进入运行态
 5. 运行期 healthcheck 连续失败达到阈值后，请求容器重启
@@ -14,27 +14,29 @@
 
 隧道、SOCKS5、注册、健康探测均由仓库根 `src/` 编译出的单一二进制 `warp-socks-rs` 提供（参考 bepass-org/warp-plus 思路重写，同一份 `wg0.conf` 格式、同样的 reserved bytes/trick 反审查机制），子命令为 `warp-socks [serve|register reg/del <path>|healthcheck]`（`src/bin/warp-socks.rs`）。日志用 `log`/`env_logger`（`RUST_LOG` 控制级别，默认 `info`，含隧道后端选择、连接建立/失败等关键信息）。
 
-`Supervisor::run` 每次启动优先尝试加载 `reg.json` 走 MASQUE（Cloudflare QUIC/H3 隧道），失败或文件不存在再回退到 `wg0.conf` 这条 WireGuard 路径。`reg.json` 是否存在由 `WARP_SOCKS_ENABLE_MASQUE` 开关控制（`Supervisor::ensure_masque_state`）：关闭时该文件不会被创建，MASQUE 分支自然跳过，行为与纯 WireGuard 完全一致；开启后缺失则自动在进程内调用 `MasqueRegistrar::register` 生成，注册失败只警告不中断启动。UDP ASSOCIATE 的数据报走隧道内 UDP 仅在 WireGuard 后端下支持；MASQUE 后端遇到 UDP 会明确报 `Unsupported` 并回退宿主机网络直连出口（`src/socks5.rs::establish_egress`）。
+`Supervisor::run` 是一个纯粹的两分支调度：`WARP_SOCKS_ENABLE_MASQUE=1` 时先调用 `try_masque`（内部会在 `reg.json` 缺失时自动调用 `MasqueRegistrar::register` 生成，失败原因统一汇总成一个 `Err`），成功则直接提供服务；关闭或失败都会落到 `run_wireguard`。`ensure_account`（Teams 账户/`account.json`）只在 `run_wireguard` 里调用——MASQUE 开启且注册、建隧道都成功的场景全程不会要求 `TEAMS_TOKEN`；只有 MASQUE 未开启，或开启但失败需要回退 WireGuard 时，才会在缺少 `account.json` 且 `TEAMS_TOKEN` 为空时 `bail!` 退出等待重启。UDP ASSOCIATE 的数据报走隧道内 UDP 仅在 WireGuard 后端下支持；MASQUE 后端遇到 UDP 会明确报 `Unsupported` 并回退宿主机网络直连出口（`src/socks5.rs::establish_egress`）。这不是本项目待补的功能缺口：Cloudflare 的 MASQUE 边缘和官方 `warp-svc` 客户端本身在 forward-proxy 模式下就不支持 CONNECT-UDP（RFC 9298），H3 CONNECT 只是字节流，扛不了数据报；真要把 UDP 也收进隧道需要换成 Connect-IP + TUN 的完全不同架构，会改变本项目免 root 的定位（交叉验证见本地参考实现 `warp-go/tunnel/udp.go` 及 `warp-go/docs/warp-masque-reverse-engineering.md` §9.6）。
 
 ## 状态文件
 
-- `wireguard/account.json`
+以下路径均相对宿主机 bind mount 目录（compose.yaml 里约定叫 `./data`，容器内挂载点是 `/etc/warp-socks`——都不再叫 wireguard，因为这个目录现在同时存 WireGuard 和 MASQUE 两套状态，见 `reg.json`）。
+
+- `data/account.json`
   - Teams 注册结果
   - 唯一账户状态来源
   - `config.client_id` base64 解码后取前 3 字节，写入 `wg0.conf` 的 `Reserved =`
     （`src/config.rs` 只读文件里的 `Reserved` 字段）
 
-- `wireguard/wg0.conf`
+- `data/wg0.conf`
   - 由 `account.json` 和 endpoint 派生
   - 当前运行中的 endpoint 以它为准，也是 healthcheck 恢复时读取 endpoint 的唯一来源
 
-- `wireguard/endpoint-state.json`
+- `data/endpoint-state.json`
   - 只保存 `last_good_endpoint` 和 cooldown
   - 用于启动时候选重排（仅 WireGuard 路径，MASQUE 走固定边缘地址不涉及候选轮换）
 
-- `wireguard/reg.json`
+- `data/reg.json`
   - MASQUE 路径的注册凭据（`WARP_SOCKS_ENABLE_MASQUE=1` 时使用）：设备 id/token、ECDSA 客户端密钥、边缘固定公钥等
-  - 缺失时 `Supervisor::ensure_masque_state` 在进程内自动调用 `MasqueRegistrar::register` 生成
+  - 缺失时 `Supervisor::try_masque` 在进程内自动调用 `MasqueRegistrar::register` 生成
   - 与 `account.json`/`wg0.conf` 相互独立，WireGuard 路径不读写这个文件
 
 ## 源码模块职责

@@ -35,8 +35,8 @@ impl Supervisor {
     /// 必要的注册/配置步骤失败、或所有 endpoint 候选均无法就绪时返回错误
     /// （调用方应以非零退出码结束进程，交给 Docker `restart: unless-stopped` 重启）。
     pub async fn run(&self) -> Result<()> {
-        std::fs::create_dir_all(&self.config.wg_dir)
-            .with_context(|| format!("创建 {} 失败", self.config.wg_dir.display()))?;
+        std::fs::create_dir_all(&self.config.state_dir)
+            .with_context(|| format!("创建 {} 失败", self.config.state_dir.display()))?;
 
         info!(
             "启动调优参数: register_retries={}, register_retry_delay={:?}, startup_ready_timeout={:?}, \
@@ -51,18 +51,23 @@ impl Supervisor {
             self.config.healthcheck_failure_threshold,
         );
 
-        let account = self.ensure_account().await?;
-        self.ensure_masque_state().await;
-
-        if self.config.enable_masque && self.config.reg_json.is_file() {
+        if self.config.enable_masque {
             match self.try_masque().await {
                 Ok((serve_handle, backend)) => {
                     info!("✓ MASQUE 隧道已建立（{}）", self.config.reg_json.display());
                     return self.serve_and_watch(serve_handle, backend, None).await;
                 }
-                Err(reason) => warn!("{reason}，回退 WireGuard ..."),
+                Err(reason) => warn!("MASQUE 不可用（{reason}），回退 WireGuard ..."),
             }
         }
+
+        self.run_wireguard().await
+    }
+
+    /// WireGuard 出网策略：确保 Teams 账户存在（这是唯一会要求 `TEAMS_TOKEN`
+    /// 的地方——只有真正跑到这里才需要）、按候选顺序依次尝试 endpoint。
+    async fn run_wireguard(&self) -> Result<()> {
+        let account = self.ensure_account().await?;
 
         let mut store = JsonFileEndpointStore::load(&self.config.endpoint_state_file)?;
         let pool = candidate_pool(&self.config.endpoint_candidates);
@@ -123,38 +128,31 @@ impl Supervisor {
         registrar.register().await
     }
 
-    /// MASQUE 是显式开关的附加路径：WireGuard 账户/配置始终按上面的流程走，
-    /// 这里只在开关打开时额外确保 reg.json 存在；失败只警告不中断启动。
-    async fn ensure_masque_state(&self) {
-        if !self.config.enable_masque {
-            return;
-        }
+    /// MASQUE 出网策略：确保 `reg.json` 存在（缺失则自动注册）、加载凭据、建立
+    /// 隧道并起 SOCKS5 监听。调用前提是 `self.config.enable_masque == true`；
+    /// 任何一步失败都统一在这里汇总成一个原因，交给调用方决定是否回退。
+    async fn try_masque(&self) -> Result<(JoinHandle<Result<()>>, &'static str), String> {
         if self.config.reg_json.is_file() {
             info!(
                 "检测到已有 MASQUE 注册（{}），跳过重新注册。",
                 self.config.reg_json.display()
             );
-            return;
+        } else {
+            info!(
+                "MASQUE 已开启且 {} 不存在，开始自动注册...",
+                self.config.reg_json.display()
+            );
+            let creds = registration::register_masque()
+                .await
+                .map_err(|e| format!("MASQUE 注册失败（{e:#}）"))?;
+            creds
+                .registration
+                .save(&self.config.reg_json)
+                .map_err(|e| format!("MASQUE 注册信息保存失败（{e}）"))?;
+            crate::fsutil::restrict_to_owner(&self.config.reg_json);
+            info!("MASQUE 注册完成：{}", self.config.reg_json.display());
         }
 
-        info!(
-            "MASQUE 已开启且 {} 不存在，开始自动注册...",
-            self.config.reg_json.display()
-        );
-        match registration::register_masque().await {
-            Ok(creds) => match creds.registration.save(&self.config.reg_json) {
-                Ok(()) => {
-                    crate::fsutil::restrict_to_owner(&self.config.reg_json);
-                    info!("MASQUE 注册完成：{}", self.config.reg_json.display());
-                }
-                Err(e) => warn!("MASQUE 注册信息保存失败（{e}），本次运行将只走 WireGuard。"),
-            },
-            Err(e) => warn!("MASQUE 自动注册失败（{e:#}），本次运行将只走 WireGuard。"),
-        }
-    }
-
-    /// 尝试加载 reg.json 并建立 MASQUE 隧道 + 起 SOCKS5 监听。
-    async fn try_masque(&self) -> Result<(JoinHandle<Result<()>>, &'static str), String> {
         let creds = registration::load(&self.config.reg_json)
             .map_err(|e| format!("加载 {} 失败（{e}）", self.config.reg_json.display()))?;
         let masque = Masque::new(creds)

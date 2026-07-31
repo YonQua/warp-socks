@@ -1,8 +1,8 @@
 .env
 /target
 /dist
-wireguard/
-wireguard-*/
+data/
+data-*/
 task_plan.md
 findings.md
 progress.md

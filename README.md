@@ -2,10 +2,10 @@
 
 一个面向单机部署的 WARP SOCKS5 Docker 方案：用 Cloudflare Teams registration token 注册一次，然后稳定提供一个本机可访问的 SOCKS5 出口。
 
-主链路：`TEAMS_TOKEN -> account.json -> 隧道进程（默认 userspace WireGuard；开启 WARP_SOCKS_ENABLE_MASQUE 后优先尝试 MASQUE，失败回退 WireGuard）+ SOCKS5`
+主链路：`TEAMS_TOKEN -> account.json -> 隧道进程（默认优先尝试 MASQUE；关闭 WARP_SOCKS_ENABLE_MASQUE 或 MASQUE 失败则回退 userspace WireGuard）+ SOCKS5`
 
-1. `TEAMS_TOKEN -> account.json`（首次启动注册，之后重启直接复用）
-2. `account.json -> wg0.conf`（WireGuard 路径用；MASQUE 路径走独立的 `reg.json`，缺失时自动注册，见下方 `WARP_SOCKS_ENABLE_MASQUE`）
+1. `WARP_SOCKS_ENABLE_MASQUE=1` 时先尝试 MASQUE（`reg.json`，缺失时自动注册，见下方 `WARP_SOCKS_ENABLE_MASQUE`），成功则全程不需要 `TEAMS_TOKEN`/`account.json`
+2. MASQUE 未开启，或开启但注册/建隧道失败需要回退时，才走 `TEAMS_TOKEN -> account.json`（首次注册，之后重启直接复用）-> `wg0.conf`
 3. `Supervisor` 起隧道 + 内置 SOCKS5：`WARP_SOCKS_ENABLE_MASQUE=1` 时先试 MASQUE（Cloudflare QUIC/H3 隧道），失败或未开启则用 userspace WireGuard
 4. 经 SOCKS5 出口探测通过（`warp=on`）后进入运行态
 5. 运行期 healthcheck 连续失败达到阈值后，请求容器重启
@@ -72,7 +72,7 @@ docker exec warp-socks curl --socks5 127.0.0.1:1080 https://cloudflare.com/cdn-c
 
 | 变量                      | 必填                   | 说明                                                                                               |
 | ------------------------- | ---------------------- | -------------------------------------------------------------------------------------------------- |
-| `TEAMS_TOKEN`             | 首次启动必填           | Cloudflare Teams registration token，推荐直接填完整 `com.cloudflare.warp://...auth?token=...` 链接。已有 `wireguard/account.json` 后重启可以留空 |
+| `TEAMS_TOKEN`             | 条件必填               | Cloudflare Teams registration token，推荐直接填完整 `com.cloudflare.warp://...auth?token=...` 链接。已有 `data/account.json` 后重启可以留空；`WARP_SOCKS_ENABLE_MASQUE=1` 且 MASQUE 注册与建隧道都成功时也不需要（纯 MASQUE 场景不会触碰 Teams 账户），只有实际需要走 WireGuard（未开启 MASQUE，或 MASQUE 失败要回退）时才会要求填写 |
 | `HOST_BIND_IP`          | 否                     | 宿主机发布地址，默认 `127.0.0.1`                                                                   |
 | `HOST_BIND_PORT`        | 否                     | 宿主机发布端口，默认 `1080`                                                                        |
 | `ENDPOINT_CANDIDATES`   | 否                     | 手工覆盖 endpoint 列表；留空时使用项目内置候选池                                                   |
@@ -91,7 +91,7 @@ docker exec warp-socks curl --socks5 127.0.0.1:1080 https://cloudflare.com/cdn-c
 | `WARP_SOCKS_HEALTHCHECK_PROBE_TIMEOUT`     | 派生值（约 63，见下方说明） | 运行期单次健康检查探测超时秒数         |
 | `WARP_SOCKS_HEALTHCHECK_FAILURE_THRESHOLD` | `3`    | 运行期连续失败达到多少次后请求容器重启 |
 | `WARP_RS_TRICK`                            | `none` | 反审查伪装包模式，`none`/`t1`/`t2` |
-| `WARP_SOCKS_ENABLE_MASQUE`                 | `0`    | 开启后自动确保 `reg.json` 存在（缺失则在进程内直接完成注册），warp-socks-rs 优先走 MASQUE，失败仍回退 WireGuard；关闭时行为与不开启完全一致 |
+| `WARP_SOCKS_ENABLE_MASQUE`                 | `1`    | 默认开启：自动确保 `reg.json` 存在（缺失则在进程内直接完成注册），warp-socks-rs 优先走 MASQUE，失败仍回退 WireGuard；显式设为 `0` 则跳过 MASQUE，只走 WireGuard |
 
 ### 启动等待调优建议
 
@@ -130,7 +130,7 @@ WARP_SOCKS_HEALTHCHECK_FAILURE_THRESHOLD=2
   - `162.159.192.1:2408`
   - `162.159.195.1:2408`
 
-运行期如果 healthcheck 连续失败达到阈值，当前 endpoint 会被临时标记为冷却；容器重启后，启动链会优先尝试最近一次成功的 endpoint，并把进入冷却的 endpoint 排到后面。内部恢复状态会持久化到 `./wireguard/endpoint-state.json`。
+运行期如果 healthcheck 连续失败达到阈值，当前 endpoint 会被临时标记为冷却；容器重启后，启动链会优先尝试最近一次成功的 endpoint，并把进入冷却的 endpoint 排到后面。内部恢复状态会持久化到 `./data/endpoint-state.json`。
 
 启动阶段会按顺序逐个尝试候选，单个候选最坏耗时约为 `WARP_SOCKS_STARTUP_SOCKS_READY_TIMEOUT` 秒；默认候选池 8 个时，全部失败的最坏总耗时约 `8 × 20s ≈ 160` 秒，之后由 Docker 按 `RESTART_POLICY` 重启容器重试。这段等待期间容器还没有标记 runtime ready，healthcheck 不会介入，不会被误判为不健康。
 
@@ -166,7 +166,7 @@ docker compose logs --tail=80
 
 最常见原因：
 
-- `TEAMS_TOKEN` 为空且 `./wireguard` 下也没有可复用的 `account.json`
+- `TEAMS_TOKEN` 为空且 `./data` 下也没有可复用的 `account.json`
 - Teams token 已过期
 - Cloudflare 返回 `429 Too Many Requests`
 
@@ -196,7 +196,7 @@ ENDPOINT_CANDIDATES=ip1:port,ip2:port,ip3:port
 ### 想重建状态
 
 ```bash
-rm -f wireguard/account.json wireguard/wg0.conf wireguard/endpoint-state.json
+rm -f data/account.json data/wg0.conf data/endpoint-state.json data/reg.json
 docker compose up --build -d
 ```
 
@@ -213,7 +213,7 @@ services:
     ports:
       - '${HOST_BIND_IP:-127.0.0.1}:${HOST_BIND_PORT:-1080}:1080'
     volumes:
-      - ./wireguard:/etc/wireguard
+      - ./data:/etc/warp-socks
     env_file:
       - .env
 ```

@@ -7,8 +7,8 @@
 // 结果"直接暴露出来，读文件是毫秒级的，--timeout 不再需要关心隧道内部
 // 的任何超时预算。
 //
-// 写在 /tmp 而非 wg_dir：wg_dir 是宿主机 bind mount（./wireguard），心跳是
-// 纯运行期状态，不应该污染用户能看到、会被备份的那个目录；容器重启后
+// 写在 /tmp 而非 state_dir：state_dir 是宿主机 bind mount（./data），
+// 心跳是纯运行期状态，不应该污染用户能看到、会被备份的那个目录；容器重启后
 // /tmp 自然清空，语义上也正是"没有历史心跳就是还没探测过"。
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
