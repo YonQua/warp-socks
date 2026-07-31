@@ -39,11 +39,8 @@ RUN set -eu \
  && apk add --no-cache ca-certificates
 
 COPY --from=rust-builder /usr/local/bin/warp-socks-rs /usr/local/bin/warp-socks-rs
-COPY entrypoint.sh /usr/local/bin/entrypoint.sh
 
-RUN chmod +x \
-      /usr/local/bin/entrypoint.sh \
-      /usr/local/bin/warp-socks-rs
+RUN chmod +x /usr/local/bin/warp-socks-rs
 
 # Docker 只负责定时展示健康状态；连续失败阈值判定与重启触发完全在
 # warp-socks-rs 自己的运行期健康检查循环里（见 src/supervisor.rs）。
@@ -55,4 +52,4 @@ RUN chmod +x \
 HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=1 \
   CMD ["/usr/local/bin/warp-socks-rs", "healthcheck"]
 
-ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
+ENTRYPOINT ["/usr/local/bin/warp-socks-rs"]

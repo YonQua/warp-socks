@@ -1,6 +1,0 @@
-# 项目用 warp-common.sh 里的 warp_source_lib() 动态 source 各个 lib 文件
-# （路径由变量拼出），shellcheck 天然无法跟踪：每个 lib 文件单独过 shellcheck
-# 时看不到别的文件怎么用它定义的变量，也看不到它 source 的是谁——这两条在
-# 这个架构下是必然噪音，不是真实问题，全局关闭。
-disable=SC1090
-disable=SC2034

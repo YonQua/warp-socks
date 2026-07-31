@@ -36,13 +36,3 @@ jobs:
 
       - name: cargo test
         run: cargo test --all-targets
-
-  shellcheck:
-    name: shellcheck
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Run shellcheck
-        run: shellcheck --severity=warning entrypoint.sh

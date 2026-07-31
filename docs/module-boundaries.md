@@ -5,8 +5,8 @@
 ## 主链路
 
 1. `TEAMS_TOKEN -> account.json`（首次启动注册，之后重启直接复用）
-2. `account.json -> wg0.conf`
-3. `Supervisor`（`src/supervisor.rs`）在进程内起隧道（userspace WireGuard 或 MASQUE）+ 内置 SOCKS5
+2. `account.json -> wg0.conf`（WireGuard 路径用；MASQUE 路径是独立的 `reg.json`，见下方“状态文件”）
+3. `Supervisor`（`src/supervisor.rs`）在进程内起隧道（`WARP_SOCKS_ENABLE_MASQUE=1` 时优先 MASQUE，失败或未开启则 userspace WireGuard）+ 内置 SOCKS5
 4. 经 SOCKS5 出口探测通过（`warp=on`）后进入运行态
 5. 运行期 healthcheck 连续失败达到阈值后，请求容器重启
 
@@ -30,7 +30,12 @@
 
 - `wireguard/endpoint-state.json`
   - 只保存 `last_good_endpoint` 和 cooldown
-  - 用于启动时候选重排
+  - 用于启动时候选重排（仅 WireGuard 路径，MASQUE 走固定边缘地址不涉及候选轮换）
+
+- `wireguard/reg.json`
+  - MASQUE 路径的注册凭据（`WARP_SOCKS_ENABLE_MASQUE=1` 时使用）：设备 id/token、ECDSA 客户端密钥、边缘固定公钥等
+  - 缺失时 `Supervisor::ensure_masque_state` 在进程内自动调用 `MasqueRegistrar::register` 生成
+  - 与 `account.json`/`wg0.conf` 相互独立，WireGuard 路径不读写这个文件
 
 ## 源码模块职责
 
@@ -52,7 +57,7 @@
 - `src/outbound/`
   - `mod.rs`：出网抽象 `Outbound` trait，SOCKS5/SOCKS4/HTTP 代理层只依赖它，不关心底层是 WireGuard 虚拟网卡还是 MASQUE H3 CONNECT 流
   - `wireguard.rs`：WireGuard 出网后端，封装 `tokio_smoltcp::Net` 虚拟网卡；`WgOutbound::establish` 消费 WG 握手 + smoltcp 网卡初始化
-  - `masque/`：MASQUE 出网后端（QUIC/H3 CONNECT），含 `tls.rs`（证书/握手）、`qpack.rs`（H3 头部编解码）
+  - `masque/`：MASQUE 出网后端（QUIC/H3 CONNECT），含 `tls.rs`（证书/pinned-key 握手）、`qpack.rs`（H3 头部编解码）、`huffman.rs`（QPACK 静态表 Huffman 编解码）、`doh.rs`（隧道内 DoH 解析，边缘不接受裸域名 CONNECT）
 
 - `src/tunnel.rs`
   - boringtun `Tunn` 状态机的 I/O 驱动：UDP 收发、reserved bytes 覆写/清零、可选 t1/t2 反审查伪装包、握手与重传定时器
@@ -86,8 +91,7 @@
 - `src/fsutil.rs`
   - 文件权限收紧为仅所有者可读写
 
-- `entrypoint.sh`
-  - 容器入口，仅 `exec warp-socks-rs "$@"`
+容器入口直接是 Dockerfile 里的 `ENTRYPOINT ["/usr/local/bin/warp-socks-rs"]`，不再经过 `entrypoint.sh` 转发（旧版 shell 编排年代的 exec 包装脚本已删除，二进制本身就作为 PID 1 运行）。
 
 ## 当前约束
 
@@ -102,7 +106,7 @@
 
 1. `src/bin/warp-socks.rs`
 2. `src/appconfig.rs`
-3. `src/supervisor.rs`
-4. `src/registration/teams.rs`
-5. `src/outbound/wireguard.rs`
-6. `src/health/recovery.rs`
+3. `src/supervisor.rs`（`run()` 里 MASQUE 优先、WireGuard 回退的分支顺序就是两条隧道路径的权威说明）
+4. `src/registration/teams.rs` / `src/registration/masque.rs`
+5. `src/outbound/wireguard.rs` / `src/outbound/masque/mod.rs`
+6. `src/health/recovery.rs` / `src/health/heartbeat.rs`

@@ -2,22 +2,23 @@
 
 一个面向单机部署的 WARP SOCKS5 Docker 方案：用 Cloudflare Teams registration token 注册一次，然后稳定提供一个本机可访问的 SOCKS5 出口。
 
-主链路：`TEAMS_TOKEN -> account.json -> wg0.conf -> 隧道进程（userspace WireGuard + SOCKS5）`
+主链路：`TEAMS_TOKEN -> account.json -> 隧道进程（默认 userspace WireGuard；开启 WARP_SOCKS_ENABLE_MASQUE 后优先尝试 MASQUE，失败回退 WireGuard）+ SOCKS5`
 
 1. `TEAMS_TOKEN -> account.json`（首次启动注册，之后重启直接复用）
-2. `account.json -> wg0.conf`
-3. 隧道进程起进程（userspace WireGuard + 内置 SOCKS5）
+2. `account.json -> wg0.conf`（WireGuard 路径用；MASQUE 路径走独立的 `reg.json`，缺失时自动注册，见下方 `WARP_SOCKS_ENABLE_MASQUE`）
+3. `Supervisor` 起隧道 + 内置 SOCKS5：`WARP_SOCKS_ENABLE_MASQUE=1` 时先试 MASQUE（Cloudflare QUIC/H3 隧道），失败或未开启则用 userspace WireGuard
 4. 经 SOCKS5 出口探测通过（`warp=on`）后进入运行态
 5. 运行期 healthcheck 连续失败达到阈值后，请求容器重启
 
-说明：不再使用内核 `wg-quick` / `microsocks`。在中国等网络环境下，内核 WireGuard 常卡在 `0 B received`；当前实现改用带 WARP tricks 的 userspace 客户端。
+说明：WireGuard 路径不再使用内核 `wg-quick` / `microsocks`。在中国等网络环境下，内核 WireGuard 常卡在 `0 B received`；当前实现改用带 WARP tricks 的 userspace 客户端。
 
 隧道与 SOCKS5 由本项目自研的 Rust 实现提供（仓库根 `src/`，参考 bepass-org/warp-plus 思路重写，同一份 `wg0.conf` 格式、同样的 reserved bytes/trick 反审查机制）。
 
 当前状态和恢复规则也很简单：
 
-- `account.json` 是唯一账户状态，`wg0.conf` 是当前运行配置，也是 healthcheck 恢复时读取当前 endpoint 的唯一来源
-- `endpoint-state.json` 只保存 `last_good_endpoint` 和 cooldown
+- `account.json` 是唯一账户状态；`wg0.conf` 是 WireGuard 路径的当前运行配置，也是该路径 healthcheck 恢复时读取当前 endpoint 的唯一来源
+- `reg.json` 是 MASQUE 路径的凭据文件（`WARP_SOCKS_ENABLE_MASQUE=1` 时使用），缺失会自动注册；MASQUE 路径没有 endpoint 候选轮换，不涉及 `endpoint-state.json`
+- `endpoint-state.json` 只保存 WireGuard 候选的 `last_good_endpoint` 和 cooldown
 - 启动阶段失败直接退出，由 Docker 重启容器
 - 运行期失败达到阈值后写入重启请求，由 PID 1 主动退出
 
@@ -27,7 +28,7 @@
 - `warp-socks register reg/del <path>`：MASQUE 凭据注册/注销
 - `warp-socks healthcheck`：Docker HEALTHCHECK 用的无状态单次探测
 
-容器入口只有 `entrypoint.sh`（直接 `exec warp-socks-rs "$@"`）。
+容器入口直接是 `warp-socks-rs` 二进制本身（Dockerfile `ENTRYPOINT`），没有中间 shell 脚本转发。
 
 对应说明见 [docs/module-boundaries.md](docs/module-boundaries.md)。
 
@@ -113,6 +114,8 @@ WARP_SOCKS_HEALTHCHECK_FAILURE_THRESHOLD=2
 - 注册链路遇到 `429` 时仍会尊重服务端 `Retry-After`，这部分不会被本地更小的 delay 强行覆盖。
 
 ## Endpoint 策略
+
+这一节只适用于 WireGuard 路径（`WARP_SOCKS_ENABLE_MASQUE=0`，或 MASQUE 尝试失败回退后）。MASQUE 路径走固定的边缘地址（隧道内 DoH 解析），没有候选轮换。
 
 `ENDPOINT_CANDIDATES` 是唯一手工覆盖入口。
 
