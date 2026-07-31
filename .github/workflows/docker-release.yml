@@ -96,6 +96,27 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install cross
+        run: cargo install cross --git https://github.com/cross-rs/cross --locked
+
+      - name: Cross-compile release binaries
+        shell: bash
+        run: |
+          set -eu
+          for pair in \
+            "linux/amd64:x86_64-unknown-linux-musl" \
+            "linux/arm64:aarch64-unknown-linux-musl" \
+            "linux/arm/v7:armv7-unknown-linux-musleabihf"; do
+            platform="${pair%%:*}"
+            target="${pair#*:}"
+            cross build --release --target "${target}" --bin warp-socks
+            mkdir -p "dist/${platform}"
+            install -m 0755 "target/${target}/release/warp-socks" "dist/${platform}/warp-socks-rs"
+          done
+
       - name: Extract Docker metadata
         id: meta
         uses: docker/metadata-action@v5
@@ -111,8 +132,8 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: .
-          file: ./Dockerfile
-          platforms: linux/amd64,linux/arm64
+          file: ./Dockerfile.release
+          platforms: linux/amd64,linux/arm64,linux/arm/v7
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}

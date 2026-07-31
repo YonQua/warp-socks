@@ -202,7 +202,7 @@ docker compose up --build -d
 
 ## 预构建镜像
 
-发布版本会同步到 `ghcr.io/yonqua/warp-socks`。建议固定 tag，不要长期跟 `latest`。
+发布版本会同步到 `ghcr.io/yonqua/warp-socks`，支持 `linux/amd64`、`linux/arm64`、`linux/arm/v7` 三种架构。建议固定 tag，不要长期跟 `latest`。
 
 ```yaml
 services:

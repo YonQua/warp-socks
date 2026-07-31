@@ -12,6 +12,7 @@
 ### Added
 
 - CI 新增 `.github/workflows/ci.yml`：push/PR 时跑 `warp-rs` 的 `cargo fmt`/`clippy`/`test` 门禁。
+- 发布镜像新增 `linux/arm/v7` 架构支持，用于覆盖 32 位 ARM 宿主机；发布流水线改用 `cross` 交叉编译三个 musl 目标二进制后再打包镜像（`Dockerfile.release`），避免 buildx 用 QEMU 完整模拟 rustc 编译。本地开发用的 `Dockerfile` 不受影响，仍是编译-from-source。
 
 ### Removed
 

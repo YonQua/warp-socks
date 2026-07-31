@@ -1,0 +1,41 @@
+ARG ALPINE_VERSION=3.22.3
+# 这个 Dockerfile 只在 GitHub Actions 发布流水线里跑（全球网络，直连官方源即可），
+# 默认留空；国内加速 CDN 是仓库根 `Dockerfile`（本地构建）的默认值，这里不继承。
+ARG APK_MIRROR_PREFIX=
+
+# 发布流水线专用：二进制已由 CI 用 cross 交叉编译好（见
+# .github/workflows/docker-release.yml），这里只负责拼出运行时镜像，
+# 不在容器里跑 cargo build，避免 buildx 用 QEMU 完整模拟 rustc 编译
+# （armv7 这类弱模拟平台上会慢到不可接受）。本地开发仍用仓库根 `Dockerfile`
+# （docker compose up --build），编译流程不受影响。
+FROM alpine:${ALPINE_VERSION}
+
+ARG APK_MIRROR_PREFIX
+ARG TARGETPLATFORM
+
+# 注册、健康探测、密钥生成均已用 Rust 原生实现（reqwest/boringtun），
+# 不再需要 curl/jq/wireguard-tools；ca-certificates 保留给 reqwest 的
+# rustls-tls 校验证书链用。
+RUN set -eu \
+ && if [ -n "${APK_MIRROR_PREFIX}" ]; then \
+      sed -i "s#https://dl-cdn.alpinelinux.org#${APK_MIRROR_PREFIX}#g" /etc/apk/repositories; \
+    fi \
+ && apk add --no-cache ca-certificates
+
+# dist/<TARGETPLATFORM>/warp-socks-rs 由 CI 的 cross build 步骤按平台预先放好，
+# 目录结构和 Docker 自动注入的 TARGETPLATFORM 值（如 linux/amd64、linux/arm/v7）一一对应。
+COPY dist/${TARGETPLATFORM}/warp-socks-rs /usr/local/bin/warp-socks-rs
+
+RUN chmod +x /usr/local/bin/warp-socks-rs
+
+# Docker 只负责定时展示健康状态；连续失败阈值判定与重启触发完全在
+# warp-socks-rs 自己的运行期健康检查循环里（见 src/supervisor.rs）。
+#
+# healthcheck 子命令不再自己发起一次真实的隧道探测，只读运行期循环写的心跳
+# 文件（见 src/health/heartbeat.rs）——纯本地文件读取，跟隧道自愈重连需要
+# 多久完全无关，--timeout 不需要再跟着内部任何超时预算走，给个宽松的固定
+# 值即可。
+HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=1 \
+  CMD ["/usr/local/bin/warp-socks-rs", "healthcheck"]
+
+ENTRYPOINT ["/usr/local/bin/warp-socks-rs"]
