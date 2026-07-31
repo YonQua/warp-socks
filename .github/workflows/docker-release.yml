@@ -7,6 +7,14 @@ on:
     tags:
       - 'v*'
 
+env:
+  # 固定 cross 的 git commit（而非跟随 --git 浮动 HEAD）：既保证可复现（不会因为
+  # 上游几个月后的一次提交突然让某个 target 编译失败或行为变化），又能给
+  # actions/cache 一个稳定的 key。这个 commit 就是本仓库第一次三平台全绿的
+  # run（30604317623）里 cargo install 实际解析到的版本，已验证支持我们要的
+  # 三个 musl target；以后要跟进上游新版本时手动改这个值即可。
+  CROSS_REV: 1d07d3f9cc465c435256f1aabc1d18024517891a
+
 jobs:
   prepare:
     name: Resolve Release Version
@@ -66,9 +74,77 @@ jobs:
           echo "major_minor=${major_minor}" >> "$GITHUB_OUTPUT"
           echo "prerelease=${prerelease}" >> "$GITHUB_OUTPUT"
 
+  cross-build:
+    name: Cross-compile (${{ matrix.platform }})
+    needs: prepare
+    if: needs.prepare.outputs.skip != 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            target: x86_64-unknown-linux-musl
+          - platform: linux/arm64
+            target: aarch64-unknown-linux-musl
+          - platform: linux/arm/v7
+            target: armv7-unknown-linux-musleabihf
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      # cross 本身很少变，命中率高；key 固定在 CROSS_REV 上，只有手动改这个
+      # 值时才会重新从源码编译（几十秒到 1-2 分钟），平时都是直接下载缓存。
+      - name: Cache cross tool
+        id: cache-cross
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/cross
+            ~/.cargo/bin/cross-util
+          key: cross-bin-${{ runner.os }}-${{ env.CROSS_REV }}
+
+      - name: Install cross
+        if: steps.cache-cross.outputs.cache-hit != 'true'
+        run: cargo install cross --git https://github.com/cross-rs/cross --rev ${{ env.CROSS_REV }} --locked
+
+      # cross 把宿主机 ~/.cargo 和 target/<target> 挂进容器里跑 cargo build（详见
+      # CLAUDE.md 里 cross 机制说明），所以这两个目录会落在 runner 本机文件系统上，
+      # 可以直接缓存；key 按 Cargo.lock 哈希失效，避免依赖升级后还复用旧编译产物。
+      - name: Cache cargo registry and build output
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target/${{ matrix.target }}
+          key: cross-build-${{ matrix.target }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            cross-build-${{ matrix.target }}-
+
+      - name: Cross-compile release binary
+        run: cross build --release --target ${{ matrix.target }} --bin warp-socks
+
+      - name: Stage binary
+        shell: bash
+        run: |
+          set -eu
+          mkdir -p "dist/${{ matrix.platform }}"
+          install -m 0755 "target/${{ matrix.target }}/release/warp-socks" "dist/${{ matrix.platform }}/warp-socks-rs"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.target }}
+          path: dist/${{ matrix.platform }}/warp-socks-rs
+          retention-days: 1
+
   publish:
     name: Publish Image And GitHub Release
-    needs: prepare
+    needs: [prepare, cross-build]
     if: needs.prepare.outputs.skip != 'true'
     runs-on: ubuntu-latest
     permissions:
@@ -96,13 +172,17 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+      - name: Download cross-compiled binaries
+        uses: actions/download-artifact@v4
+        with:
+          pattern: dist-*
+          path: artifacts
 
-      - name: Install cross
-        run: cargo install cross --git https://github.com/cross-rs/cross --locked
-
-      - name: Cross-compile release binaries
+      # 三个 matrix job 各自只产出自己 target 的单个文件（artifacts/dist-<target>/
+      # warp-socks-rs），这里按 platform<->target 映射还原成 Dockerfile.release
+      # 期望的 dist/<platform>/warp-socks-rs 目录结构。映射关系必须和上面
+      # cross-build 的 matrix 保持一致。
+      - name: Assemble dist/ layout
         shell: bash
         run: |
           set -eu
@@ -112,9 +192,8 @@ jobs:
             "linux/arm/v7:armv7-unknown-linux-musleabihf"; do
             platform="${pair%%:*}"
             target="${pair#*:}"
-            cross build --release --target "${target}" --bin warp-socks
             mkdir -p "dist/${platform}"
-            install -m 0755 "target/${target}/release/warp-socks" "dist/${platform}/warp-socks-rs"
+            install -m 0755 "artifacts/dist-${target}/warp-socks-rs" "dist/${platform}/warp-socks-rs"
           done
 
       - name: Extract Docker metadata
