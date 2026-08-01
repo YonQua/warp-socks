@@ -25,7 +25,13 @@ const CST_OFFSET: time::UtcOffset = match time::UtcOffset::from_hms(8, 0, 0) {
     Err(_) => unreachable!(),
 };
 
-#[tokio::main]
+// worker_threads 固定给 2，不用默认值：默认值是 std::thread::available_parallelism()
+// 探测到的宿主机 CPU 核数，不感知 compose.yaml 里 `cpus: 0.50` 这个 cgroup
+// 配额——在多核宿主机上会起远多于配额所需的线程数，徒增线程间调度/工作
+// 窃取的开销。这个代理是 IO 密集型（大部分时间在 epoll 等待），真正的 CPU
+// 需求集中在偶发的握手/隧道加解密上，2 个线程既够用又不会在 0.5 核配额下
+// 造成过度线程争抢。
+#[tokio::main(worker_threads = 2)]
 async fn main() -> Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
         .format(|buf, record| {

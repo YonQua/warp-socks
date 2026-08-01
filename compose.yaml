@@ -10,6 +10,14 @@ services:
     restart: ${RESTART_POLICY:-unless-stopped}
     mem_limit: 256m
     cpus: 0.50
+    # 不设置时容器继承 Docker daemon 的默认值，部分环境下这个默认值偏低；
+    # 并发代理连接一多（每条 SOCKS5/SOCKS4/HTTP 代理连接各占用宿主机侧一个
+    # 真实 fd）就可能撞到上限，触发 accept() 返回 EMFILE。显式调大更贴近这个
+    # 代理实际的并发连接规模。
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
     environment:
       # 首次启动必须提供（纯 MASQUE 场景可留空，见 README）；已经在 ./data 下留有 account.json 后，重启也可以留空。详见 README。
       TEAMS_TOKEN: ${TEAMS_TOKEN:-}
