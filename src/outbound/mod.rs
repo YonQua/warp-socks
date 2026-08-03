@@ -16,7 +16,7 @@ pub mod masque;
 pub mod wireguard;
 
 pub use masque::Masque;
-pub use wireguard::WgOutbound;
+pub use wireguard::{WgHealConfig, WgOutbound};
 
 /// 双向字节流。tokio_smoltcp::TcpStream、quinn (Send,Recv) 组合都满足。
 pub trait Stream: AsyncRead + AsyncWrite + Unpin + Send {}
@@ -87,5 +87,17 @@ pub trait Outbound: Send + Sync {
             std::io::ErrorKind::Unsupported,
             "该出网后端不支持 UDP",
         ))
+    }
+
+    /// 运行期健康探测失败时尝试连接级自愈（换路径/重连），调用方成功后会
+    /// 立刻重新探测一次确认。默认不支持——多数后端没有能在 `connect_tcp`
+    /// 之外单独触发的自愈手段（如 MASQUE：自愈已经在 `connect_tcp` 内部
+    /// 的 `open()` 里发生，探测失败即代表那次自愈也没能挽回，不需要额外
+    /// 一轮，这里保持默认失败即可）。
+    ///
+    /// # Errors
+    /// 不支持自愈，或自愈本身失败时返回错误。
+    async fn heal(&self) -> anyhow::Result<()> {
+        anyhow::bail!("该出网后端不支持自愈")
     }
 }

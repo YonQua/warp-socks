@@ -6,7 +6,7 @@
 // 对应 lib/app/main.sh + lib/runtime/tunnel.sh + lib/runtime/recovery.sh 的编排部分。
 
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use anyhow::{bail, Context, Result};
 use log::{info, warn};
@@ -14,11 +14,10 @@ use tokio::task::JoinHandle;
 use tokio::time::sleep;
 
 use crate::appconfig::AppConfig;
-use crate::config::parse_wg_conf;
 use crate::endpoint::{candidate_pool, plan_candidates, JsonFileEndpointStore};
 use crate::health::{heartbeat, RecoveryAction, SocksTraceProbe, ThresholdRecovery};
 use crate::mixed;
-use crate::outbound::{Masque, Outbound, WgOutbound};
+use crate::outbound::{Masque, Outbound, WgHealConfig, WgOutbound};
 use crate::registration::{self, TeamsRegistrar, WgAccount};
 
 pub struct Supervisor {
@@ -53,9 +52,9 @@ impl Supervisor {
 
         if self.config.enable_masque {
             match self.try_masque().await {
-                Ok((serve_handle, backend)) => {
+                Ok((outbound, serve_handle)) => {
                     info!("✓ MASQUE 隧道已建立（{}）", self.config.reg_json.display());
-                    return self.serve_and_watch(serve_handle, backend, None).await;
+                    return self.serve_and_watch(serve_handle, outbound).await;
                 }
                 Err(reason) => warn!("MASQUE 不可用（{reason}），回退 WireGuard ..."),
             }
@@ -71,7 +70,7 @@ impl Supervisor {
 
         let mut store = JsonFileEndpointStore::load(&self.config.endpoint_state_file)?;
         let pool = candidate_pool(&self.config.endpoint_candidates);
-        let candidates = plan_candidates(pool, &store);
+        let candidates = plan_candidates(pool.clone(), &store);
         if candidates.is_empty() {
             bail!("未生成任何可用 endpoint 候选。");
         }
@@ -79,18 +78,11 @@ impl Supervisor {
 
         let total = candidates.len();
         for (index, endpoint) in candidates.iter().enumerate() {
-            match self.try_wg_candidate(&account, endpoint).await {
-                Ok((serve_handle, backend)) => {
+            match self.try_wg_candidate(&account, endpoint, &pool).await {
+                Ok((outbound, serve_handle)) => {
                     store.record_success(endpoint)?;
                     info!("隧道与 SOCKS 已就绪：endpoint={endpoint}");
-                    let cooldown = self.config.runtime_endpoint_cooldown;
-                    return self
-                        .serve_and_watch(
-                            serve_handle,
-                            backend,
-                            Some((&mut store, endpoint, cooldown)),
-                        )
-                        .await;
+                    return self.serve_and_watch(serve_handle, outbound).await;
                 }
                 Err(reason) => {
                     warn!("候选 {endpoint} 就绪失败: {reason}");
@@ -131,7 +123,7 @@ impl Supervisor {
     /// MASQUE 出网策略：确保 `reg.json` 存在（缺失则自动注册）、加载凭据、建立
     /// 隧道并起 SOCKS5 监听。调用前提是 `self.config.enable_masque == true`；
     /// 任何一步失败都统一在这里汇总成一个原因，交给调用方决定是否回退。
-    async fn try_masque(&self) -> Result<(JoinHandle<Result<()>>, &'static str), String> {
+    async fn try_masque(&self) -> Result<(Arc<dyn Outbound>, JoinHandle<Result<()>>), String> {
         if self.config.reg_json.is_file() {
             info!(
                 "检测到已有 MASQUE 注册（{}），跳过重新注册。",
@@ -159,49 +151,49 @@ impl Supervisor {
             .await
             .map_err(|e| format!("MASQUE 建立失败（{e:#}）"))?;
         let outbound: Arc<dyn Outbound> = Arc::new(masque);
-        self.spawn_and_probe(outbound)
+        let serve_handle = self
+            .spawn_and_probe(outbound.clone())
             .await
-            .map_err(|e| format!("{e:#}"))
+            .map_err(|e| format!("{e:#}"))?;
+        Ok((outbound, serve_handle))
     }
 
     /// 用给定 endpoint 覆盖写 wg0.conf、建立 WireGuard 隧道 + 起 SOCKS5 监听。
+    /// `pool` 是 `candidate_pool()` 的结果，交给 `WgOutbound` 保管，供运行期
+    /// `Outbound::heal` 换候选时复用同一套排序规则。
     async fn try_wg_candidate(
         &self,
         account: &WgAccount,
         endpoint: &str,
-    ) -> Result<(JoinHandle<Result<()>>, &'static str)> {
-        registration::write_wg_conf(account, Some(endpoint), &self.config.wg_conf)?;
-        let wg_conf_str = self
-            .config
-            .wg_conf
-            .to_str()
-            .context("wg0.conf 路径包含非 UTF-8 字符")?;
-        let wg_config = parse_wg_conf(wg_conf_str)?;
-
-        let outbound = WgOutbound::establish(
-            &wg_config,
-            self.config.trick,
-            self.config.startup_probe_timeout,
-        )
-        .await
-        .context("建立 WireGuard 隧道失败")?;
-        let outbound: Arc<dyn Outbound> = Arc::new(outbound);
-        self.spawn_and_probe(outbound).await
+        pool: &[String],
+    ) -> Result<(Arc<dyn Outbound>, JoinHandle<Result<()>>)> {
+        let heal_config = WgHealConfig {
+            pool: pool.to_vec(),
+            endpoint_state_file: self.config.endpoint_state_file.clone(),
+            wg_conf_path: self.config.wg_conf.clone(),
+            cooldown: self.config.runtime_endpoint_cooldown,
+        };
+        let outbound: Arc<dyn Outbound> = Arc::new(
+            WgOutbound::establish(
+                account,
+                endpoint,
+                self.config.trick,
+                self.config.startup_probe_timeout,
+                heal_config,
+            )
+            .await
+            .context("建立 WireGuard 隧道失败")?,
+        );
+        let serve_handle = self.spawn_and_probe(outbound.clone()).await?;
+        Ok((outbound, serve_handle))
     }
 
     /// 起 SOCKS5 监听并反复探测直到就绪或启动预算耗尽；失败时监听任务会被中止。
-    /// 返回值带上 `outbound.name()`：后端名只由 `Outbound` 实现自己定义
-    /// （见 `Outbound::name`），这里原样透传给调用方，不再各自维护一份字面量。
-    async fn spawn_and_probe(
-        &self,
-        outbound: Arc<dyn Outbound>,
-    ) -> Result<(JoinHandle<Result<()>>, &'static str)> {
-        let backend = outbound.name();
+    async fn spawn_and_probe(&self, outbound: Arc<dyn Outbound>) -> Result<JoinHandle<Result<()>>> {
         let listen_addr: std::net::SocketAddr = format!("0.0.0.0:{}", self.config.listen_port)
             .parse()
             .expect("固定监听地址格式正确");
-        let serve_outbound = outbound.clone();
-        let serve_handle = tokio::spawn(mixed::serve(serve_outbound, listen_addr));
+        let serve_handle = tokio::spawn(mixed::serve(outbound, listen_addr));
 
         let probe =
             SocksTraceProbe::new(self.config.listen_port, self.config.startup_probe_timeout);
@@ -228,7 +220,7 @@ impl Supervisor {
                     if let Some(ip) = outcome.ip {
                         info!("当前出口 IP: {ip}");
                     }
-                    return Ok((serve_handle, backend));
+                    return Ok(serve_handle);
                 }
                 Err(_) => {
                     sleep(self.config.startup_probe_delay.min(remaining)).await;
@@ -237,15 +229,16 @@ impl Supervisor {
         }
     }
 
-    /// 提供服务并跑内部健康检查循环；`endpoint_cooldown` 非空时，连续失败达
-    /// 阈值会先把对应 endpoint 标记冷却（对应 recovery.sh:
-    /// recovery_mark_active_endpoint_cooldown），MASQUE 没有候选概念故传 `None`。
+    /// 提供服务并跑内部健康检查循环。探测失败先尝试 `outbound.heal()` 自愈
+    /// （是否支持、怎么自愈完全由后端自己决定，见 `Outbound::heal` 默认实现），
+    /// 成功则这次探测失败不计入连续失败计数；自愈失败或不支持时按原有阈值
+    /// 机制处理——连续失败达阈值退出进程交给 Docker 重启。
     async fn serve_and_watch(
         &self,
         mut serve_handle: JoinHandle<Result<()>>,
-        backend: &str,
-        endpoint_cooldown: Option<(&mut JsonFileEndpointStore, &str, Duration)>,
+        outbound: Arc<dyn Outbound>,
     ) -> Result<()> {
+        let backend = outbound.name();
         info!(
             "SOCKS5 已由 warp-socks-rs 提供（容器内监听）: 0.0.0.0:{}",
             self.config.listen_port
@@ -270,7 +263,6 @@ impl Supervisor {
             self.config.healthcheck_probe_timeout,
         );
         let mut recovery = ThresholdRecovery::new(self.config.healthcheck_failure_threshold);
-        let mut endpoint_cooldown = endpoint_cooldown;
         let mut shutdown = Box::pin(shutdown_signal());
 
         loop {
@@ -295,6 +287,17 @@ impl Supervisor {
                         }
                         Err(e) => {
                             heartbeat::record(false);
+                            // 自愈是否可用完全由后端自己决定（`Outbound::heal` 默认
+                            // 不支持）；MASQUE 的自愈已经在它自己的 connect_tcp 内部
+                            // 发生，这里的探测失败即代表那次自愈也没能挽回，不需要
+                            // 额外分支区分后端。
+                            let healed = outbound.heal().await.is_ok() && probe.probe().await.is_ok();
+                            if healed {
+                                info!("{backend} 自愈成功，本次探测失败不计入连续失败计数。");
+                                heartbeat::record(true);
+                                recovery.on_success();
+                                continue;
+                            }
                             let action = recovery.on_failure(&e.to_string());
                             warn!(
                                 "SOCKS 出口探测失败: {e}; failures={}/{}",
@@ -302,13 +305,6 @@ impl Supervisor {
                                 self.config.healthcheck_failure_threshold
                             );
                             if action == RecoveryAction::RequestExit {
-                                if let Some((store, endpoint, cooldown)) = endpoint_cooldown.take() {
-                                    store.mark_cooldown(endpoint, cooldown)?;
-                                    info!(
-                                        "当前 endpoint {endpoint} 已标记冷却 {} 秒，容器重启后会优先尝试其他候选。",
-                                        cooldown.as_secs()
-                                    );
-                                }
                                 serve_handle.abort();
                                 bail!("连续失败达到阈值，退出等待容器重启。");
                             }

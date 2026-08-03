@@ -121,16 +121,24 @@ impl WgTunnel {
             }
         };
 
-        let mut rng = rand::thread_rng();
-        let num_packets = rng.gen_range(20..=50);
+        // rand::thread_rng() 本身不是 Send（线程本地状态），每次只在同步代码段
+        // 内借用、用完即扔，绝不跨越下面的 .await——否则整个 send_decoy_packets
+        // 的 future 会被判定为非 Send，而 heal() 作为 Outbound trait 方法必须
+        // 是 Send（async_trait 的默认要求，跟 connect_tcp/connect_udp 一致）。
+        let num_packets = rand::thread_rng().gen_range(20..=50);
         let max_len = header.len() + 120;
         for _ in 0..num_packets {
-            let packet_size = rng.gen_range((header.len() + 10)..=max_len);
-            let mut packet = vec![0u8; packet_size];
-            packet[..header.len()].copy_from_slice(&header);
-            rng.fill(&mut packet[header.len()..]);
+            let packet = {
+                let mut rng = rand::thread_rng();
+                let packet_size = rng.gen_range((header.len() + 10)..=max_len);
+                let mut packet = vec![0u8; packet_size];
+                packet[..header.len()].copy_from_slice(&header);
+                rng.fill(&mut packet[header.len()..]);
+                packet
+            };
             self.sock.send(&packet).await?;
-            tokio::time::sleep(Duration::from_millis(rng.gen_range(80..=150))).await;
+            let delay_ms = rand::thread_rng().gen_range(80..=150);
+            tokio::time::sleep(Duration::from_millis(delay_ms)).await;
         }
         Ok(())
     }
