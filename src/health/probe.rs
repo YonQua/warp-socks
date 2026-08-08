@@ -2,6 +2,7 @@
 // 走隧道）请求 trace 接口，检查响应里的 warp=on|plus 标记，这是隧道对外提供
 // 的真实使用路径，比直接探测出口 IP 更贴近实际用户流量。
 
+use std::net::SocketAddr;
 use std::time::Duration;
 
 /// 探测成功时携带的信息（当前出口 IP，若响应里有）。
@@ -29,16 +30,16 @@ impl std::error::Error for ProbeError {}
 
 /// SOCKS5 trace 健康探测，对应 lib/core/probe.sh。
 pub struct SocksTraceProbe {
-    pub socks_port: u16,
+    pub socks_addr: SocketAddr,
     pub timeout: Duration,
     pub trace_url: String,
 }
 
 impl SocksTraceProbe {
     #[must_use]
-    pub fn new(socks_port: u16, timeout: Duration) -> Self {
+    pub fn new(socks_addr: SocketAddr, timeout: Duration) -> Self {
         Self {
-            socks_port,
+            socks_addr,
             timeout,
             trace_url: "https://cloudflare.com/cdn-cgi/trace".to_string(),
         }
@@ -47,7 +48,7 @@ impl SocksTraceProbe {
     /// # Errors
     /// 探测失败（超时、连接失败、响应缺少 warp 标记）时返回错误。
     pub async fn probe(&self) -> Result<ProbeOutcome, ProbeError> {
-        let proxy_url = format!("socks5h://127.0.0.1:{}", self.socks_port);
+        let proxy_url = format!("socks5h://{}", self.socks_addr);
         let proxy =
             reqwest::Proxy::all(&proxy_url).map_err(|e| ProbeError::Request(e.to_string()))?;
         let client = reqwest::Client::builder()

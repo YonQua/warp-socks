@@ -14,7 +14,7 @@
 
 隧道、SOCKS5、注册、健康探测均由仓库根 `src/` 编译出的单一二进制 `warp-socks-rs` 提供（参考 bepass-org/warp-plus 思路重写，同一份 `wg0.conf` 格式、同样的 reserved bytes/trick 反审查机制），子命令为 `warp-socks [serve|register reg/del <path>|healthcheck]`（`src/bin/warp-socks.rs`）。日志用 `log`/`env_logger`（`RUST_LOG` 控制级别，默认 `info`，含隧道后端选择、连接建立/失败等关键信息）。
 
-`Supervisor::run` 是一个纯粹的两分支调度：`WARP_SOCKS_ENABLE_MASQUE=1` 时先调用 `try_masque`（内部会在 `reg.json` 缺失时自动调用 `MasqueRegistrar::register` 生成，失败原因统一汇总成一个 `Err`），成功则直接提供服务；关闭或失败都会落到 `run_wireguard`。`ensure_account`（Teams 账户/`account.json`）只在 `run_wireguard` 里调用——MASQUE 开启且注册、建隧道都成功的场景全程不会要求 `TEAMS_TOKEN`；只有 MASQUE 未开启，或开启但失败需要回退 WireGuard 时，才会在缺少 `account.json` 且 `TEAMS_TOKEN` 为空时 `bail!` 退出等待重启。UDP ASSOCIATE 的数据报走隧道内 UDP 仅在 WireGuard 后端下支持；MASQUE 后端遇到 UDP 会明确报 `Unsupported` 并回退宿主机网络直连出口（`src/socks5.rs::establish_egress`）。这不是本项目待补的功能缺口：Cloudflare 的 MASQUE 边缘和官方 `warp-svc` 客户端本身在 forward-proxy 模式下就不支持 CONNECT-UDP（RFC 9298），H3 CONNECT 只是字节流，扛不了数据报；真要把 UDP 也收进隧道需要换成 Connect-IP + TUN 的完全不同架构，会改变本项目免 root 的定位（交叉验证见本地参考实现 `warp-go/tunnel/udp.go` 及 `warp-go/docs/warp-masque-reverse-engineering.md` §9.6）。
+`Supervisor::run` 是一个纯粹的两分支调度：`WARP_SOCKS_ENABLE_MASQUE=1` 时先调用 `try_masque`（内部会在 `reg.json` 缺失时自动调用 `MasqueRegistrar::register` 生成，失败原因统一汇总成一个 `Err`），成功则直接提供服务；关闭或失败都会落到 `run_wireguard`。`ensure_account`（Teams 账户/`account.json`）只在 `run_wireguard` 里调用——MASQUE 开启且注册、建隧道都成功的场景全程不会要求 `TEAMS_TOKEN`；只有 MASQUE 未开启，或开启但失败需要回退 WireGuard 时，才会在缺少 `account.json` 且 `TEAMS_TOKEN` 为空时 `bail!` 退出等待重启。UDP ASSOCIATE 的数据报走隧道内 UDP 仅在 WireGuard 后端下支持；MASQUE 后端没有 CONNECT-UDP 能力，在回复 ASSOCIATE 前明确拒绝。项目不存在宿主机 UDP 直出路径。
 
 ## 状态文件
 
@@ -58,8 +58,11 @@
 
 - `src/outbound/`
   - `mod.rs`：出网抽象 `Outbound` trait，SOCKS5/SOCKS4/HTTP 代理层只依赖它，不关心底层是 WireGuard 虚拟网卡还是 MASQUE H3 CONNECT 流
-  - `wireguard.rs`：WireGuard 出网后端，封装 `tokio_smoltcp::Net` 虚拟网卡；`WgOutbound::establish` 消费 WG 握手 + smoltcp 网卡初始化
+  - `wireguard.rs`：WireGuard 出网后端，封装项目内双栈 `Net` 虚拟网卡，为 WARP IPv4 `/32` 和 IPv6 `/128` 同时安装默认路由，并按目标地址族选择 TCP/UDP 源地址
   - `masque/`：MASQUE 出网后端（QUIC/H3 CONNECT），含 `tls.rs`（证书/pinned-key 握手）、`qpack.rs`（H3 头部编解码）、`huffman.rs`（QPACK 静态表 Huffman 编解码）、`doh.rs`（隧道内 DoH 解析，边缘不接受裸域名 CONNECT）
+
+- `src/netstack.rs`
+  - 项目专用 Tokio/smoltcp 适配层；一个 reactor 驱动 `Interface`、TCP/UDP `SocketSet` 与 WireGuard packet device，不包含监听器或 raw socket 等无关能力
 
 - `src/tunnel.rs`
   - boringtun `Tunn` 状态机的 I/O 驱动：UDP 收发、reserved bytes 覆写/清零、可选 t1/t2 反审查伪装包、握手与重传定时器
@@ -79,10 +82,11 @@
   - `mod.rs`：探测方式与恢复策略的 trait 抽象
 
 - `src/mixed.rs`
-  - 单端口多协议探测分发（peek 首字节：0x05→SOCKS5，0x04→SOCKS4，其余→HTTP）
+  - 多监听地址共享同一出网后端和并发上限；每个入口仍按首字节分发 SOCKS5/SOCKS4/HTTP
 
 - `src/socks5.rs` / `src/socks4.rs` / `src/http_proxy.rs`
   - 三种代理协议的服务端实现
+  - SOCKS5 的一个 UDP ASSOCIATE 可同时维护多个独立目标通道并汇聚回包；worker 完成结果不修改 route map，关闭通道只按 sender 状态清理，目标建立时间、活跃目标数和空闲时间均有界，控制连接关闭时统一回收
 
 - `src/relay.rs`
   - CONNECT 语义成功后的双向转发，三种协议共用

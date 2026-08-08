@@ -190,13 +190,11 @@ impl Supervisor {
 
     /// 起 SOCKS5 监听并反复探测直到就绪或启动预算耗尽；失败时监听任务会被中止。
     async fn spawn_and_probe(&self, outbound: Arc<dyn Outbound>) -> Result<JoinHandle<Result<()>>> {
-        let listen_addr: std::net::SocketAddr = format!("0.0.0.0:{}", self.config.listen_port)
-            .parse()
-            .expect("固定监听地址格式正确");
-        let serve_handle = tokio::spawn(mixed::serve(outbound, listen_addr));
+        let listen_addrs = parse_listen_addrs(&self.config.listen_addrs)?;
+        let probe_addr = listen_addrs[0];
+        let serve_handle = tokio::spawn(mixed::serve(outbound, listen_addrs));
 
-        let probe =
-            SocksTraceProbe::new(self.config.listen_port, self.config.startup_probe_timeout);
+        let probe = SocksTraceProbe::new(probe_addr, self.config.startup_probe_timeout);
         let deadline = Instant::now() + self.config.startup_ready_timeout;
 
         loop {
@@ -239,14 +237,9 @@ impl Supervisor {
         outbound: Arc<dyn Outbound>,
     ) -> Result<()> {
         let backend = outbound.name();
-        info!(
-            "SOCKS5 已由 warp-socks-rs 提供（容器内监听）: 0.0.0.0:{}",
-            self.config.listen_port
-        );
-        info!(
-            "Docker 发布端口（宿主机入口）: {} -> 容器 0.0.0.0:{}",
-            self.config.host_bind_display, self.config.listen_port
-        );
+        info!("代理监听地址: {}", self.config.listen_addrs);
+        let probe_addr = parse_listen_addrs(&self.config.listen_addrs)?[0];
+        info!("内部健康探测入口: {probe_addr}");
         info!("隧道后端: {backend}");
 
         // spawn_and_probe 里已经跑过一次成功的就绪探测，这里直接记一次心跳，
@@ -258,10 +251,7 @@ impl Supervisor {
         // 一时拥塞导致的自愈重连（如 masque::open() 内部换 QUIC 连接）也会在
         // 这次探测里自然发生——前提是 healthcheck_probe_timeout 给得够长，
         // 详见 appconfig.rs 里该字段默认值的注释。
-        let probe = SocksTraceProbe::new(
-            self.config.listen_port,
-            self.config.healthcheck_probe_timeout,
-        );
+        let probe = SocksTraceProbe::new(probe_addr, self.config.healthcheck_probe_timeout);
         let mut recovery = ThresholdRecovery::new(self.config.healthcheck_failure_threshold);
         let mut shutdown = Box::pin(shutdown_signal());
 
@@ -316,6 +306,23 @@ impl Supervisor {
     }
 }
 
+fn parse_listen_addrs(raw: &str) -> Result<Vec<std::net::SocketAddr>> {
+    let addrs = raw
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| {
+            value
+                .parse()
+                .with_context(|| format!("SOCKS_LISTEN_ADDRS 包含非法地址: {value}"))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    if addrs.is_empty() {
+        bail!("SOCKS_LISTEN_ADDRS 至少需要一个监听地址");
+    }
+    Ok(addrs)
+}
+
 fn log_candidate_plan(candidates: &[String], store: &JsonFileEndpointStore) {
     info!("endpoint 候选，共 {} 个。", candidates.len());
     if let Some(last_good) = store.last_good() {
@@ -339,5 +346,24 @@ async fn shutdown_signal() {
         _ = term.recv() => {}
         _ = int.recv() => {}
         _ = hup.recv() => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_ipv4_and_ipv6_listeners() {
+        let addrs = parse_listen_addrs("127.0.0.1:1080, [2001:db8::10]:1080").unwrap();
+        assert_eq!(addrs.len(), 2);
+        assert!(addrs[0].is_ipv4());
+        assert!(addrs[1].is_ipv6());
+    }
+
+    #[test]
+    fn rejects_empty_or_invalid_listener_config() {
+        assert!(parse_listen_addrs(" , ").is_err());
+        assert!(parse_listen_addrs("192.0.2.10").is_err());
     }
 }

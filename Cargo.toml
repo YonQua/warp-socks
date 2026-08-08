@@ -17,7 +17,8 @@ base64 = "0.22"
 rand = "0.8"
 anyhow = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "macros", "signal", "time", "sync"] }
-tokio-smoltcp = "0.6"
+smoltcp = { version = "0.13.1", default-features = false, features = ["std", "async", "socket-tcp", "socket-udp", "medium-ip", "proto-ipv4", "proto-ipv6"] }
+parking_lot = "0.12"
 futures = "0.3"
 httparse = "1"
 quinn = "0.11"

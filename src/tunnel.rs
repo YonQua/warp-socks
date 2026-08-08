@@ -5,8 +5,8 @@
 // 机制；t1/t2 decoy 包不是必需项（默认关闭更快），但保留作为可选开关，
 // 应对未来审查策略变化。
 //
-// Phase 2 起 WgTunnel 本身实现 tokio_smoltcp 的 AsyncDevice（Stream+Sink），
-// 握手完成后交给 tokio_smoltcp::Net 常驻做虚拟网卡：Stream 产出隧道解密后的
+// Phase 2 起 WgTunnel 本身实现项目内 netstack 的 AsyncDevice（Stream+Sink），
+// 握手完成后交给 Net 常驻做虚拟网卡：Stream 产出隧道解密后的
 // 明文 IP 包，Sink 把虚拟网卡要发的明文 IP 包重新加密发出去。
 
 use std::io;
@@ -20,10 +20,12 @@ use boringtun::noise::{Tunn, TunnResult};
 use boringtun::x25519::{PublicKey, StaticSecret};
 use futures::{Sink, Stream};
 use rand::Rng;
+use smoltcp::phy::{DeviceCapabilities, Medium};
 use tokio::io::ReadBuf;
 use tokio::net::UdpSocket;
 use tokio::time::Interval;
-use tokio_smoltcp::device::{AsyncDevice, DeviceCapabilities};
+
+use crate::netstack::AsyncDevice;
 
 use crate::config::WgConfig;
 
@@ -63,7 +65,7 @@ impl WgTunnel {
             .with_context(|| format!("UDP connect 到 {} 失败", config.endpoint))?;
 
         let mut caps = DeviceCapabilities::default();
-        caps.medium = tokio_smoltcp::smoltcp::phy::Medium::Ip;
+        caps.medium = Medium::Ip;
         caps.max_transmission_unit = TUNNEL_MTU;
 
         Ok(Self {
@@ -284,7 +286,7 @@ impl Sink<Vec<u8>> for WgTunnel {
                 Ok(()) => Ok(()),
                 // 底层 UDP 发送缓冲区瞬时打满：按丢包处理（TCP 由 smoltcp
                 // 自身的重传定时器恢复），而不是把错误上抛。之前这里直接
-                // 透传 WouldBlock，会被 tokio-smoltcp 的 send_all 当成硬错误，
+                // 透传 WouldBlock，会被 netstack reactor 当成硬错误，
                 // 导致 Reactor 后台任务（tokio::spawn 结果被丢弃、无感知）
                 // 整个退出——并发多连接高吞吐时非常容易触发，表现为所有连接
                 // 一起卡死、新连接的隧道内 DNS 解析超时，直到健康检查判定

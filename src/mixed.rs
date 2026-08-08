@@ -33,11 +33,39 @@ const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_secs(1);
 // healthcheck_interval 同类处理：固定常量，不做成环境变量。
 const MAX_CONNECTIONS: usize = 4096;
 
-pub async fn serve(outbound: Arc<dyn Outbound>, listen_addr: SocketAddr) -> Result<()> {
-    let listener = TcpListener::bind(listen_addr)
-        .await
-        .with_context(|| format!("监听 {listen_addr} 失败"))?;
+pub async fn serve(outbound: Arc<dyn Outbound>, listen_addrs: Vec<SocketAddr>) -> Result<()> {
     let permits = Arc::new(Semaphore::new(MAX_CONNECTIONS));
+    let mut listeners = Vec::with_capacity(listen_addrs.len());
+    for listen_addr in listen_addrs {
+        let listener = TcpListener::bind(listen_addr)
+            .await
+            .with_context(|| format!("监听 {listen_addr} 失败"))?;
+        listeners.push((listen_addr, listener));
+    }
+
+    let mut tasks = tokio::task::JoinSet::new();
+    for (listen_addr, listener) in listeners {
+        tasks.spawn(accept_loop(
+            listener,
+            listen_addr,
+            Arc::clone(&outbound),
+            Arc::clone(&permits),
+        ));
+    }
+    match tasks.join_next().await {
+        Some(Ok(result)) => result,
+        Some(Err(e)) => Err(e).context("监听任务异常终止"),
+        None => anyhow::bail!("没有可用的监听任务"),
+    }
+}
+
+async fn accept_loop(
+    listener: TcpListener,
+    listen_addr: SocketAddr,
+    outbound: Arc<dyn Outbound>,
+    permits: Arc<Semaphore>,
+) -> Result<()> {
+    log::info!("代理监听已就绪: {listen_addr}");
 
     loop {
         // 先拿许可证、再 accept：达到并发上限时不消费 listener 的 backlog，
@@ -68,7 +96,7 @@ pub async fn serve(outbound: Arc<dyn Outbound>, listen_addr: SocketAddr) -> Resu
         let outbound = outbound.clone();
         tokio::spawn(async move {
             let _permit = permit;
-            if let Err(e) = dispatch(client, peer, &*outbound).await {
+            if let Err(e) = dispatch(client, peer, outbound).await {
                 warn!("连接 {peer} 处理失败: {e:#}");
             }
         });
@@ -88,7 +116,7 @@ fn is_connection_error(e: &io::Error) -> bool {
     )
 }
 
-async fn dispatch(client: TcpStream, peer: SocketAddr, outbound: &dyn Outbound) -> Result<()> {
+async fn dispatch(client: TcpStream, peer: SocketAddr, outbound: Arc<dyn Outbound>) -> Result<()> {
     let mut first_byte = [0u8; 1];
     let n = client.peek(&mut first_byte).await?;
     if n == 0 {
@@ -96,7 +124,7 @@ async fn dispatch(client: TcpStream, peer: SocketAddr, outbound: &dyn Outbound) 
     }
     match first_byte[0] {
         0x05 => socks5::handle_client(client, peer, outbound).await,
-        0x04 => socks4::handle_client(client, peer, outbound).await,
-        _ => http_proxy::handle_client(client, peer, outbound).await,
+        0x04 => socks4::handle_client(client, peer, &*outbound).await,
+        _ => http_proxy::handle_client(client, peer, &*outbound).await,
     }
 }

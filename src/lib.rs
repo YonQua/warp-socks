@@ -6,6 +6,7 @@ pub mod fsutil;
 pub mod health;
 pub mod http_proxy;
 pub mod mixed;
+pub mod netstack;
 pub mod outbound;
 pub mod registration;
 pub mod relay;

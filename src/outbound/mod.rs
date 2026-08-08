@@ -18,7 +18,7 @@ pub mod wireguard;
 pub use masque::Masque;
 pub use wireguard::{WgHealConfig, WgOutbound};
 
-/// 双向字节流。tokio_smoltcp::TcpStream、quinn (Send,Recv) 组合都满足。
+/// 双向字节流。项目内 netstack 的 TcpStream、quinn (Send,Recv) 组合都满足。
 pub trait Stream: AsyncRead + AsyncWrite + Unpin + Send {}
 impl<T: AsyncRead + AsyncWrite + Unpin + Send> Stream for T {}
 
@@ -74,6 +74,12 @@ pub trait Outbound: Send + Sync {
     /// 后端名，用于展示（启动日志、每条连接日志），如 "MASQUE"/"WireGuard"。
     /// 只在实现处定义这一份，避免调用方各自维护一份同名字符串、改名时漏改。
     fn name(&self) -> &'static str;
+
+    /// 后端是否原生支持隧道内 UDP。SOCKS5 必须在回复 UDP ASSOCIATE 前读取
+    /// 这个静态能力，避免先回复成功、收到首包后才发现后端不支持而形成黑洞。
+    fn supports_udp(&self) -> bool {
+        false
+    }
 
     /// # Errors
     /// 连接失败（超时、拒绝、网络不可达、域名解析失败等）时返回 `io::Error`。

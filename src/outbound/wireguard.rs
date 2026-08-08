@@ -1,29 +1,29 @@
-// WireGuard 出网后端：把现有 tokio_smoltcp::Net 虚拟网卡包装成 Outbound trait。
+// WireGuard 出网后端：把项目内双栈 Net 虚拟网卡包装成 Outbound trait。
 //
 // connect_tcp 走虚拟网卡的 TCP 栈；域名目标在隧道内用虚拟网卡的 UDP socket
-// 发 DNS 查询解析。这层只是薄封装，实际逻辑在 tokio_smoltcp::Net 和 crate::dns 里。
+// 发 DNS 查询解析。这层只是薄封装，实际逻辑在 crate::netstack 和 crate::dns 里。
 //
 // 自愈（heal）语义对齐 masque::Masque::open()：探测失败时单飞重连，对
 // Supervisor 完全透明。区别只是 WireGuard 没有 MASQUE close_reason() 那种
 // 廉价活性查询——触发信号由调用方（健康探测失败）决定，候选池/冷却状态
 // 因此整体收在这个后端自己手里，而不是暴露给编排层。
 
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use log::warn;
+use smoltcp::iface::Config as IfaceConfig;
+use smoltcp::wire::{HardwareAddress, IpAddress, IpCidr};
 use tokio::sync::{Mutex, RwLock};
-use tokio_smoltcp::smoltcp::iface::Config as IfaceConfig;
-use tokio_smoltcp::smoltcp::wire::{HardwareAddress, IpAddress, IpCidr};
-use tokio_smoltcp::{BufferSize, Net, NetConfig, UdpSocket as TunnelUdpSocket};
 
 use super::{Connected, Datagram, Host, Outbound};
 use crate::config::{parse_wg_conf, WgConfig};
 use crate::dns::{resolve, RecordType};
 use crate::endpoint::{plan_candidates, JsonFileEndpointStore};
+use crate::netstack::{BufferSize, Net, NetConfig, UdpSocket as TunnelUdpSocket};
 use crate::registration::{self, WgAccount};
 use crate::tunnel::{Trick, WgTunnel};
 
@@ -123,11 +123,20 @@ async fn build_net(config: &WgConfig, trick: Trick, handshake_timeout: Duration)
     let mut tunnel = WgTunnel::connect(config, trick).await?;
     tunnel.handshake(handshake_timeout).await?;
 
+    let net_config = build_net_config(config);
+    Net::new(tunnel, net_config).context("启动 WireGuard 双栈网络栈失败")
+}
+
+fn build_net_config(config: &WgConfig) -> NetConfig {
     let mut interface_config = IfaceConfig::new(HardwareAddress::Ip);
     interface_config.random_seed = rand::random();
-    let ip_addr = IpCidr::new(IpAddress::from(IpAddr::V4(config.address_v4)), 32);
-    let gateway = vec![IpAddress::from(IpAddr::V4(config.address_v4))];
-    let mut net_config = NetConfig::new(interface_config, ip_addr, gateway);
+    let address_v4 = IpAddress::from(IpAddr::V4(config.address_v4));
+    let address_v6 = IpAddress::from(IpAddr::V6(config.address_v6));
+    let mut net_config = NetConfig::new(
+        interface_config,
+        vec![IpCidr::new(address_v4, 32), IpCidr::new(address_v6, 128)],
+        vec![address_v4, address_v6],
+    );
     // 默认 8KiB 收发窗口在实测中把单连接吞吐限制在约 30KB/s（窗口/RTT），
     // 调大到 256KiB 后单连接吞吐可提升到 MB/s 级别。
     net_config.buffer_size = BufferSize {
@@ -136,7 +145,7 @@ async fn build_net(config: &WgConfig, trick: Trick, handshake_timeout: Duration)
         ..Default::default()
     };
 
-    Ok(Net::new(tunnel, net_config))
+    net_config
 }
 
 /// 写 wg0.conf（覆盖 endpoint）再解析回 `WgConfig`；`establish`/`heal` 共用，
@@ -181,12 +190,16 @@ impl Outbound for WgOutbound {
         "WireGuard"
     }
 
+    fn supports_udp(&self) -> bool {
+        true
+    }
+
     async fn connect_tcp(&self, host: Host, port: u16) -> std::io::Result<Connected> {
         // smoltcp 对未响应的 SYN 只会把重传间隔倍增到 60s 封顶，不加超时会永远挂着。
         let addr = self.resolve_target(host, port).await?;
         // 读锁覆盖整个 tcp_connect：期间若 heal() 想拿写锁会等到这次连接
         // 结束或超时（最坏 CONNECT_TIMEOUT），可接受——换来的是不需要确认
-        // tokio_smoltcp::Net 是否可廉价 Clone。
+        // Net 是否可廉价 Clone。
         let net = self.net.read().await;
         let stream = tokio::time::timeout(CONNECT_TIMEOUT, net.tcp_connect(addr))
             .await
@@ -205,8 +218,12 @@ impl Outbound for WgOutbound {
     async fn connect_udp(&self, host: Host, port: u16) -> std::io::Result<Box<dyn Datagram>> {
         let target = self.resolve_target(host, port).await?;
         let net = self.net.read().await;
+        let bind_addr = match target {
+            SocketAddr::V4(_) => SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
+            SocketAddr::V6(_) => SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0),
+        };
         let sock = net
-            .udp_bind("0.0.0.0:0".parse().unwrap())
+            .udp_bind(bind_addr)
             .await
             .map_err(|e| std::io::Error::other(format!("绑定隧道内 UDP socket 失败: {e}")))?;
         Ok(Box::new(WgDatagram { sock, target }))
@@ -254,5 +271,35 @@ impl Outbound for WgOutbound {
             warn!("记录 endpoint {next} 成功状态失败（不影响本次自愈结果）: {e:#}");
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::{Ipv4Addr, Ipv6Addr};
+
+    fn config() -> WgConfig {
+        WgConfig {
+            private_key: [1; 32],
+            peer_public_key: [2; 32],
+            endpoint: "192.0.2.1:2408".parse().unwrap(),
+            reserved: [0; 3],
+            address_v4: Ipv4Addr::new(172, 16, 0, 2),
+            address_v6: "2001:db8::2".parse::<Ipv6Addr>().unwrap(),
+        }
+    }
+
+    #[test]
+    fn net_config_contains_dual_stack_addresses_and_routes() {
+        let config = build_net_config(&config());
+        let v4 = IpAddress::from(IpAddr::V4(Ipv4Addr::new(172, 16, 0, 2)));
+        let v6 = IpAddress::from(IpAddr::V6("2001:db8::2".parse::<Ipv6Addr>().unwrap()));
+
+        assert_eq!(
+            config.ip_addrs,
+            vec![IpCidr::new(v4, 32), IpCidr::new(v6, 128)]
+        );
+        assert_eq!(config.gateways, vec![v4, v6]);
     }
 }

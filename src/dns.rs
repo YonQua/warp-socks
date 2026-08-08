@@ -8,7 +8,7 @@
 // Go 版自己也是手写 dnsmessage 而非依赖第三方库，同等复杂度没必要
 // 为此引入一整个 DNS 库依赖。
 //
-// Phase 2 起查询通过 tokio_smoltcp::Net 的虚拟 UDP socket 发送——和 SOCKS5
+// Phase 2 起查询通过项目内 Net 的虚拟 UDP socket 发送——和 SOCKS5
 // CONNECT 的 TCP 流走同一个虚拟网卡，不再需要手搓 IP/UDP 头（那是 Phase 1
 // 独立验证 boringtun 收发时的临时做法，现在虚拟网卡本身就是应用层 socket）。
 
@@ -17,9 +17,9 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
+use crate::netstack::Net;
 use anyhow::{bail, Context, Result};
 use rand::Rng;
-use tokio_smoltcp::Net;
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum RecordType {

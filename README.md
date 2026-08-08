@@ -1,6 +1,6 @@
 # warp-socks
 
-一个面向单机部署的 WARP SOCKS5 Docker 方案：用 Cloudflare Teams registration token 注册一次，然后稳定提供一个本机可访问的 SOCKS5 出口。
+一个面向 Linux 单机部署的 WARP SOCKS5 Docker 方案：SOCKS5 UDP relay 通过 host network 对远端客户端可达，业务出口由 MASQUE 或 userspace WireGuard 承载。
 
 主链路：`TEAMS_TOKEN -> account.json -> 隧道进程（默认优先尝试 MASQUE；关闭 WARP_SOCKS_ENABLE_MASQUE 或 MASQUE 失败则回退 userspace WireGuard）+ SOCKS5`
 
@@ -44,6 +44,8 @@ cp .env.example .env
 
 ```env
 TEAMS_TOKEN=com.cloudflare.warp://<your-team>.cloudflareaccess.com/auth?token=<your-token>
+WARP_SOCKS_ENABLE_MASQUE=0
+SOCKS_LISTEN_ADDRS=127.0.0.1:1080
 ```
 
 3. 启动：
@@ -73,8 +75,7 @@ docker exec warp-socks curl --socks5 127.0.0.1:1080 https://cloudflare.com/cdn-c
 | 变量                      | 必填                   | 说明                                                                                               |
 | ------------------------- | ---------------------- | -------------------------------------------------------------------------------------------------- |
 | `TEAMS_TOKEN`             | 条件必填               | Cloudflare Teams registration token，推荐直接填完整 `com.cloudflare.warp://...auth?token=...` 链接。已有 `data/account.json` 后重启可以留空；`WARP_SOCKS_ENABLE_MASQUE=1` 且 MASQUE 注册与建隧道都成功时也不需要（纯 MASQUE 场景不会触碰 Teams 账户），只有实际需要走 WireGuard（未开启 MASQUE，或 MASQUE 失败要回退）时才会要求填写 |
-| `HOST_BIND_IP`          | 否                     | 宿主机发布地址，默认 `127.0.0.1`                                                                   |
-| `HOST_BIND_PORT`        | 否                     | 宿主机发布端口，默认 `1080`                                                                        |
+| `SOCKS_LISTEN_ADDRS`    | 否                     | 逗号分隔的显式监听地址，默认 `127.0.0.1:1080`；远端部署按实际网络加入宿主机可达的 IPv4/IPv6 地址 |
 | `ENDPOINT_CANDIDATES`   | 否                     | 手工覆盖 endpoint 列表；留空时使用项目内置候选池                                                   |
 | `RESTART_POLICY`        | `unless-stopped`       | Docker 重启策略                                                                                    |
 | `RUST_LOG`              | `info`                 | 日志级别（`env_logger` 标准语法），默认 `info` 已包含连接建立/失败、隧道后端（MASQUE/WireGuard）等关键信息；调试可设 `RUST_LOG=debug` |
@@ -134,7 +135,15 @@ WARP_SOCKS_HEALTHCHECK_FAILURE_THRESHOLD=2
 
 启动阶段会按顺序逐个尝试候选，单个候选最坏耗时约为 `WARP_SOCKS_STARTUP_SOCKS_READY_TIMEOUT` 秒；默认候选池 8 个时，全部失败的最坏总耗时约 `8 × 20s ≈ 160` 秒，之后由 Docker 按 `RESTART_POLICY` 重启容器重试。这段等待期间容器还没有标记 runtime ready，healthcheck 不会介入，不会被误判为不健康。
 
-容器内 SOCKS5 固定监听 `0.0.0.0:1080`，宿主机入口由 `HOST_BIND_IP:HOST_BIND_PORT` 决定。默认只监听 `127.0.0.1:1080`。当前 SOCKS5 无认证，不建议直接暴露到公网。
+Compose 使用 `network_mode: host`，因为 UDP ASSOCIATE relay 使用随机端口，Docker bridge 无法提前发布。程序只监听 `SOCKS_LISTEN_ADDRS` 中列出的地址；默认仅监听 `127.0.0.1:1080`。需要远端客户端时，应加入该客户端实际可达的宿主机 IPv4/IPv6 地址。当前 SOCKS5 无认证，不应使用 `0.0.0.0`、`[::]` 或直接暴露到公网的地址。
+
+例如，以下只展示格式，使用的是不可路由的 RFC 文档地址，不能直接复制到生产：
+
+```env
+SOCKS_LISTEN_ADDRS=127.0.0.1:1080,192.0.2.10:1080,[2001:db8::10]:1080
+```
+
+WireGuard 后端使用项目内的 `smoltcp 0.13.1` 异步适配层，同时配置 WARP IPv4 `/32`、IPv6 `/128` 和两种默认路由。TCP 与 UDP 都按目标地址族选择对应的 WARP 源地址，因此 IPv4/IPv6 字面量均走隧道。域名第一阶段继续在隧道内只查询 A 记录，所以域名目标当前固定使用 IPv4，不主动查询 AAAA，也不做 Happy Eyeballs。一个 SOCKS5 UDP ASSOCIATE 可以同时访问多个 IPv4、IPv6 或域名目标；每个 association 最多保留 64 个活跃目标，目标通道建立最多等待 10 秒，建立后空闲 120 秒释放。MASQUE 不支持隧道内 UDP，默认会在 SOCKS5 UDP ASSOCIATE 阶段明确拒绝，不会静默回退宿主机出口。
 
 入口在复用或新建 `account.json` 后，会自动清理旧模型遗留的 `state.json` 和 `wgcf-*` 文件。
 
@@ -207,13 +216,27 @@ docker compose up --build -d
 ```yaml
 services:
   warp-socks:
-    image: ghcr.io/yonqua/warp-socks:latest
+    image: ghcr.io/yonqua/warp-socks:<固定版本或 digest>
     container_name: warp-socks
     restart: unless-stopped
-    ports:
-      - '${HOST_BIND_IP:-127.0.0.1}:${HOST_BIND_PORT:-1080}:1080'
+    network_mode: host
     volumes:
       - ./data:/etc/warp-socks
     env_file:
       - .env
 ```
+
+完整上线验收至少覆盖 TCP/UDP × IPv4/IPv6，并确认日志中的后端为 `WireGuard`、Cloudflare trace 包含 `warp=on|plus`、没有“宿主机出口”日志。host network 生产配置面向 Linux；Docker Desktop 不在该部署合同内。
+
+### 当前能力验收矩阵
+
+| 路径 | 必须验证的结果 |
+| --- | --- |
+| SOCKS TCP → IPv4 字面量 | 连接成功，日志为 `backend=WireGuard` |
+| SOCKS TCP → IPv6 字面量 | 成功，日志为 `backend=WireGuard`，trace 为 `warp=on|plus` |
+| SOCKS TCP → 域名 | 成功，DNS 仍在隧道内查询 A 记录 |
+| SOCKS UDP → IPv4 DNS | UDP ASSOCIATE 成功，relay 返回客户端可达的宿主机 IPv4 随机端口 |
+| SOCKS UDP → IPv6 目标 | 成功，真实建立 UDP ASSOCIATE，且无宿主机直出日志 |
+| MASQUE UDP | 默认在 ASSOCIATE 阶段明确失败，无宿主机直出 |
+
+程序内部 liveness 使用 `SOCKS_LISTEN_ADDRS` 的第一个地址做一次域名 TCP `warp=on|plus` 探测，用于判断进程和隧道主链路是否需要重启；它不冒充完整能力矩阵。`tcp4`、`tcp6`、`udp4`、`udp6` 应由实际客户端或上层代理分别验证。远端部署还必须用主机防火墙限制允许访问 TCP 1080 和随机 UDP relay 端口的来源地址。

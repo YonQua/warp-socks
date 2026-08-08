@@ -1,6 +1,6 @@
 // Phase 0/1 握手可行性验证：读取现有生产 wg0.conf（只读，不改动、不重新注册），
 // 用 boringtun 做真实握手。隧道内 DNS/SOCKS5 端到端验证见 warp-socks 二进制
-// （Phase 2 起改走 tokio_smoltcp 虚拟网卡，不再需要这里单独手搓 IP 包测试）。
+// （Phase 2 起改走项目内 smoltcp 虚拟网卡，不再需要这里单独手搓 IP 包测试）。
 //
 // 用法：handshake_probe <wg0.conf 路径> <none|t1|t2>
 

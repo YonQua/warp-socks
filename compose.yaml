@@ -5,7 +5,7 @@ services:
     build:
       context: .
     # 显式指定镜像名，避免 Compose 默认生成 warp-socks-warp-socks 这种重复名称。
-    image: warp-socks:latest
+    image: warp-socks:${IMAGE_TAG:-dev}
     container_name: warp-socks
     restart: ${RESTART_POLICY:-unless-stopped}
     mem_limit: 256m
@@ -21,9 +21,9 @@ services:
     environment:
       # 首次启动必须提供（纯 MASQUE 场景可留空，见 README）；已经在 ./data 下留有 account.json 后，重启也可以留空。详见 README。
       TEAMS_TOKEN: ${TEAMS_TOKEN:-}
-      # 仅用于容器启动日志，帮助区分"宿主机入口"与"容器内监听"。
-      HOST_BIND_IP: ${HOST_BIND_IP:-127.0.0.1}
-      HOST_BIND_PORT: ${HOST_BIND_PORT:-1080}
+      # host network 下程序直接绑定宿主机地址，第一个地址用于内部健康
+      # 探测。默认只允许本机访问；远端部署按实际网络加入可达地址。
+      SOCKS_LISTEN_ADDRS: ${SOCKS_LISTEN_ADDRS:-127.0.0.1:1080}
       ENDPOINT_CANDIDATES: ${ENDPOINT_CANDIDATES:-}
       # 默认优先走 MASQUE 隧道（缺 reg.json 会自动注册，不需要 TEAMS_TOKEN），失败仍回退 WireGuard；显式设为 0 可强制只用 WireGuard。
       WARP_SOCKS_ENABLE_MASQUE: ${WARP_SOCKS_ENABLE_MASQUE:-1}
@@ -48,9 +48,9 @@ services:
       options:
         max-size: 1m
         max-file: '1'
-    ports:
-      # 默认只绑定到本机，先确保代理可用；需要对外暴露时再改 HOST_BIND_IP=0.0.0.0
-      - '${HOST_BIND_IP:-127.0.0.1}:${HOST_BIND_PORT:-1080}:1080'
+    # UDP ASSOCIATE 使用随机 relay 端口，bridge/ports 无法预先发布；host
+    # network 让返回的 BND.ADDR:BND.PORT 对远端客户端真实可达。
+    network_mode: host
     volumes:
       # 把 WireGuard 与 MASQUE 的注册结果、隧道配置都落到当前目录，便于查看和备份。
       # 目录名统一叫 data（宿主机 ./data、容器内 /etc/warp-socks），不再用

@@ -1,22 +1,24 @@
 // RFC 1928 SOCKS5 服务端：CONNECT（0x01）+ UDP ASSOCIATE（0x03），无认证。
 // 出网通过 Outbound trait，不关心底层是 WireGuard 虚拟网卡还是 MASQUE。
 //
-// UDP ASSOCIATE 的转发语义对照 warp-plus `proxy/pkg/socks5/server.go:
-// embedHandleAssociate`：只记住第一个客户端来源地址和第一个目的地址，
-// 之后的包一律转发到这唯一一对 (source, target)——不支持一个 ASSOCIATE
-// 会话内动态切换多个目的地，这是 Go 版本自己的简化，这里原样保留。
+// 一个 UDP ASSOCIATE 可携带多个目标；每个目标持有独立的隧道数据报通道，
+// 回包汇聚到同一个客户端 relay。目标数和空闲时间均有上限，避免单个客户端
+// 无限占用虚拟网卡 socket。
 //
-// UDP 的实际出网路径优先走 Outbound::connect_udp（后端支持则数据报也走隧道，
-// 目前只有 WireGuard 后端支持）；后端返回 Unsupported（比如 MASQUE，H3
-// CONNECT 是字节流扛不了 datagram）时才回退到宿主机网络直连出口。
+// UDP 只允许走 Outbound::connect_udp 提供的隧道通道；不支持隧道内 UDP 的
+// 后端在 ASSOCIATE 阶段直接拒绝，绝不回退到宿主机出口。
 
+use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::sync::Arc;
+use std::time::Duration;
 
-use anyhow::{anyhow, bail, Context, Result};
-use async_trait::async_trait;
+use anyhow::{bail, Context, Result};
 use log::{info, warn};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
+use tokio::sync::mpsc;
+use tokio::task::JoinSet;
 
 use crate::outbound::{Datagram, Host, Outbound};
 use crate::relay;
@@ -28,6 +30,12 @@ const REP_ATYP_NOT_SUPPORTED: u8 = 0x08;
 
 const CMD_CONNECT: u8 = 0x01;
 const CMD_UDP_ASSOCIATE: u8 = 0x03;
+
+const MAX_UDP_TARGETS_PER_ASSOCIATION: usize = 64;
+const UDP_TARGET_CHANNEL_CAPACITY: usize = 32;
+const UDP_REPLY_CHANNEL_CAPACITY: usize = 64;
+const UDP_TARGET_ESTABLISH_TIMEOUT: Duration = Duration::from_secs(10);
+const UDP_TARGET_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 
 async fn reply(client: &mut TcpStream, rep: u8) -> Result<()> {
     client
@@ -56,7 +64,7 @@ async fn reply_with_addr(client: &mut TcpStream, rep: u8, addr: SocketAddr) -> R
 pub(crate) async fn handle_client(
     mut client: TcpStream,
     peer: SocketAddr,
-    outbound: &dyn Outbound,
+    outbound: Arc<dyn Outbound>,
 ) -> Result<()> {
     // 方法协商：只接受“无认证”（0x00）。
     let mut head = [0u8; 2];
@@ -89,7 +97,7 @@ pub(crate) async fn handle_client(
     }
 
     match req[1] {
-        CMD_CONNECT => handle_connect(client, peer, req[3], outbound).await,
+        CMD_CONNECT => handle_connect(client, peer, req[3], &*outbound).await,
         CMD_UDP_ASSOCIATE => handle_udp_associate(client, peer, req[3], outbound).await,
         _ => unreachable!(),
     }
@@ -166,7 +174,9 @@ fn decode_udp_header(buf: &[u8]) -> Option<(SocketAddrOrName, usize)> {
             if buf.len() < pos + len + 2 {
                 return None;
             }
-            let name = String::from_utf8(buf[pos..pos + len].to_vec()).ok()?;
+            let name = String::from_utf8(buf[pos..pos + len].to_vec())
+                .ok()?
+                .to_ascii_lowercase();
             pos += len;
             let port = u16::from_be_bytes([buf[pos], buf[pos + 1]]);
             pos += 2;
@@ -177,6 +187,7 @@ fn decode_udp_header(buf: &[u8]) -> Option<(SocketAddrOrName, usize)> {
     Some((target, pos))
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 enum SocketAddrOrName {
     Addr(SocketAddr),
     Name(String, u16),
@@ -189,15 +200,177 @@ fn target_host_port(target: &SocketAddrOrName) -> (Host, u16) {
     }
 }
 
+struct UdpReply {
+    from: SocketAddr,
+    payload: Vec<u8>,
+}
+
+struct UdpEgressSet {
+    routes: HashMap<SocketAddrOrName, mpsc::Sender<Vec<u8>>>,
+    workers: JoinSet<()>,
+    reply_tx: mpsc::Sender<UdpReply>,
+    reply_rx: mpsc::Receiver<UdpReply>,
+    establish_timeout: Duration,
+    idle_timeout: Duration,
+}
+
+impl UdpEgressSet {
+    fn new() -> Self {
+        Self::with_timeouts(UDP_TARGET_ESTABLISH_TIMEOUT, UDP_TARGET_IDLE_TIMEOUT)
+    }
+
+    fn with_timeouts(establish_timeout: Duration, idle_timeout: Duration) -> Self {
+        let (reply_tx, reply_rx) = mpsc::channel(UDP_REPLY_CHANNEL_CAPACITY);
+        Self {
+            routes: HashMap::new(),
+            workers: JoinSet::new(),
+            reply_tx,
+            reply_rx,
+            establish_timeout,
+            idle_timeout,
+        }
+    }
+
+    fn send(
+        &mut self,
+        outbound: Arc<dyn Outbound>,
+        target: SocketAddrOrName,
+        payload: &[u8],
+        peer: SocketAddr,
+    ) {
+        self.prune();
+
+        if let Some(route) = self.routes.get(&target) {
+            match route.try_send(payload.to_vec()) {
+                Ok(()) => return,
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    log::debug!("UDP ASSOCIATE 目标发送队列已满，丢弃数据报: {target:?}");
+                    return;
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    self.routes.remove(&target);
+                }
+            }
+        }
+
+        if self.routes.len() >= MAX_UDP_TARGETS_PER_ASSOCIATION {
+            warn!(
+                "UDP ASSOCIATE 活跃目标已达上限 {}，拒绝新目标: {target:?}",
+                MAX_UDP_TARGETS_PER_ASSOCIATION
+            );
+            return;
+        }
+
+        let (send_tx, send_rx) = mpsc::channel(UDP_TARGET_CHANNEL_CAPACITY);
+        let reply_tx = self.reply_tx.clone();
+        let worker_target = target.clone();
+        let establish_timeout = self.establish_timeout;
+        let idle_timeout = self.idle_timeout;
+        self.workers.spawn(async move {
+            log::debug!("UDP ASSOCIATE 开始建立目标通道: {worker_target:?}");
+            match tokio::time::timeout(
+                establish_timeout,
+                establish_egress(&*outbound, &worker_target, peer),
+            )
+            .await
+            {
+                Ok(Some(egress)) => {
+                    run_udp_egress(
+                        worker_target.clone(),
+                        egress,
+                        send_rx,
+                        reply_tx,
+                        idle_timeout,
+                    )
+                    .await;
+                }
+                Ok(None) => {}
+                Err(_) => warn!(
+                    "UDP ASSOCIATE 建立目标通道超时（{establish_timeout:?}）: {worker_target:?}"
+                ),
+            }
+        });
+        if send_tx.try_send(payload.to_vec()).is_err() {
+            log::debug!("新建 UDP ASSOCIATE 目标后发送队列意外关闭");
+            return;
+        }
+        self.routes.insert(target, send_tx);
+    }
+
+    async fn recv(&mut self) -> Option<UdpReply> {
+        self.reply_rx.recv().await
+    }
+
+    fn prune(&mut self) {
+        while let Some(result) = self.workers.try_join_next() {
+            if let Err(error) = result {
+                warn!("UDP ASSOCIATE 目标 worker 异常结束: {error}");
+            }
+        }
+        self.routes.retain(|_, sender| !sender.is_closed());
+    }
+}
+
+async fn run_udp_egress(
+    target: SocketAddrOrName,
+    egress: Box<dyn Datagram>,
+    mut sends: mpsc::Receiver<Vec<u8>>,
+    replies: mpsc::Sender<UdpReply>,
+    idle_timeout: Duration,
+) {
+    let idle = tokio::time::sleep(idle_timeout);
+    tokio::pin!(idle);
+    let mut recv_buf = [0u8; 65536];
+
+    loop {
+        tokio::select! {
+            _ = &mut idle => return,
+            command = sends.recv() => {
+                let Some(payload) = command else { return };
+                if let Err(error) = egress.send(&payload).await {
+                    warn!("UDP ASSOCIATE 向 {target:?} 发送失败: {error}");
+                    return;
+                }
+                idle.as_mut().reset(tokio::time::Instant::now() + idle_timeout);
+            }
+            result = egress.recv(&mut recv_buf) => {
+                let size = match result {
+                    Ok(size) => size,
+                    Err(error) => {
+                        warn!("UDP ASSOCIATE 从 {target:?} 接收失败: {error}");
+                        return;
+                    }
+                };
+                let reply = UdpReply {
+                    from: egress.peer_addr(),
+                    payload: recv_buf[..size].to_vec(),
+                };
+                if replies.send(reply).await.is_err() {
+                    return;
+                }
+                idle.as_mut().reset(tokio::time::Instant::now() + idle_timeout);
+            }
+        }
+    }
+}
+
 async fn handle_udp_associate(
     mut client: TcpStream,
     peer: SocketAddr,
     atyp: u8,
-    outbound: &dyn Outbound,
+    outbound: Arc<dyn Outbound>,
 ) -> Result<()> {
     // 客户端在请求里带的 DST.ADDR/DST.PORT 只是建议地址，实际以每个 UDP 包
     // 自带的头部为准（多数客户端直接填 0.0.0.0:0），这里读掉但不解析、不使用。
     skip_target(&mut client, atyp).await?;
+
+    if !outbound.supports_udp() {
+        reply(&mut client, REP_CMD_NOT_SUPPORTED).await?;
+        bail!(
+            "{} 后端不支持隧道内 UDP，已拒绝 UDP ASSOCIATE",
+            outbound.name()
+        );
+    }
 
     let bind_ip = client.local_addr().context("获取本地地址失败")?.ip();
     let relay_sock = tokio::net::UdpSocket::bind(SocketAddr::new(bind_ip, 0))
@@ -210,9 +383,8 @@ async fn handle_udp_associate(
     }
 
     let mut client_addr: Option<SocketAddr> = None;
-    let mut egress: Option<Box<dyn Datagram>> = None;
+    let mut egress = UdpEgressSet::new();
     let mut relay_buf = [0u8; 65536];
-    let mut target_buf = [0u8; 65536];
     let mut ctrl_buf = [0u8; 1];
 
     loop {
@@ -226,33 +398,31 @@ async fn handle_udp_associate(
             }
             r = relay_sock.recv_from(&mut relay_buf) => {
                 let (n, from) = r.context("UDP ASSOCIATE 中继读失败")?;
-                if client_addr.is_none() {
-                    client_addr = Some(from);
-                } else if client_addr != Some(from) {
+                if !udp_source_allowed(peer, client_addr, from) {
+                    log::debug!("忽略与 SOCKS 控制连接来源 IP 不一致的 UDP 包: control={peer}, udp={from}");
+                    continue;
+                }
+                if client_addr.is_some() && client_addr != Some(from) {
                     continue; // 忽略非首个来源
                 }
                 let Some((target, header_len)) = decode_udp_header(&relay_buf[..n]) else {
                     continue;
                 };
-                if egress.is_none() {
-                    egress = establish_egress(outbound, &target, bind_ip, peer).await;
-                }
-                if let Some(e) = &egress {
-                    let _ = e.send(&relay_buf[header_len..n]).await;
-                }
+                // 只有通过来源 IP 和 SOCKS UDP header 校验的首包才能锁定客户端
+                // UDP 端口，避免同 IP 上的无效数据报抢占 association。
+                client_addr.get_or_insert(from);
+                egress.send(
+                    Arc::clone(&outbound),
+                    target,
+                    &relay_buf[header_len..n],
+                    peer,
+                );
             }
-            // 回包：目标 → 客户端；egress 建立前这个分支永不就绪。
-            r = async {
-                match &egress {
-                    Some(e) => e.recv(&mut target_buf).await,
-                    None => futures::future::pending().await,
-                }
-            } => {
-                let Ok(n) = r else { continue };
+            reply = egress.recv() => {
+                let Some(reply) = reply else { continue };
                 if let Some(client_addr) = client_addr {
-                    let from = egress.as_ref().expect("recv 成功说明 egress 已建立").peer_addr();
-                    let mut wrapped = encode_udp_header(from);
-                    wrapped.extend_from_slice(&target_buf[..n]);
+                    let mut wrapped = encode_udp_header(reply.from);
+                    wrapped.extend_from_slice(&reply.payload);
                     let _ = relay_sock.send_to(&wrapped, client_addr).await;
                 }
             }
@@ -260,12 +430,18 @@ async fn handle_udp_associate(
     }
 }
 
+fn udp_source_allowed(
+    control_peer: SocketAddr,
+    learned_client: Option<SocketAddr>,
+    source: SocketAddr,
+) -> bool {
+    source.ip() == control_peer.ip() && learned_client.is_none_or(|learned| learned == source)
+}
+
 /// 建立到目标的 UDP 出网通道：优先走 Outbound::connect_udp（数据报走隧道）；
-/// 后端明确回报 Unsupported 才回退到宿主机网络直连（域名用宿主机解析器）。
 async fn establish_egress(
     outbound: &dyn Outbound,
     target: &SocketAddrOrName,
-    bind_ip: IpAddr,
     peer: SocketAddr,
 ) -> Option<Box<dyn Datagram>> {
     let (host, port) = target_host_port(target);
@@ -276,19 +452,6 @@ async fn establish_egress(
                 d.peer_addr()
             );
             Some(d)
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::Unsupported => {
-            info!("UDP ASSOCIATE: 当前出网后端不支持隧道内 UDP，改走宿主机网络直连出口");
-            match host_datagram(bind_ip, target).await {
-                Ok((d, display)) => {
-                    info!("连接 {peer} -> {display}: 已建立（UDP ASSOCIATE，宿主机出口）");
-                    Some(Box::new(d) as Box<dyn Datagram>)
-                }
-                Err(e) => {
-                    warn!("UDP ASSOCIATE 宿主机出口建立失败: {e:#}");
-                    None
-                }
-            }
         }
         Err(e) => {
             warn!("UDP ASSOCIATE 隧道内建立失败: {e}");
@@ -312,56 +475,6 @@ fn encode_udp_header(target: SocketAddr) -> Vec<u8> {
         }
     }
     out
-}
-
-/// 宿主机网络直连的 UDP 数据报通道（MASQUE 等不支持隧道内 UDP 的后端回退用）。
-struct HostDatagram {
-    sock: tokio::net::UdpSocket,
-    target: SocketAddr,
-}
-
-#[async_trait]
-impl Datagram for HostDatagram {
-    fn peer_addr(&self) -> SocketAddr {
-        self.target
-    }
-
-    async fn send(&self, buf: &[u8]) -> std::io::Result<()> {
-        self.sock.send_to(buf, self.target).await?;
-        Ok(())
-    }
-
-    async fn recv(&self, buf: &mut [u8]) -> std::io::Result<usize> {
-        loop {
-            let (n, from) = self.sock.recv_from(buf).await?;
-            if from == self.target {
-                return Ok(n);
-            }
-        }
-    }
-}
-
-/// 用宿主机解析器解析 UDP 目标并绑定出网 socket（不经过隧道）。
-async fn host_datagram(
-    bind_ip: IpAddr,
-    target: &SocketAddrOrName,
-) -> Result<(HostDatagram, String)> {
-    use tokio::net::lookup_host;
-    let (addr, display) = match target {
-        SocketAddrOrName::Addr(a) => (*a, a.to_string()),
-        SocketAddrOrName::Name(name, port) => {
-            let addr = lookup_host(format!("{name}:{port}"))
-                .await
-                .with_context(|| format!("解析 {name}:{port} 失败"))?
-                .next()
-                .ok_or_else(|| anyhow!("{name}:{port} 未解析到地址"))?;
-            (addr, format!("{name}:{port}({addr})"))
-        }
-    };
-    let sock = tokio::net::UdpSocket::bind(SocketAddr::new(bind_ip, 0))
-        .await
-        .context("绑定 UDP ASSOCIATE 出网 socket 失败")?;
-    Ok((HostDatagram { sock, target: addr }, display))
 }
 
 async fn read_target(client: &mut TcpStream, atyp: u8) -> Result<Target> {
@@ -432,4 +545,403 @@ async fn skip_target(client: &mut TcpStream, atyp: u8) -> Result<()> {
         other => bail!("不支持的地址类型: {other}"),
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use async_trait::async_trait;
+    use std::collections::HashMap;
+    use std::future::pending;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::sync::{Mutex, Notify};
+
+    struct EchoDatagram {
+        target: SocketAddr,
+        tx: mpsc::Sender<Vec<u8>>,
+        rx: Mutex<mpsc::Receiver<Vec<u8>>>,
+    }
+
+    #[async_trait]
+    impl Datagram for EchoDatagram {
+        fn peer_addr(&self) -> SocketAddr {
+            self.target
+        }
+
+        async fn send(&self, buf: &[u8]) -> std::io::Result<()> {
+            self.tx
+                .send(buf.to_vec())
+                .await
+                .map_err(|_| std::io::Error::from(std::io::ErrorKind::BrokenPipe))
+        }
+
+        async fn recv(&self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let payload = self
+                .rx
+                .lock()
+                .await
+                .recv()
+                .await
+                .ok_or(std::io::ErrorKind::UnexpectedEof)?;
+            buf[..payload.len()].copy_from_slice(&payload);
+            Ok(payload.len())
+        }
+    }
+
+    struct EchoOutbound {
+        connects: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl Outbound for EchoOutbound {
+        fn name(&self) -> &'static str {
+            "Echo"
+        }
+
+        fn supports_udp(&self) -> bool {
+            true
+        }
+
+        async fn connect_tcp(
+            &self,
+            _host: Host,
+            _port: u16,
+        ) -> std::io::Result<crate::outbound::Connected> {
+            Err(std::io::ErrorKind::Unsupported.into())
+        }
+
+        async fn connect_udp(&self, host: Host, port: u16) -> std::io::Result<Box<dyn Datagram>> {
+            let Host::Ip(ip) = host else {
+                return Err(std::io::ErrorKind::InvalidInput.into());
+            };
+            self.connects.fetch_add(1, Ordering::Relaxed);
+            let (tx, rx) = mpsc::channel(4);
+            Ok(Box::new(EchoDatagram {
+                target: SocketAddr::new(ip, port),
+                tx,
+                rx: Mutex::new(rx),
+            }))
+        }
+    }
+
+    struct PendingOutbound {
+        pending_ip: Option<IpAddr>,
+        connects: AtomicUsize,
+        started: Arc<Notify>,
+        cancelled: Arc<AtomicUsize>,
+    }
+
+    struct CancellationGuard(Arc<AtomicUsize>);
+
+    impl Drop for CancellationGuard {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    #[async_trait]
+    impl Outbound for PendingOutbound {
+        fn name(&self) -> &'static str {
+            "Pending"
+        }
+
+        fn supports_udp(&self) -> bool {
+            true
+        }
+
+        async fn connect_tcp(
+            &self,
+            _host: Host,
+            _port: u16,
+        ) -> std::io::Result<crate::outbound::Connected> {
+            Err(std::io::ErrorKind::Unsupported.into())
+        }
+
+        async fn connect_udp(&self, host: Host, port: u16) -> std::io::Result<Box<dyn Datagram>> {
+            self.connects.fetch_add(1, Ordering::Relaxed);
+            let Host::Ip(ip) = host else {
+                return Err(std::io::ErrorKind::InvalidInput.into());
+            };
+            if self.pending_ip.is_none_or(|pending| pending == ip) {
+                let _guard = CancellationGuard(self.cancelled.clone());
+                self.started.notify_one();
+                return pending().await;
+            }
+            let (tx, rx) = mpsc::channel(4);
+            Ok(Box::new(EchoDatagram {
+                target: SocketAddr::new(ip, port),
+                tx,
+                rx: Mutex::new(rx),
+            }))
+        }
+    }
+
+    async fn reap_until_empty(egress: &mut UdpEgressSet) {
+        tokio::time::timeout(Duration::from_millis(200), async {
+            loop {
+                egress.prune();
+                if egress.routes.is_empty() {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("worker 应在测试超时内完成并被回收");
+    }
+
+    #[test]
+    fn udp_headers_round_trip_ipv4_and_ipv6() {
+        for addr in [
+            "192.0.2.1:53".parse().unwrap(),
+            "[2001:db8::1]:443".parse().unwrap(),
+        ] {
+            let encoded = encode_udp_header(addr);
+            let (decoded, header_len) = decode_udp_header(&encoded).unwrap();
+            assert_eq!(header_len, encoded.len());
+            match decoded {
+                SocketAddrOrName::Addr(actual) => assert_eq!(actual, addr),
+                SocketAddrOrName::Name(_, _) => panic!("IP header 不应解码成域名"),
+            }
+        }
+    }
+
+    #[test]
+    fn decodes_domain_udp_header() {
+        let mut encoded = vec![0, 0, 0, 3, 11];
+        encoded.extend_from_slice(b"example.com");
+        encoded.extend_from_slice(&53u16.to_be_bytes());
+        let (decoded, header_len) = decode_udp_header(&encoded).unwrap();
+        assert_eq!(header_len, encoded.len());
+        match decoded {
+            SocketAddrOrName::Name(name, port) => {
+                assert_eq!(name, "example.com");
+                assert_eq!(port, 53);
+            }
+            SocketAddrOrName::Addr(_) => panic!("域名 header 不应解码成 IP"),
+        }
+    }
+
+    #[test]
+    fn udp_source_must_match_control_ip_and_learned_port() {
+        let peer = "192.0.2.10:40000".parse().unwrap();
+        let first = "192.0.2.10:50000".parse().unwrap();
+        assert!(udp_source_allowed(peer, None, first));
+        assert!(udp_source_allowed(peer, Some(first), first));
+        assert!(!udp_source_allowed(
+            peer,
+            Some(first),
+            "192.0.2.10:50001".parse().unwrap()
+        ));
+        assert!(!udp_source_allowed(
+            peer,
+            None,
+            "192.0.2.11:50000".parse().unwrap()
+        ));
+    }
+
+    #[tokio::test]
+    async fn udp_association_routes_multiple_ipv4_and_ipv6_targets() {
+        let outbound = Arc::new(EchoOutbound {
+            connects: AtomicUsize::new(0),
+        });
+        let peer = "192.0.2.10:40000".parse().unwrap();
+        let targets = [
+            SocketAddrOrName::Addr("192.0.2.1:53".parse().unwrap()),
+            SocketAddrOrName::Addr("[2001:db8::1]:53".parse().unwrap()),
+        ];
+        let mut egress = UdpEgressSet::new();
+
+        egress.send(outbound.clone(), targets[0].clone(), b"v4", peer);
+        egress.send(outbound.clone(), targets[1].clone(), b"v6", peer);
+
+        let mut replies = HashMap::new();
+        for _ in 0..2 {
+            let reply = tokio::time::timeout(Duration::from_millis(100), egress.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            replies.insert(reply.from, reply.payload);
+        }
+        assert_eq!(replies[&"192.0.2.1:53".parse().unwrap()], b"v4");
+        assert_eq!(replies[&"[2001:db8::1]:53".parse().unwrap()], b"v6");
+        assert_eq!(outbound.connects.load(Ordering::Relaxed), 2);
+
+        egress.send(outbound.clone(), targets[0].clone(), b"again", peer);
+        let reply = tokio::time::timeout(Duration::from_millis(100), egress.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(reply.payload, b"again");
+        assert_eq!(outbound.connects.load(Ordering::Relaxed), 2);
+    }
+
+    #[tokio::test]
+    async fn completed_worker_cannot_remove_current_route() {
+        let target = SocketAddrOrName::Addr("192.0.2.1:53".parse().unwrap());
+        let mut egress = UdpEgressSet::new();
+        let (sender, _receiver) = mpsc::channel(1);
+        egress.routes.insert(target.clone(), sender);
+        egress.workers.spawn(async {});
+
+        while !egress.workers.is_empty() {
+            tokio::task::yield_now().await;
+            egress.prune();
+        }
+
+        assert!(egress.routes.contains_key(&target));
+    }
+
+    #[tokio::test]
+    async fn slow_target_establishment_does_not_block_fast_target() {
+        let slow_ip = "192.0.2.1".parse().unwrap();
+        let outbound = Arc::new(PendingOutbound {
+            pending_ip: Some(slow_ip),
+            connects: AtomicUsize::new(0),
+            started: Arc::new(Notify::new()),
+            cancelled: Arc::new(AtomicUsize::new(0)),
+        });
+        let peer = "192.0.2.10:40000".parse().unwrap();
+        let mut egress =
+            UdpEgressSet::with_timeouts(Duration::from_secs(1), Duration::from_secs(1));
+        egress.send(
+            outbound.clone(),
+            SocketAddrOrName::Addr(SocketAddr::new(slow_ip, 53)),
+            b"slow",
+            peer,
+        );
+        egress.send(
+            outbound,
+            SocketAddrOrName::Addr("192.0.2.2:53".parse().unwrap()),
+            b"fast",
+            peer,
+        );
+
+        let reply = tokio::time::timeout(Duration::from_millis(100), egress.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(reply.from, "192.0.2.2:53".parse().unwrap());
+        assert_eq!(reply.payload, b"fast");
+    }
+
+    #[tokio::test]
+    async fn establishment_timeout_releases_route_for_retry() {
+        let started = Arc::new(Notify::new());
+        let cancelled = Arc::new(AtomicUsize::new(0));
+        let outbound = Arc::new(PendingOutbound {
+            pending_ip: None,
+            connects: AtomicUsize::new(0),
+            started: started.clone(),
+            cancelled: cancelled.clone(),
+        });
+        let peer = "192.0.2.10:40000".parse().unwrap();
+        let target = SocketAddrOrName::Addr("192.0.2.1:53".parse().unwrap());
+        let mut egress =
+            UdpEgressSet::with_timeouts(Duration::from_millis(10), Duration::from_secs(1));
+
+        egress.send(outbound.clone(), target.clone(), b"first", peer);
+        tokio::time::timeout(Duration::from_millis(100), started.notified())
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        reap_until_empty(&mut egress).await;
+        assert_eq!(cancelled.load(Ordering::Relaxed), 1);
+
+        egress.send(outbound.clone(), target, b"retry", peer);
+        tokio::time::timeout(Duration::from_millis(100), started.notified())
+            .await
+            .unwrap();
+        assert_eq!(outbound.connects.load(Ordering::Relaxed), 2);
+    }
+
+    #[tokio::test]
+    async fn target_limit_rejects_sixty_fifth_route() {
+        let outbound = Arc::new(PendingOutbound {
+            pending_ip: None,
+            connects: AtomicUsize::new(0),
+            started: Arc::new(Notify::new()),
+            cancelled: Arc::new(AtomicUsize::new(0)),
+        });
+        let peer = "192.0.2.10:40000".parse().unwrap();
+        let mut egress = UdpEgressSet::new();
+
+        for offset in 0..=MAX_UDP_TARGETS_PER_ASSOCIATION {
+            egress.send(
+                outbound.clone(),
+                SocketAddrOrName::Addr(SocketAddr::new(
+                    "192.0.2.1".parse().unwrap(),
+                    10_000 + u16::try_from(offset).unwrap(),
+                )),
+                b"packet",
+                peer,
+            );
+        }
+
+        let rejected = SocketAddrOrName::Addr(SocketAddr::new(
+            "192.0.2.1".parse().unwrap(),
+            10_000 + u16::try_from(MAX_UDP_TARGETS_PER_ASSOCIATION).unwrap(),
+        ));
+        assert_eq!(egress.routes.len(), MAX_UDP_TARGETS_PER_ASSOCIATION);
+        assert_eq!(egress.workers.len(), MAX_UDP_TARGETS_PER_ASSOCIATION);
+        assert!(!egress.routes.contains_key(&rejected));
+    }
+
+    #[tokio::test]
+    async fn idle_target_is_released_and_reestablished() {
+        let outbound = Arc::new(EchoOutbound {
+            connects: AtomicUsize::new(0),
+        });
+        let peer = "192.0.2.10:40000".parse().unwrap();
+        let target = SocketAddrOrName::Addr("192.0.2.1:53".parse().unwrap());
+        let mut egress =
+            UdpEgressSet::with_timeouts(Duration::from_secs(1), Duration::from_millis(10));
+
+        egress.send(outbound.clone(), target.clone(), b"first", peer);
+        tokio::time::timeout(Duration::from_millis(100), egress.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        reap_until_empty(&mut egress).await;
+
+        egress.send(outbound.clone(), target, b"second", peer);
+        let reply = tokio::time::timeout(Duration::from_millis(100), egress.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(reply.payload, b"second");
+        assert_eq!(outbound.connects.load(Ordering::Relaxed), 2);
+    }
+
+    #[tokio::test]
+    async fn dropping_association_cancels_pending_workers() {
+        let started = Arc::new(Notify::new());
+        let cancelled = Arc::new(AtomicUsize::new(0));
+        let outbound = Arc::new(PendingOutbound {
+            pending_ip: None,
+            connects: AtomicUsize::new(0),
+            started: started.clone(),
+            cancelled: cancelled.clone(),
+        });
+        let mut egress = UdpEgressSet::new();
+        egress.send(
+            outbound,
+            SocketAddrOrName::Addr("192.0.2.1:53".parse().unwrap()),
+            b"packet",
+            "192.0.2.10:40000".parse().unwrap(),
+        );
+        tokio::time::timeout(Duration::from_millis(100), started.notified())
+            .await
+            .unwrap();
+
+        drop(egress);
+        tokio::time::timeout(Duration::from_millis(100), async {
+            while cancelled.load(Ordering::Relaxed) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+    }
 }

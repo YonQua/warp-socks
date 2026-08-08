@@ -26,9 +26,9 @@ pub struct AppConfig {
     pub enable_masque: bool,
     pub trick: Trick,
 
-    pub listen_port: u16,
-    /// 仅用于启动日志，帮助区分"宿主机入口"与"容器内监听"。
-    pub host_bind_display: String,
+    /// 逗号分隔的显式监听地址。默认只开 loopback；第一个地址同时作为内部
+    /// 健康探测入口，远端部署按实际网络传入宿主机可达的 IPv4/IPv6 地址。
+    pub listen_addrs: String,
 
     pub register_retries: u32,
     pub register_retry_delay: Duration,
@@ -66,12 +66,7 @@ impl AppConfig {
                 _ => Trick::None,
             },
 
-            listen_port: 1080,
-            host_bind_display: format!(
-                "{}:{}",
-                env_var("HOST_BIND_IP", "127.0.0.1"),
-                env_var("HOST_BIND_PORT", "1080")
-            ),
+            listen_addrs: env_var("SOCKS_LISTEN_ADDRS", "127.0.0.1:1080"),
 
             register_retries: sanitize_positive_int(
                 &env_var("WARP_SOCKS_REGISTER_RETRIES", "2"),
