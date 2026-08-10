@@ -1,6 +1,4 @@
 // 运行时环境变量解析，对应 lib/app/env.sh + normalize_runtime_tuning。
-// STATE_DIR/LISTEN_ADDR 等固定路径未做成环境变量——shell 版本里它们也不是
-// `${VAR:-default}` 形式的可覆盖项，是写死的常量。
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -47,7 +45,7 @@ pub struct AppConfig {
 impl AppConfig {
     #[must_use]
     pub fn from_env() -> Self {
-        let state_dir = PathBuf::from("/etc/warp-socks");
+        let state_dir = PathBuf::from(env_var("WARP_SOCKS_STATE_DIR", "/etc/warp-socks"));
         Self {
             wg_conf: state_dir.join("wg0.conf"),
             account_json: state_dir.join("account.json"),

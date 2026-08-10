@@ -77,6 +77,7 @@ docker exec warp-socks curl --socks5-hostname 127.0.0.1:1080 https://cloudflare.
 | 变量                      | 必填                   | 说明                                                                                               |
 | ------------------------- | ---------------------- | -------------------------------------------------------------------------------------------------- |
 | `TEAMS_TOKEN`             | 条件必填               | Cloudflare Teams registration token，只填写注册链接中 `token=` 后面的原始三段 JWT，例如 `header.payload.signature`；不能包含 `token=`、完整 URI、引号或前后空白。已有 `data/account.json` 后重启可以留空；`WARP_SOCKS_ENABLE_MASQUE=1` 且 MASQUE 注册与建隧道都成功时也不需要（纯 MASQUE 场景不会触碰 Teams 账户），只有实际需要走 WireGuard（未开启 MASQUE，或 MASQUE 失败要回退）时才会要求填写 |
+| `WARP_SOCKS_STATE_DIR`    | `/etc/warp-socks`      | 状态目录；`wg0.conf`、`account.json`、`endpoint-state.json` 和 `reg.json` 都相对此目录读写 |
 | `SOCKS_LISTEN_ADDRS`    | 否                     | 默认 `auto`：自动监听 IPv4/IPv6，只允许 loopback、RFC1918 IPv4、ULA/link-local IPv6 客户端；也可填写逗号分隔的显式地址列表 |
 | `SOCKS_LISTEN_PORT`     | 否                     | `auto` 模式的监听端口，默认 `1080`；显式地址列表模式忽略此项 |
 | `ENDPOINT_CANDIDATES`   | 否                     | 手工覆盖 endpoint 列表；留空时使用项目内置候选池                                                   |
@@ -139,7 +140,7 @@ WARP_SOCKS_HEALTHCHECK_FAILURE_THRESHOLD=2
 
 生产环境不建议只填写一个 endpoint；单候选会让运行期自愈没有可切换目标。通常保持为空即可。
 
-运行期单次 healthcheck 失败默认只累计计数，不立即切换 endpoint，避免短时拥塞打断仍在工作的连接。WireGuard 会记录当前 netstack 代际的业务包、已认证回包、outer UDP 收发、下游丢包和 BoringTun session 统计；业务发送后连续 10 秒没有认证业务回包时只输出一次诊断快照，同一代际恢复时再输出一次恢复快照，不会仅凭日志事件切换 endpoint。只有真实 SOCKS 探测已完整等待 10 秒仍失败，并且这段时间没有认证业务回包时，才会提前建立新 endpoint generation 并复测。否则等连续失败达到阈值后再自愈。新 generation 完成握手后会原子替换当前网络栈并立即终止旧 generation：WireGuard 同一 peer 只能有一个有效 endpoint，保留旧 outer UDP socket 排空会触发 endpoint roaming 竞争。已有连接会失败并由客户端重试，不承诺跨代际迁移。自愈和复测仍失败且达到阈值才退出进程，交给 Docker 重启。容器重启后，启动链会优先尝试最近一次成功的 endpoint，并把进入冷却的 endpoint 排到后面。内部恢复状态会持久化到 `./data/endpoint-state.json`。
+运行期单次 healthcheck 失败默认只累计计数，不立即切换 endpoint，避免短时拥塞打断仍在工作的连接。WireGuard 只在近期持续发送业务包，且认证回包与 outer UDP 回包都静默 10 秒时，限频替换同 endpoint 的 UDP socket 并重握手；原 BoringTun 状态机实例和 smoltcp generation 继续使用，session/key 由 BoringTun 正常轮换。若仍未恢复，则继续使用原有健康检查与 endpoint generation 切换路径。新 generation 完成握手后会原子替换当前网络栈并立即终止旧 generation；已有连接由客户端重试。容器重启后优先尝试最近成功的 endpoint，内部状态保存在 `./data/endpoint-state.json`。
 
 启动阶段会按顺序逐个尝试候选，单个候选最坏耗时约为 `WARP_SOCKS_STARTUP_SOCKS_READY_TIMEOUT` 秒；默认候选池 8 个时，全部失败的最坏总耗时约 `8 × 20s ≈ 160` 秒，之后由 Docker 按 `RESTART_POLICY` 重启容器重试。这段等待期间容器还没有标记 runtime ready，healthcheck 不会介入，不会被误判为不健康。
 

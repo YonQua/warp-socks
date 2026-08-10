@@ -48,6 +48,7 @@ const OUTER_RX_BURST_SIZE: usize = 64;
 const STALL_DIAGNOSTIC_AFTER: Duration = Duration::from_secs(10);
 const STALL_DIAGNOSTIC_INTERVAL: Duration = Duration::from_secs(10);
 const STALL_ACTIVE_TX_WINDOW: Duration = Duration::from_secs(2);
+const OUTER_UDP_REBIND_COOLDOWN: Duration = Duration::from_secs(30);
 const DECAP_ERROR_REPORT_INTERVAL: Duration = Duration::from_secs(10);
 static NEXT_GENERATION_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -299,6 +300,14 @@ fn has_recent_business_tx(last_business_tx_age: Option<Duration>, active_window:
     last_business_tx_age.is_some_and(|age| age <= active_window)
 }
 
+fn confirmed_outer_stall(
+    authenticated_stall: Option<Duration>,
+    outer_rx_silent_for: Duration,
+    threshold: Duration,
+) -> Option<Duration> {
+    authenticated_stall.filter(|_| outer_rx_silent_for >= threshold)
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Trick {
     None,
@@ -315,6 +324,7 @@ pub struct WgTunnel {
     endpoint: SocketAddr,
     generation_id: u64,
     decap_errors: DecapErrorTracker,
+    last_outer_udp_rebind_at: Option<Instant>,
 }
 
 /// smoltcp 看到的异步 packet device。WireGuard 状态机和 outer UDP socket
@@ -347,6 +357,7 @@ impl WgTunnel {
             endpoint: config.endpoint,
             generation_id: NEXT_GENERATION_ID.fetch_add(1, Ordering::Relaxed),
             decap_errors: DecapErrorTracker::default(),
+            last_outer_udp_rebind_at: None,
         })
     }
 
@@ -493,21 +504,26 @@ impl WgTunnel {
                 }
                 _ = timer.tick() => self.tick().await?,
             }
-            self.observe_stall(&mut stall_tracker);
+            self.observe_stall(&mut stall_tracker).await;
         }
     }
 
-    fn observe_stall(&self, tracker: &mut StallTracker) {
+    async fn observe_stall(&mut self, tracker: &mut StallTracker) {
         let now = self.activity.started_at.elapsed();
         let snapshot = self.activity.snapshot();
         if !has_recent_business_tx(snapshot.last_business_tx_age, STALL_ACTIVE_TX_WINDOW) {
             tracker.clear();
             return;
         }
-        let stalled_for = self.activity.stalled_for(STALL_DIAGNOSTIC_AFTER);
+        let stalled_for = confirmed_outer_stall(
+            self.activity.stalled_for(STALL_DIAGNOSTIC_AFTER),
+            snapshot.outer_rx_silent_for,
+            STALL_DIAGNOSTIC_AFTER,
+        );
         let Some(event) = tracker.observe(now, stalled_for) else {
             return;
         };
+        let should_rebind = matches!(event, StallEvent::Started { .. });
         let (handshake_age, tx_bytes, rx_bytes, loss, handshake_rtt_ms) = self.tunn.stats();
         match event {
             StallEvent::Started { silent_for } | StallEvent::Ongoing { silent_for } => log::warn!(
@@ -530,7 +546,7 @@ impl WgTunnel {
                 handshake_rtt_ms,
             ),
             StallEvent::Recovered { stalled_for } => log::info!(
-                "WireGuard 数据面恢复: endpoint={}, generation={}, stalled_for={:?}, recovered_by=same_generation, business_tx={}, authenticated_rx={}, outer_tx={}, outer_rx={}, netstack_rx_dropped={}",
+                "WireGuard 数据面恢复: endpoint={}, generation={}, stalled_for={:?}, business_tx={}, authenticated_rx={}, outer_tx={}, outer_rx={}, netstack_rx_dropped={}",
                 self.endpoint,
                 self.generation_id,
                 stalled_for,
@@ -541,6 +557,64 @@ impl WgTunnel {
                 snapshot.netstack_rx_dropped,
             ),
         }
+
+        if should_rebind {
+            self.rebind_outer_udp().await;
+        }
+    }
+
+    async fn rebind_outer_udp(&mut self) {
+        let now = Instant::now();
+        if self
+            .last_outer_udp_rebind_at
+            .is_some_and(|last| now.saturating_duration_since(last) < OUTER_UDP_REBIND_COOLDOWN)
+        {
+            return;
+        }
+        self.last_outer_udp_rebind_at = Some(now);
+
+        let previous_local = self.sock.local_addr().ok();
+        let new_sock = match outer_udp_socket(self.endpoint) {
+            Ok(sock) => sock,
+            Err(error) => {
+                log::warn!(
+                    "WireGuard outer UDP rebind 创建失败: endpoint={}, generation={}, previous_local={previous_local:?}, error={error:#}",
+                    self.endpoint,
+                    self.generation_id,
+                );
+                return;
+            }
+        };
+        let current_local = new_sock.local_addr().ok();
+        let mut buf = [0u8; PACKET_BUF];
+        let packet = match self.tunn.format_handshake_initiation(&mut buf, true) {
+            TunnResult::WriteToNetwork(packet) => packet,
+            other => {
+                log::warn!(
+                    "WireGuard outer UDP rebind 重握手失败: endpoint={}, generation={}, result={other:?}",
+                    self.endpoint,
+                    self.generation_id,
+                );
+                return;
+            }
+        };
+        self.patch_reserved(packet);
+        if let Err(error) = new_sock.send(packet).await {
+            log::warn!(
+                "WireGuard outer UDP rebind 发送失败: endpoint={}, generation={}, current_local={current_local:?}, error={error}",
+                self.endpoint,
+                self.generation_id,
+            );
+            return;
+        }
+
+        self.activity.mark_outer_tx();
+        self.sock = new_sock;
+        log::warn!(
+            "WireGuard outer UDP 已重绑: endpoint={}, generation={}, previous_local={previous_local:?}, current_local={current_local:?}",
+            self.endpoint,
+            self.generation_id,
+        );
     }
 
     async fn send_plaintext(&mut self, packet: &[u8]) -> io::Result<()> {
@@ -837,6 +911,21 @@ mod tests {
             active_window
         ));
         assert!(!has_recent_business_tx(None, active_window));
+    }
+
+    #[test]
+    fn outer_rebind_requires_both_authenticated_and_outer_rx_silence() {
+        let threshold = Duration::from_secs(10);
+
+        assert_eq!(
+            confirmed_outer_stall(Some(threshold), Duration::from_secs(9), threshold),
+            None
+        );
+        assert_eq!(confirmed_outer_stall(None, threshold, threshold), None);
+        assert_eq!(
+            confirmed_outer_stall(Some(threshold), threshold, threshold),
+            Some(threshold)
+        );
     }
 
     #[test]

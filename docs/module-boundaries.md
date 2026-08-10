@@ -18,7 +18,7 @@
 
 ## 状态文件
 
-以下路径均相对宿主机 bind mount 目录（compose.yaml 里约定叫 `./data`，容器内挂载点是 `/etc/warp-socks`——都不再叫 wireguard，因为这个目录现在同时存 WireGuard 和 MASQUE 两套状态，见 `reg.json`）。
+以下路径均相对状态目录。默认 compose.yaml 把宿主机 `./data` 挂载到容器内 `/etc/warp-socks`；原生运行可用 `WARP_SOCKS_STATE_DIR` 指向同一个 `data` 目录。这个目录同时保存 WireGuard 和 MASQUE 两套状态，见 `reg.json`。
 
 - `data/account.json`
   - Teams 注册结果
@@ -68,7 +68,7 @@
   - boringtun `Tunn` 状态机的 I/O 驱动：UDP 收发、reserved bytes 覆写/清零、可选 t1/t2 反审查伪装包、握手与重传定时器
   - BoringTun 状态机、outer UDP 和 timer 由单个 transport task 持有；smoltcp 与 transport 之间使用 1024 包有界通道。发送方按背压等待，解密队列满时丢弃 IP 包并计数，确保 outer UDP 接收、握手和 timer 不等待下游 netstack
   - netstack 有限发送批次使用 `feed + flush`，不关闭长寿命 packet sink；outer UDP socket 显式申请 4 MiB 收发缓冲并记录内核实际值
-  - 同一 transport task 维护诊断型 stall lifecycle：业务 TX 后 10 秒无已认证 RX 时记录限频快照，恢复时记录同 generation 的停滞总时长；控制包只计 outer RX，不会冒充业务恢复，也不会直接触发 endpoint 切换
+  - 同一 transport task 在近期业务 TX 持续发生，且认证 RX 与 outer UDP RX 同时静默 10 秒时，限频重绑同 endpoint UDP socket 并强制重握手；保留 BoringTun 状态机实例与 smoltcp generation，session/key 由 BoringTun 正常轮换，失败继续交给上层健康路径
 
 - `src/config.rs`
   - 解析 `wg0.conf`
