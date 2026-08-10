@@ -1,6 +1,5 @@
-// “简单错误恢复策略”：连续失败达到阈值就请求退出进程，不在进程内做候选
-// 轮换/重试状态机，交给 Docker `restart: unless-stopped` 重新拉起容器。
-// 对应 lib/runtime/recovery.sh: warp_healthcheck_main 里的阈值判定部分。
+// “简单错误恢复策略”：这里只判断连续失败是否达到阈值；具体选择后端自愈
+// 或退出进程由 supervisor 统一编排，避免单次瞬时拥塞触发破坏性重连。
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RecoveryAction {

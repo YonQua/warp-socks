@@ -14,11 +14,12 @@
 
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::sync::{LazyLock, Mutex};
+use std::sync::LazyLock;
 use std::time::{Duration, Instant};
 
 use crate::netstack::Net;
 use anyhow::{bail, Context, Result};
+use parking_lot::Mutex;
 use rand::Rng;
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -28,7 +29,7 @@ pub enum RecordType {
 }
 
 impl RecordType {
-    fn qtype(self) -> u16 {
+    pub(crate) fn qtype(self) -> u16 {
         match self {
             RecordType::A => 1,
             RecordType::Aaaa => 28,
@@ -53,7 +54,7 @@ static CACHE: LazyLock<Mutex<HashMap<(String, RecordType), CacheEntry>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
 fn cache_get(key: &(String, RecordType)) -> Option<Vec<IpAddr>> {
-    let cache = CACHE.lock().unwrap();
+    let cache = CACHE.lock();
     let entry = cache.get(key)?;
     (entry.expires_at > Instant::now()).then(|| entry.addrs.clone())
 }
@@ -62,10 +63,13 @@ fn cache_get(key: &(String, RecordType)) -> Option<Vec<IpAddr>> {
 // 有限的场景下（个人/小规模代理）这个上限基本不会被触及。
 fn cache_put(key: (String, RecordType), addrs: Vec<IpAddr>, ttl_secs: u32) {
     let ttl = Duration::from_secs(ttl_secs as u64).clamp(CACHE_MIN_TTL, CACHE_MAX_TTL);
-    let mut cache = CACHE.lock().unwrap();
-    if cache.len() > 500 {
+    let mut cache = CACHE.lock();
+    if cache.len() >= 512 {
         let now = Instant::now();
         cache.retain(|_, e| e.expires_at > now);
+        if cache.len() >= 512 {
+            cache.clear();
+        }
     }
     cache.insert(
         key,
@@ -76,22 +80,29 @@ fn cache_put(key: (String, RecordType), addrs: Vec<IpAddr>, ttl_secs: u32) {
     );
 }
 
-fn encode_dns_query(id: u16, name: &str, qtype: u16) -> Vec<u8> {
+pub(crate) fn encode_dns_query(id: u16, name: &str, record_type: RecordType) -> Result<Vec<u8>> {
     let mut msg = Vec::with_capacity(64);
     msg.extend_from_slice(&id.to_be_bytes());
     msg.extend_from_slice(&0x0100u16.to_be_bytes()); // flags: RD=1
     msg.extend_from_slice(&1u16.to_be_bytes()); // QDCOUNT
     msg.extend_from_slice(&[0u8; 6]); // AN/NS/AR COUNT
 
-    for label in name.trim_end_matches('.').split('.') {
+    let name = name.trim_end_matches('.');
+    if name.is_empty() || name.len() > 253 {
+        bail!("DNS 域名长度非法: {name:?}");
+    }
+    for label in name.split('.') {
+        if label.is_empty() || label.len() > 63 {
+            bail!("DNS 域名标签长度非法: {label:?}");
+        }
         msg.push(label.len() as u8);
         msg.extend_from_slice(label.as_bytes());
     }
     msg.push(0); // root
 
-    msg.extend_from_slice(&qtype.to_be_bytes());
+    msg.extend_from_slice(&record_type.qtype().to_be_bytes());
     msg.extend_from_slice(&1u16.to_be_bytes()); // QCLASS IN
-    msg
+    Ok(msg)
 }
 
 // 跳过一个 DNS name 字段（label 序列或压缩指针），返回紧随其后的位置。
@@ -117,7 +128,11 @@ fn skip_name(buf: &[u8], mut pos: usize) -> Result<usize> {
 
 // 返回解析出的地址，以及这些地址里最小的 TTL（秒，供 resolve() 决定缓存
 // 多久；没有任何 A/AAAA 记录时无意义，调用方会先检查 addrs 是否为空）。
-fn parse_dns_response(buf: &[u8], expected_id: u16) -> Result<(Vec<IpAddr>, u32)> {
+pub(crate) fn parse_dns_response(
+    buf: &[u8],
+    expected_id: u16,
+    record_type: RecordType,
+) -> Result<(Vec<IpAddr>, u32)> {
     if buf.len() < 12 {
         bail!("DNS 响应过短: {} 字节", buf.len());
     }
@@ -125,12 +140,27 @@ fn parse_dns_response(buf: &[u8], expected_id: u16) -> Result<(Vec<IpAddr>, u32)
     if id != expected_id {
         bail!("DNS 响应 ID 不匹配: 期望 {expected_id}, 实际 {id}");
     }
+    let flags = u16::from_be_bytes([buf[2], buf[3]]);
+    if flags & 0x8000 == 0 {
+        bail!("DNS 报文不是响应");
+    }
+    if flags & 0x0200 != 0 {
+        bail!("DNS UDP 响应被截断");
+    }
+    match flags & 0x000f {
+        0 => {}
+        3 => bail!("DNS 域名不存在（NXDOMAIN）"),
+        rcode => bail!("DNS 服务返回错误 RCODE={rcode}"),
+    }
     let qdcount = u16::from_be_bytes([buf[4], buf[5]]) as usize;
     let ancount = u16::from_be_bytes([buf[6], buf[7]]) as usize;
 
     let mut pos = 12;
     for _ in 0..qdcount {
         pos = skip_name(buf, pos)?;
+        if pos + 4 > buf.len() {
+            bail!("DNS 响应越界: question 不完整");
+        }
         pos += 4; // QTYPE + QCLASS
     }
 
@@ -148,8 +178,8 @@ fn parse_dns_response(buf: &[u8], expected_id: u16) -> Result<(Vec<IpAddr>, u32)
         if pos + rdlength > buf.len() {
             bail!("DNS 响应越界: rdata 不完整");
         }
-        match (rtype, rdlength) {
-            (1, 4) => {
+        match (record_type, rtype, rdlength) {
+            (RecordType::A, 1, 4) => {
                 addrs.push(IpAddr::V4(Ipv4Addr::new(
                     buf[pos],
                     buf[pos + 1],
@@ -158,8 +188,9 @@ fn parse_dns_response(buf: &[u8], expected_id: u16) -> Result<(Vec<IpAddr>, u32)
                 )));
                 min_ttl = min_ttl.min(ttl);
             }
-            (28, 16) => {
-                let octets: [u8; 16] = buf[pos..pos + 16].try_into().unwrap();
+            (RecordType::Aaaa, 28, 16) => {
+                let mut octets = [0u8; 16];
+                octets.copy_from_slice(&buf[pos..pos + 16]);
                 addrs.push(IpAddr::V6(Ipv6Addr::from(octets)));
                 min_ttl = min_ttl.min(ttl);
             }
@@ -185,10 +216,10 @@ pub async fn resolve(
     }
 
     let query_id: u16 = rand::thread_rng().gen();
-    let query = encode_dns_query(query_id, name, record_type.qtype());
+    let query = encode_dns_query(query_id, name, record_type)?;
 
     let sock = net
-        .udp_bind("0.0.0.0:0".parse().unwrap())
+        .udp_bind(SocketAddr::from(([0, 0, 0, 0], 0)))
         .await
         .context("绑定隧道内 UDP socket 失败")?;
     sock.send_to(&query, dns_server)
@@ -211,12 +242,17 @@ pub async fn resolve(
         let wait = remaining.min(RETRY_INTERVAL);
         match tokio::time::timeout(wait, sock.recv_from(&mut buf)).await {
             Ok(Ok((n, from))) if from == dns_server => {
-                if let Ok((addrs, ttl)) = parse_dns_response(&buf[..n], query_id) {
-                    if !addrs.is_empty() {
-                        cache_put(cache_key, addrs.clone(), ttl);
-                        return Ok(addrs);
-                    }
-                }
+                let (addrs, ttl) = parse_dns_response(&buf[..n], query_id, record_type)
+                    .context("解析隧道内 DNS 响应失败")?;
+                // NOERROR/NODATA 是完整的否定答案，不是丢包。短暂缓存可避免
+                // IPv6-only 域名的每条连接都重复查询不存在的 A 记录。
+                let cache_ttl = if addrs.is_empty() {
+                    CACHE_MIN_TTL.as_secs() as u32
+                } else {
+                    ttl
+                };
+                cache_put(cache_key, addrs.clone(), cache_ttl);
+                return Ok(addrs);
             }
             Ok(Ok(_)) => continue, // 非期望来源，丢弃继续等
             Ok(Err(e)) => return Err(e).context("隧道内 UDP 接收失败"),
@@ -229,5 +265,59 @@ pub async fn resolve(
                     .context("重发 DNS 查询失败")?;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn response(id: u16, flags: u16, answers: &[u8], answer_count: u16) -> Vec<u8> {
+        let mut packet = Vec::new();
+        packet.extend_from_slice(&id.to_be_bytes());
+        packet.extend_from_slice(&flags.to_be_bytes());
+        packet.extend_from_slice(&0u16.to_be_bytes()); // QDCOUNT
+        packet.extend_from_slice(&answer_count.to_be_bytes());
+        packet.extend_from_slice(&0u16.to_be_bytes()); // NSCOUNT
+        packet.extend_from_slice(&0u16.to_be_bytes()); // ARCOUNT
+        packet.extend_from_slice(answers);
+        packet
+    }
+
+    #[test]
+    fn nodata_is_a_successful_empty_answer() {
+        let packet = response(0x1234, 0x8180, &[], 0);
+        let (addrs, _) = parse_dns_response(&packet, 0x1234, RecordType::A).unwrap();
+        assert!(addrs.is_empty());
+    }
+
+    #[test]
+    fn nxdomain_is_reported_without_waiting_for_timeout() {
+        let packet = response(0x1234, 0x8183, &[], 0);
+        let error = parse_dns_response(&packet, 0x1234, RecordType::A).unwrap_err();
+        assert!(error.to_string().contains("NXDOMAIN"));
+    }
+
+    #[test]
+    fn parses_aaaa_answer() {
+        let expected = Ipv6Addr::new(0x2607, 0xf2d8, 1, 0x3c, 0, 0, 0, 4);
+        let mut answer = vec![0, 0, 28, 0, 1]; // root name, AAAA, IN
+        answer.extend_from_slice(&300u32.to_be_bytes());
+        answer.extend_from_slice(&16u16.to_be_bytes());
+        answer.extend_from_slice(&expected.octets());
+        let packet = response(0x1234, 0x8180, &answer, 1);
+
+        let (addrs, ttl) = parse_dns_response(&packet, 0x1234, RecordType::Aaaa).unwrap();
+        assert_eq!(addrs, vec![IpAddr::V6(expected)]);
+        assert_eq!(ttl, 300);
+    }
+
+    #[test]
+    fn query_rejects_invalid_labels() {
+        assert!(encode_dns_query(0, "", RecordType::A).is_err());
+        assert!(encode_dns_query(0, "bad..example", RecordType::A).is_err());
+        assert!(
+            encode_dns_query(0, &format!("{}.example", "a".repeat(64)), RecordType::A).is_err()
+        );
     }
 }

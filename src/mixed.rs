@@ -4,12 +4,13 @@
 // bufio.Reader。
 
 use std::io;
-use std::net::SocketAddr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
 use log::{error, warn};
+use socket2::{Domain, Protocol, Socket, Type};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Semaphore;
 
@@ -33,21 +34,22 @@ const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_secs(1);
 // healthcheck_interval 同类处理：固定常量，不做成环境变量。
 const MAX_CONNECTIONS: usize = 4096;
 
-pub async fn serve(outbound: Arc<dyn Outbound>, listen_addrs: Vec<SocketAddr>) -> Result<()> {
+#[derive(Clone, Debug)]
+pub enum ListenMode {
+    Auto { port: u16 },
+    Explicit(Vec<SocketAddr>),
+}
+
+pub async fn serve(outbound: Arc<dyn Outbound>, mode: ListenMode) -> Result<()> {
     let permits = Arc::new(Semaphore::new(MAX_CONNECTIONS));
-    let mut listeners = Vec::with_capacity(listen_addrs.len());
-    for listen_addr in listen_addrs {
-        let listener = TcpListener::bind(listen_addr)
-            .await
-            .with_context(|| format!("监听 {listen_addr} 失败"))?;
-        listeners.push((listen_addr, listener));
-    }
+    let listeners = bind_listeners(mode).await?;
 
     let mut tasks = tokio::task::JoinSet::new();
-    for (listen_addr, listener) in listeners {
+    for (listen_addr, listener, lan_only) in listeners {
         tasks.spawn(accept_loop(
             listener,
             listen_addr,
+            lan_only,
             Arc::clone(&outbound),
             Arc::clone(&permits),
         ));
@@ -59,9 +61,56 @@ pub async fn serve(outbound: Arc<dyn Outbound>, listen_addrs: Vec<SocketAddr>) -
     }
 }
 
+async fn bind_listeners(mode: ListenMode) -> Result<Vec<(SocketAddr, TcpListener, bool)>> {
+    match mode {
+        ListenMode::Auto { port } => {
+            let v4 = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), port);
+            let v6 = SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), port);
+            Ok(vec![
+                (v4, bind_socket(v4, false)?, true),
+                (v6, bind_socket(v6, true)?, true),
+            ])
+        }
+        ListenMode::Explicit(addrs) => {
+            let mut listeners = Vec::with_capacity(addrs.len());
+            for addr in addrs {
+                let listener = TcpListener::bind(addr)
+                    .await
+                    .with_context(|| format!("监听 {addr} 失败"))?;
+                listeners.push((addr, listener, false));
+            }
+            Ok(listeners)
+        }
+    }
+}
+
+fn bind_socket(addr: SocketAddr, only_v6: bool) -> Result<TcpListener> {
+    let socket = listener_socket(addr, only_v6)?;
+    let listener = std::net::TcpListener::from(socket);
+    TcpListener::from_std(listener).with_context(|| format!("监听 {addr} 失败"))
+}
+
+fn listener_socket(addr: SocketAddr, only_v6: bool) -> Result<Socket> {
+    let domain = if addr.is_ipv4() {
+        Domain::IPV4
+    } else {
+        Domain::IPV6
+    };
+    let socket = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))?;
+    socket.set_reuse_address(true)?;
+    if addr.is_ipv6() {
+        socket.set_only_v6(only_v6)?;
+    }
+    socket.bind(&addr.into())?;
+    socket.listen(1024)?;
+    socket.set_nonblocking(true)?;
+    Ok(socket)
+}
+
 async fn accept_loop(
     listener: TcpListener,
     listen_addr: SocketAddr,
+    lan_only: bool,
     outbound: Arc<dyn Outbound>,
     permits: Arc<Semaphore>,
 ) -> Result<()> {
@@ -93,6 +142,10 @@ async fn accept_loop(
                 continue;
             }
         };
+        if lan_only && !is_lan_address(peer.ip()) {
+            warn!("自动监听拒绝非 LAN 客户端: {peer}");
+            continue;
+        }
         let outbound = outbound.clone();
         tokio::spawn(async move {
             let _permit = permit;
@@ -100,6 +153,15 @@ async fn accept_loop(
                 warn!("连接 {peer} 处理失败: {e:#}");
             }
         });
+    }
+}
+
+fn is_lan_address(addr: IpAddr) -> bool {
+    match addr {
+        IpAddr::V4(addr) => addr.is_loopback() || addr.is_private() || addr.is_link_local(),
+        IpAddr::V6(addr) => {
+            addr.is_loopback() || addr.is_unique_local() || addr.is_unicast_link_local()
+        }
     }
 }
 
@@ -126,5 +188,33 @@ async fn dispatch(client: TcpStream, peer: SocketAddr, outbound: Arc<dyn Outboun
         0x05 => socks5::handle_client(client, peer, outbound).await,
         0x04 => socks4::handle_client(client, peer, &*outbound).await,
         _ => http_proxy::handle_client(client, peer, &*outbound).await,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn auto_mode_accepts_only_local_and_lan_addresses() {
+        for addr in [
+            "127.0.0.1",
+            "10.10.10.2",
+            "192.168.1.2",
+            "::1",
+            "fd00::2",
+            "fe80::2",
+        ] {
+            assert!(is_lan_address(addr.parse().unwrap()), "{addr}");
+        }
+        for addr in ["1.1.1.1", "8.8.8.8", "2606:4700:4700::1111"] {
+            assert!(!is_lan_address(addr.parse().unwrap()), "{addr}");
+        }
+    }
+
+    #[test]
+    fn auto_ipv6_listener_is_v6_only() {
+        let socket = listener_socket("[::]:0".parse().unwrap(), true).unwrap();
+        assert!(socket.only_v6().unwrap());
     }
 }

@@ -3,10 +3,11 @@
 // 分配的隧道内地址），翻译自 lib/domain/account.sh: account_register_via_teams。
 //
 // 与 registration::masque 的两步 MASQUE 注册是两条独立的注册流程：这里产出
-// 的 WgAccount 走 WireGuard 隧道（config.rs::parse_wg_conf 消费的 wg0.conf），
-// masque 产出的 RegCredentials 走 MASQUE over QUIC/H3。
+// 的 WgAccount 直接构造内存 WgConfig，成功后再写 wg0.conf 审计快照；masque
+// 产出的 RegCredentials 走 MASQUE over QUIC/H3。
 
 use std::fs;
+use std::net::ToSocketAddrs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -18,6 +19,7 @@ use rand::rngs::OsRng;
 use serde::{Deserialize, Serialize};
 
 use crate::fsutil::restrict_to_owner;
+use crate::{config::decode_key, config::WgConfig};
 
 const REGISTER_URL: &str = "https://api.cloudflareclient.com/v0a2158/reg";
 const CF_CLIENT_VERSION: &str = "a-6.10-2158";
@@ -125,10 +127,7 @@ impl TeamsRegistrar {
     /// # Errors
     /// 注册流程中的网络请求、解析或密钥生成失败时返回错误。
     pub async fn register(&self) -> Result<WgAccount> {
-        let raw_token = normalize_token(&self.token);
-        if raw_token.is_empty() {
-            bail!("必须提供 TEAMS_TOKEN。");
-        }
+        let raw_token = parse_token(&self.token)?;
 
         let secret = boringtun::x25519::StaticSecret::random_from_rng(OsRng);
         let public = boringtun::x25519::PublicKey::from(&secret);
@@ -157,7 +156,7 @@ impl TeamsRegistrar {
                 .post(REGISTER_URL)
                 .header("User-Agent", "okhttp/3.12.1")
                 .header("CF-Client-Version", CF_CLIENT_VERSION)
-                .header("Cf-Access-Jwt-Assertion", &raw_token)
+                .header("Cf-Access-Jwt-Assertion", raw_token)
                 .json(&req_body)
                 .send()
                 .await;
@@ -231,20 +230,34 @@ fn http_client() -> Result<reqwest::Client> {
         .context("构造 HTTP 客户端失败")
 }
 
-/// 去掉 `com.cloudflare.warp://...token=...` 包装，只保留 token 本体。
-fn normalize_token(raw: &str) -> String {
-    let trimmed = raw.trim();
-    if !trimmed.starts_with("com.cloudflare.warp://") || !trimmed.contains("token=") {
-        return trimmed.to_string();
+/// 校验 `TEAMS_TOKEN` 是从注册链接 `token=` 参数中提取的原始 JWT。
+fn parse_token(raw: &str) -> Result<&str> {
+    if raw.is_empty() {
+        bail!("必须提供 TEAMS_TOKEN。");
     }
-    let Some(idx) = trimmed.rfind("token=") else {
-        return trimmed.to_string();
+    if raw != raw.trim() {
+        bail!("TEAMS_TOKEN 不能包含前后空白。");
+    }
+    if raw.contains("token=") || raw.starts_with("com.cloudflare.warp://") {
+        bail!("TEAMS_TOKEN 只接受 token= 后面的原始 JWT，不能填写完整注册链接。");
+    }
+    let mut parts = raw.split('.');
+    let valid_part = |part: Option<&str>| {
+        part.is_some_and(|part| {
+            !part.is_empty()
+                && part
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+        })
     };
-    let after_token = &trimmed[idx + "token=".len()..];
-    match after_token.find('&') {
-        Some(end) => after_token[..end].to_string(),
-        None => after_token.to_string(),
+    if !valid_part(parts.next())
+        || !valid_part(parts.next())
+        || !valid_part(parts.next())
+        || parts.next().is_some()
+    {
+        bail!("TEAMS_TOKEN 格式无效：应为 token= 后面的三段 JWT。");
     }
+    Ok(raw)
 }
 
 fn random_alnum(len: usize) -> String {
@@ -291,34 +304,11 @@ fn reserved_bytes(client_id: &str) -> [u8; 3] {
     reserved
 }
 
-fn ensure_v4_cidr(addr: &str) -> String {
-    if addr.contains('/') {
-        addr.to_string()
-    } else {
-        format!("{addr}/32")
-    }
-}
-
-fn ensure_v6_cidr(addr: &str) -> String {
-    if addr.contains('/') {
-        addr.to_string()
-    } else {
-        format!("{addr}/128")
-    }
-}
-
-/// 从 [`WgAccount`] 生成 wg0.conf 并写入指定路径，对应
-/// lib/domain/wireguard.sh: write_wg_config + build_wg_config_from_account。
-/// DNS/MTU/PersistentKeepalive 不写在这里，隧道实现固定用等价的值（见
-/// config.rs 头部注释）。
+/// 从账户和选定 endpoint 构造运行期 WireGuard 配置。
 ///
 /// # Errors
-/// 账户信息缺少必要字段、或写入文件失败时返回错误。
-pub fn write_wg_conf(
-    account: &WgAccount,
-    endpoint_override: Option<&str>,
-    path: &Path,
-) -> Result<()> {
+/// 账户字段缺失、密钥/地址或 endpoint 无效时返回错误。
+pub fn build_wg_config(account: &WgAccount, endpoint_override: Option<&str>) -> Result<WgConfig> {
     if account.private_key.is_empty() {
         bail!("WireGuard 配置缺少 PrivateKey。");
     }
@@ -350,7 +340,39 @@ pub fn write_wg_conf(
             }
         });
 
-    let reserved = reserved_bytes(&account.config.client_id);
+    let endpoint = endpoint_host
+        .to_socket_addrs()
+        .with_context(|| format!("Endpoint 解析失败: {endpoint_host}"))?
+        .next()
+        .with_context(|| format!("Endpoint 无法解析为地址: {endpoint_host}"))?;
+    let address_v4 = address_v4
+        .split('/')
+        .next()
+        .and_then(|value| value.parse().ok())
+        .context("账户 IPv4 地址无效")?;
+    let address_v6 = address_v6
+        .split('/')
+        .next()
+        .and_then(|value| value.parse().ok())
+        .context("账户 IPv6 地址无效")?;
+
+    Ok(WgConfig {
+        private_key: decode_key(&account.private_key)?,
+        peer_public_key: decode_key(&peer.public_key)?,
+        endpoint,
+        reserved: reserved_bytes(&account.config.client_id),
+        address_v4,
+        address_v6,
+    })
+}
+
+/// 将已验证的运行期配置写成可审计的 wg0.conf 快照。
+///
+/// # Errors
+/// 写入失败时返回错误。
+pub fn write_wg_conf(config: &WgConfig, path: &Path) -> Result<()> {
+    let private_key = STANDARD.encode(config.private_key);
+    let peer_public_key = STANDARD.encode(config.peer_public_key);
     let text = format!(
         "[Interface]\n\
          PrivateKey = {}\n\
@@ -362,14 +384,14 @@ pub fn write_wg_conf(
          AllowedIPs = 0.0.0.0/0,::/0\n\
          Endpoint = {}\n\
          Reserved = {},{},{}\n",
-        account.private_key,
-        ensure_v4_cidr(address_v4),
-        ensure_v6_cidr(address_v6),
-        peer.public_key,
-        endpoint_host,
-        reserved[0],
-        reserved[1],
-        reserved[2],
+        private_key,
+        format_args!("{}/32", config.address_v4),
+        format_args!("{}/128", config.address_v6),
+        peer_public_key,
+        config.endpoint,
+        config.reserved[0],
+        config.reserved[1],
+        config.reserved[2],
     );
 
     fs::write(path, text).with_context(|| format!("写入 {} 失败", path.display()))?;
@@ -382,15 +404,20 @@ mod tests {
     use super::*;
 
     #[test]
-    fn normalize_token_strips_uri_wrapper() {
+    fn parse_token_accepts_only_raw_jwt() {
         assert_eq!(
-            normalize_token("com.cloudflare.warp://register?token=abc123&other=1"),
-            "abc123"
+            parse_token("header.payload.signature").unwrap(),
+            "header.payload.signature"
         );
-        assert_eq!(normalize_token("plain-token"), "plain-token");
-        assert_eq!(
-            normalize_token("com.cloudflare.warp://register?token=abc123"),
-            "abc123"
+        assert_eq!(parse_token("a-b.c_d.012").unwrap(), "a-b.c_d.012");
+        assert!(parse_token("").is_err());
+        assert!(parse_token(" header.payload.signature ").is_err());
+        assert!(parse_token("\"header.payload.signature\"").is_err());
+        assert!(parse_token("plain-token").is_err());
+        assert!(parse_token("header.payload").is_err());
+        assert!(parse_token("header.payload.signature.extra").is_err());
+        assert!(
+            parse_token("com.cloudflare.warp://register?token=header.payload.signature").is_err()
         );
     }
 
@@ -402,21 +429,19 @@ mod tests {
     }
 
     #[test]
-    fn write_wg_conf_rejects_missing_fields() {
+    fn build_wg_config_rejects_missing_fields() {
         let account = WgAccount::default();
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("wg0.conf");
-        assert!(write_wg_conf(&account, None, &path).is_err());
+        assert!(build_wg_config(&account, None).is_err());
     }
 
     #[test]
     fn write_wg_conf_uses_override_endpoint() {
         let account = WgAccount {
-            private_key: "priv".to_string(),
+            private_key: STANDARD.encode([1u8; 32]),
             config: WgAccountConfig {
                 client_id: String::new(),
                 peers: vec![WgAccountPeer {
-                    public_key: "peer-pub".to_string(),
+                    public_key: STANDARD.encode([2u8; 32]),
                     endpoint: WgAccountEndpoint {
                         host: "default.example:2408".to_string(),
                     },
@@ -431,7 +456,8 @@ mod tests {
         };
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("wg0.conf");
-        write_wg_conf(&account, Some("1.2.3.4:2408"), &path).unwrap();
+        let config = build_wg_config(&account, Some("1.2.3.4:2408")).unwrap();
+        write_wg_conf(&config, &path).unwrap();
         let text = fs::read_to_string(&path).unwrap();
         assert!(text.contains("Endpoint = 1.2.3.4:2408"));
         assert!(text.contains("Address = 10.0.0.2/32"));

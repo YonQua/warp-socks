@@ -18,7 +18,7 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use futures::future::{poll_fn, FutureExt};
-use futures::{Sink, Stream, StreamExt};
+use futures::{Sink, SinkExt, Stream, StreamExt};
 use parking_lot::{MappedMutexGuard, Mutex, MutexGuard};
 use smoltcp::iface::{
     Config as InterfaceConfig, Context as InterfaceContext, Interface,
@@ -97,7 +97,6 @@ pub struct Net {
     reactor: Arc<Reactor>,
     source_v4: Option<IpAddress>,
     source_v6: Option<IpAddress>,
-    stopper: Arc<Notify>,
 }
 
 impl Net {
@@ -151,19 +150,14 @@ impl Net {
             })?;
         }
 
-        let stopper = Arc::new(Notify::new());
-        let (reactor, task) = Reactor::new(
-            device,
-            interface,
-            buffered,
-            config.buffer_size,
-            stopper.clone(),
-        );
+        let (reactor, task) = Reactor::new(device, interface, buffered, config.buffer_size);
         let reactor = Arc::new(reactor);
-        let task_reactor = reactor.clone();
+        let task_reactor = Arc::downgrade(&reactor);
         tokio::spawn(async move {
             let result = task.await;
-            task_reactor.stop_sockets();
+            if let Some(reactor) = task_reactor.upgrade() {
+                reactor.stop_sockets();
+            }
             if let Err(error) = result {
                 log::error!("WireGuard netstack reactor 已停止: {error}");
             }
@@ -173,7 +167,6 @@ impl Net {
             reactor,
             source_v4,
             source_v6,
-            stopper,
         })
     }
 
@@ -195,6 +188,20 @@ impl Net {
         UdpSocket::new(self.reactor.clone(), source, addr).await
     }
 
+    /// 后台 reactor 是否已经因设备错误停止。
+    #[must_use]
+    pub fn is_stopped(&self) -> bool {
+        self.reactor.is_stopped()
+    }
+
+    /// 立即停止本代网络栈，并中断所有仍持有本代 reactor 的 TCP/UDP socket。
+    ///
+    /// WireGuard 同一 peer 不能让两个使用不同 outer UDP socket 的 generation
+    /// 同时发送，否则对端的 endpoint roaming 会让新旧 generation 互相抢占。
+    pub fn shutdown(&self) {
+        self.reactor.shutdown();
+    }
+
     fn source_for(&self, addr: SocketAddr) -> io::Result<IpAddress> {
         let source = match addr {
             SocketAddr::V4(_) => self.source_v4,
@@ -209,12 +216,6 @@ impl Net {
                 ),
             )
         })
-    }
-}
-
-impl Drop for Net {
-    fn drop(&mut self) {
-        self.stopper.notify_one();
     }
 }
 
@@ -490,6 +491,7 @@ impl Drop for SocketHandle {
 
 struct Reactor {
     notify: Arc<Notify>,
+    stopper: Arc<Notify>,
     interface: Arc<Mutex<Interface>>,
     allocator: SocketAllocator,
     stopped: AtomicBool,
@@ -501,13 +503,13 @@ impl Reactor {
         interface: Interface,
         buffered: BufferDevice,
         buffer_size: BufferSize,
-        stopper: Arc<Notify>,
     ) -> (
         Self,
         impl std::future::Future<Output = io::Result<()>> + Send,
     ) {
         let interface = Arc::new(Mutex::new(interface));
         let notify = Arc::new(Notify::new());
+        let stopper = Arc::new(Notify::new());
         let allocator = SocketAllocator::new(buffer_size);
         let task = run_reactor(
             device,
@@ -515,11 +517,12 @@ impl Reactor {
             buffered,
             allocator.clone(),
             notify.clone(),
-            stopper,
+            stopper.clone(),
         );
         (
             Self {
                 notify,
+                stopper,
                 interface,
                 allocator,
                 stopped: AtomicBool::new(false),
@@ -555,6 +558,18 @@ impl Reactor {
             }
         }
     }
+
+    fn shutdown(&self) {
+        self.stop_sockets();
+        self.stopper.notify_one();
+        self.notify.notify_waiters();
+    }
+}
+
+impl Drop for Reactor {
+    fn drop(&mut self) {
+        self.stopper.notify_one();
+    }
 }
 
 async fn run_reactor(
@@ -573,9 +588,7 @@ async fn run_reactor(
 
     loop {
         let outgoing = buffered.take_send_queue();
-        futures::stream::iter(outgoing.into_iter().map(Ok))
-            .forward(&mut device)
-            .await?;
+        flush_packets(&mut device, outgoing).await?;
 
         let mut stream_ended = false;
         if received.is_empty() && buffered.recv_queue.is_empty() {
@@ -619,6 +632,16 @@ async fn run_reactor(
         }
     }
     Ok(())
+}
+
+async fn flush_packets(
+    device: &mut impl AsyncDevice,
+    packets: impl IntoIterator<Item = Vec<u8>>,
+) -> io::Result<()> {
+    for packet in packets {
+        device.feed(packet).await?;
+    }
+    device.flush().await
 }
 
 fn map_error(error: impl std::error::Error) -> io::Error {
@@ -843,6 +866,7 @@ fn reactor_stopped() -> io::Error {
 mod tests {
     use super::*;
     use std::net::Ipv6Addr;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use smoltcp::phy::Medium;
     use smoltcp::wire::HardwareAddress;
@@ -892,6 +916,75 @@ mod tests {
         fn capabilities(&self) -> &DeviceCapabilities {
             &self.capabilities
         }
+    }
+
+    struct CloseTrackingDevice {
+        capabilities: DeviceCapabilities,
+        sent: Arc<AtomicUsize>,
+        closed: Arc<AtomicUsize>,
+    }
+
+    impl Stream for CloseTrackingDevice {
+        type Item = io::Result<Vec<u8>>;
+
+        fn poll_next(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+            Poll::Pending
+        }
+    }
+
+    impl Sink<Vec<u8>> for CloseTrackingDevice {
+        type Error = io::Error;
+
+        fn poll_ready(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn start_send(self: Pin<&mut Self>, _item: Vec<u8>) -> Result<(), Self::Error> {
+            self.sent.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }
+
+        fn poll_flush(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_close(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Result<(), Self::Error>> {
+            self.closed.fetch_add(1, Ordering::Relaxed);
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl AsyncDevice for CloseTrackingDevice {
+        fn capabilities(&self) -> &DeviceCapabilities {
+            &self.capabilities
+        }
+    }
+
+    #[tokio::test]
+    async fn flushing_finite_packet_batch_does_not_close_device() {
+        let sent = Arc::new(AtomicUsize::new(0));
+        let closed = Arc::new(AtomicUsize::new(0));
+        let mut device = CloseTrackingDevice {
+            capabilities: DeviceCapabilities::default(),
+            sent: sent.clone(),
+            closed: closed.clone(),
+        };
+
+        flush_packets(&mut device, vec![vec![1], vec![2]])
+            .await
+            .unwrap();
+
+        assert_eq!(sent.load(Ordering::Relaxed), 2);
+        assert_eq!(closed.load(Ordering::Relaxed), 0);
     }
 
     fn dual_stack_net() -> Net {
@@ -1033,17 +1126,30 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dropping_net_wakes_pending_udp_operation() {
+    async fn dropping_net_keeps_existing_socket_generation_alive_until_explicit_shutdown() {
         let net = dual_stack_net();
         let socket = net.udp_bind("0.0.0.0:0".parse().unwrap()).await.unwrap();
-        let mut buf = [0; 32];
-        let mut receiving = Box::pin(socket.recv_from(&mut buf));
-        assert!(futures::poll!(&mut receiving).is_pending());
+        let reactor = Arc::downgrade(&socket.reactor);
 
         drop(net);
-        let error = tokio::time::timeout(std::time::Duration::from_millis(100), receiving)
+        assert!(reactor.upgrade().is_some());
+        assert!(!socket.reactor.is_stopped());
+
+        drop(socket);
+        assert!(reactor.upgrade().is_none());
+    }
+
+    #[tokio::test]
+    async fn shutdown_stops_existing_socket_generation() {
+        let net = dual_stack_net();
+        let socket = net.udp_bind("0.0.0.0:0".parse().unwrap()).await.unwrap();
+
+        net.shutdown();
+
+        assert!(net.is_stopped());
+        let error = socket
+            .send_to(&[1], "192.0.2.1:53".parse().unwrap())
             .await
-            .expect("停止 reactor 后 pending UDP recv 应被唤醒")
             .unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::ConnectionAborted);
     }

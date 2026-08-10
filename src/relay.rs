@@ -8,33 +8,19 @@ use std::time::Duration;
 
 use anyhow::Result;
 use log::info;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 
-use crate::outbound::masque;
 use crate::outbound::{Connected, Host, Outbound};
 
-// 从 masque::CONNECT_STREAM_TIMEOUT（各 Outbound 实现里最大的连接预算，即
-// open() 内部重连自愈需要的完整预算）直接派生，而不是手抄一个数字——
-// masque 那边的子超时改动后这里自动跟着变，不会再出现"改了内层却忘了同
-// 步外层"的漂移。留 5 秒余量：这里比内层更没耐心地提前取消，会把一次本
-// 可恢复的重连误判成超时失败。
-pub(crate) const CONNECT_TIMEOUT: Duration =
-    Duration::from_secs(masque::CONNECT_STREAM_TIMEOUT.as_secs() + 5);
+const RELAY_DRAIN_GRACE: Duration = Duration::from_secs(30);
 
 /// 通过出网抽象建立 TCP 连接。
 ///
 /// # Errors
-/// 连接超时或失败时返回 `io::Error`。
+/// 后端连接失败时返回 `io::Error`。
 pub async fn connect(outbound: &dyn Outbound, host: Host, port: u16) -> std::io::Result<Connected> {
-    tokio::time::timeout(CONNECT_TIMEOUT, outbound.connect_tcp(host, port))
-        .await
-        .map_err(|_| {
-            std::io::Error::new(
-                std::io::ErrorKind::TimedOut,
-                format!("连接目标超时（{CONNECT_TIMEOUT:?}）"),
-            )
-        })?
+    outbound.connect_tcp(host, port).await
 }
 
 /// 双向转发：客户端 TCP 流 <-> 出网代理流，直到任一方关闭。
@@ -61,8 +47,18 @@ pub async fn tunnel_tcp(
         Some(note) => info!("连接 {peer} -> {display}（backend={backend}, {note}）: 已建立"),
         None => info!("连接 {peer} -> {display}（backend={backend}）: 已建立"),
     }
+    copy_with_drain(client, outbound, RELAY_DRAIN_GRACE).await;
+    info!("连接 {peer} -> {display}: 已关闭");
+    Ok(())
+}
+
+async fn copy_with_drain<C, O>(client: C, outbound: O, drain_grace: Duration)
+where
+    C: AsyncRead + AsyncWrite + Unpin,
+    O: AsyncRead + AsyncWrite + Unpin,
+{
+    let (mut rc, mut wc) = tokio::io::split(client);
     let (mut ro, mut wo) = tokio::io::split(outbound);
-    let (mut rc, mut wc) = client.into_split();
     let up = async {
         let n = tokio::io::copy(&mut rc, &mut wo).await;
         let _ = wo.shutdown().await;
@@ -73,7 +69,31 @@ pub async fn tunnel_tcp(
         let _ = wc.shutdown().await;
         n
     };
-    let _ = tokio::join!(up, down);
-    info!("连接 {peer} -> {display}: 已关闭");
-    Ok(())
+    tokio::pin!(up);
+    tokio::pin!(down);
+    tokio::select! {
+        _ = &mut down => {}
+        _ = &mut up => {
+            let _ = tokio::time::timeout(drain_grace, &mut down).await;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn client_close_does_not_wait_forever_for_remote() {
+        let (client, client_peer) = tokio::io::duplex(64);
+        let (outbound, _outbound_peer) = tokio::io::duplex(64);
+        drop(client_peer);
+
+        tokio::time::timeout(
+            Duration::from_millis(100),
+            copy_with_drain(client, outbound, Duration::from_millis(10)),
+        )
+        .await
+        .expect("drain 宽限结束后 relay 应释放连接");
+    }
 }

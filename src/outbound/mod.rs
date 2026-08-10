@@ -16,7 +16,7 @@ pub mod masque;
 pub mod wireguard;
 
 pub use masque::Masque;
-pub use wireguard::{WgHealConfig, WgOutbound};
+pub use wireguard::{WgOutbound, WgRecoveryConfig};
 
 /// 双向字节流。项目内 netstack 的 TcpStream、quinn (Send,Recv) 组合都满足。
 pub trait Stream: AsyncRead + AsyncWrite + Unpin + Send {}
@@ -68,6 +68,22 @@ pub struct Connected {
     pub note: Option<String>,
 }
 
+/// 健康探测失败后允许后端采用的恢复强度。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RecoveryMode {
+    /// 仅在后端已有明确数据面失联证据时恢复。
+    Opportunistic,
+    /// 连续失败已达阈值，要求后端执行最后一次恢复尝试。
+    Forced,
+}
+
+/// 后端处理一次恢复请求后的结果。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RecoveryOutcome {
+    NotNeeded,
+    Recovered,
+}
+
 /// 出网后端：给定 host:port 产出一条双向字节流，可选支持 UDP。
 #[async_trait]
 pub trait Outbound: Send + Sync {
@@ -81,6 +97,9 @@ pub trait Outbound: Send + Sync {
         false
     }
 
+    /// 每个后端拥有自己的拨号、重连和协议握手超时；调用方不应再用一个了解
+    /// 具体后端实现的外层超时包裹它。
+    ///
     /// # Errors
     /// 连接失败（超时、拒绝、网络不可达、域名解析失败等）时返回 `io::Error`。
     async fn connect_tcp(&self, host: Host, port: u16) -> std::io::Result<Connected>;
@@ -95,15 +114,12 @@ pub trait Outbound: Send + Sync {
         ))
     }
 
-    /// 运行期健康探测失败时尝试连接级自愈（换路径/重连），调用方成功后会
-    /// 立刻重新探测一次确认。默认不支持——多数后端没有能在 `connect_tcp`
-    /// 之外单独触发的自愈手段（如 MASQUE：自愈已经在 `connect_tcp` 内部
-    /// 的 `open()` 里发生，探测失败即代表那次自愈也没能挽回，不需要额外
-    /// 一轮，这里保持默认失败即可）。
+    /// 处理一次健康探测失败。后端同时拥有“是否需要恢复”和“如何恢复”的
+    /// 决策权，调用方只负责选择恢复强度并在恢复后复测。
     ///
     /// # Errors
-    /// 不支持自愈，或自愈本身失败时返回错误。
-    async fn heal(&self) -> anyhow::Result<()> {
-        anyhow::bail!("该出网后端不支持自愈")
+    /// 后端决定执行恢复、但恢复过程失败时返回错误。
+    async fn recover(&self, _mode: RecoveryMode) -> anyhow::Result<RecoveryOutcome> {
+        Ok(RecoveryOutcome::NotNeeded)
     }
 }

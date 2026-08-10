@@ -17,7 +17,7 @@ pub struct WgConfig {
     pub address_v6: Ipv6Addr,
 }
 
-fn decode_key(b64: &str) -> Result<[u8; 32]> {
+pub(crate) fn decode_key(b64: &str) -> Result<[u8; 32]> {
     use base64::Engine;
     let raw = base64::engine::general_purpose::STANDARD
         .decode(b64.trim())

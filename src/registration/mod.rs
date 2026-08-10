@@ -6,4 +6,4 @@ pub mod masque;
 pub mod teams;
 
 pub use masque::{delete, load, register as register_masque, RegCredentials, Registration};
-pub use teams::{write_wg_conf, TeamsRegistrar, WgAccount};
+pub use teams::{build_wg_config, write_wg_conf, TeamsRegistrar, WgAccount};

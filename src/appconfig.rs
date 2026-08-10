@@ -5,14 +5,11 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use crate::relay;
 use crate::tunnel::Trick;
 
-// 健康检查探测内部就是走 relay::connect()（同一条业务连接路径），这里在它
-// 的超时基础上再留 5 秒余量，避免探测自己的超时比它调用的 connect() 更没
-// 耐心。从 relay::CONNECT_TIMEOUT 派生而不是独立手抄一个数字，链路只有一
-// 个源头（masque::CONNECT_STREAM_TIMEOUT），逐层派生、逐层加一点余量。
-const HEALTHCHECK_PROBE_TIMEOUT_DEFAULT: u64 = relay::CONNECT_TIMEOUT.as_secs() + 5;
+// 健康探测是运维策略，不应反向依赖某个 Outbound 的私有协议预算。63 秒保持
+// 现有默认行为，并覆盖当前两种后端各自有界的 connect_tcp 实现。
+const HEALTHCHECK_PROBE_TIMEOUT_DEFAULT: u64 = 63;
 
 pub struct AppConfig {
     pub state_dir: PathBuf,
@@ -26,9 +23,10 @@ pub struct AppConfig {
     pub enable_masque: bool,
     pub trick: Trick,
 
-    /// 逗号分隔的显式监听地址。默认只开 loopback；第一个地址同时作为内部
-    /// 健康探测入口，远端部署按实际网络传入宿主机可达的 IPv4/IPv6 地址。
+    /// `auto` 自动监听 IPv4/IPv6 并只允许 LAN 客户端；也可配置逗号分隔的
+    /// 显式监听地址，此时第一个地址同时作为内部健康探测入口。
     pub listen_addrs: String,
+    pub listen_port: u16,
 
     pub register_retries: u32,
     pub register_retry_delay: Duration,
@@ -66,7 +64,8 @@ impl AppConfig {
                 _ => Trick::None,
             },
 
-            listen_addrs: env_var("SOCKS_LISTEN_ADDRS", "127.0.0.1:1080"),
+            listen_addrs: env_var("SOCKS_LISTEN_ADDRS", "auto"),
+            listen_port: sanitize_port(&env_var("SOCKS_LISTEN_PORT", "1080"), 1080),
 
             register_retries: sanitize_positive_int(
                 &env_var("WARP_SOCKS_REGISTER_RETRIES", "2"),
@@ -89,11 +88,8 @@ impl AppConfig {
                 20,
             ))),
             startup_endpoint_cooldown: Duration::from_secs(30),
-            // 探测走跟真实业务连接相同的路径，隧道拥塞时的自愈重连也会在这
-            // 次探测里自然发生——前提是这里给的时间够长；短于它会导致探测
-            // 在自愈跑完前就先报超时，把可自愈的拥塞误判成"连续失败"进而
-            // 触发整进程重启。默认值从 HEALTHCHECK_PROBE_TIMEOUT_DEFAULT 派
-            // 生（见上方常量及其注释里的完整链路），不再是独立手抄的数字。
+            // 探测走真实业务路径；这个总预算是运维层可配置边界，后端内部
+            // 的拨号/重连预算由各自 connect_tcp 实现负责。
             healthcheck_probe_timeout: Duration::from_secs(u64::from(sanitize_positive_int(
                 &env_var(
                     "WARP_SOCKS_HEALTHCHECK_PROBE_TIMEOUT",
@@ -130,4 +126,11 @@ fn sanitize_positive_int(raw: &str, fallback: u32) -> u32 {
 /// 对应 lib/core/utils.sh: sanitize_nonnegative_int —— 允许 0，非法输入回退默认值。
 fn sanitize_nonnegative_int(raw: &str, fallback: u64) -> u64 {
     raw.trim().parse::<u64>().unwrap_or(fallback)
+}
+
+fn sanitize_port(raw: &str, fallback: u16) -> u16 {
+    match raw.trim().parse::<u16>() {
+        Ok(port) if port != 0 => port,
+        _ => fallback,
+    }
 }

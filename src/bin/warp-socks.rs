@@ -5,7 +5,7 @@
 //   warp-socks [serve]                  默认子命令：启动隧道 + SOCKS5 服务（前台常驻）
 //   warp-socks register reg <path>      注册 MASQUE 凭据并保存到 path（已存在则跳过）
 //   warp-socks register del <path>      向 API 注销并删除本地文件
-//   warp-socks healthcheck              无状态单次探测，探测失败以非零退出码结束
+//   warp-socks healthcheck              只读心跳时效检查，不健康时以非零退出码结束
 
 use std::io::Write as _;
 use std::path::PathBuf;
@@ -99,15 +99,10 @@ async fn run_register(args: &[String]) -> Result<()> {
 /// 不再自己发起一次完整的 SOCKS→隧道探测——那条隧道本来就已经在被
 /// Supervisor 自己的循环真实探测，这里重复探测只是白白多打一次流量、多一
 /// 处要和内部超时预算保持同步的地方。阈值判定同样完全在 Supervisor 那边，
-/// 这里只是把它的最新结果转成 Docker HEALTHCHECK 的退出码。
+/// 这里只检查最后一次成功探测是否仍在允许的时间窗口内。
 async fn run_healthcheck() -> Result<()> {
     let config = AppConfig::from_env();
-    // 心跳最坏多久没更新一次：运行期循环每 healthcheck_interval 探测一次，
-    // 一次探测最坏能拖到 healthcheck_probe_timeout（隧道自愈重连的完整预
-    // 算），二者相加再留 10 秒余量，避免自愈还没跑完就被判成"心跳过期"。
-    let max_age = config.healthcheck_interval
-        + config.healthcheck_probe_timeout
-        + std::time::Duration::from_secs(10);
+    let max_age = heartbeat_max_age(&config);
     match heartbeat::check(max_age) {
         Ok(()) => Ok(()),
         Err(reason) => {
@@ -115,4 +110,13 @@ async fn run_healthcheck() -> Result<()> {
             std::process::exit(1);
         }
     }
+}
+
+fn heartbeat_max_age(config: &AppConfig) -> std::time::Duration {
+    // Supervisor 才是连续失败和自愈的唯一决策者。Docker 的只读心跳窗口
+    // 必须覆盖完整阈值周期，再多留一轮给达到阈值后的 heal + 复测；否则
+    // Supervisor 仍按设计容忍瞬时拥塞时，容器会先显示 unhealthy。
+    let rounds = config.healthcheck_failure_threshold.saturating_add(1);
+    (config.healthcheck_interval + config.healthcheck_probe_timeout) * rounds
+        + std::time::Duration::from_secs(10)
 }

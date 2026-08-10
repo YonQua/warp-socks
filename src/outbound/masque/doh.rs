@@ -19,6 +19,8 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::Mutex;
 use tokio_rustls::TlsConnector;
 
+use crate::dns::{encode_dns_query, parse_dns_response, RecordType};
+
 /// 固定的 Cloudflare DoH 出口 IP（无需解析，直接当 CONNECT 的 authority 用）。
 pub(super) const DOH_ADDRS: [&str; 2] = ["162.159.36.1:443", "162.159.46.1:443"];
 const DOH_SNI: &str = "cloudflare-dns.com";
@@ -26,21 +28,6 @@ const DOH_PATH: &str = "/dns-query";
 const QUERY_TIMEOUT: Duration = Duration::from_secs(8);
 const MIN_TTL: Duration = Duration::from_secs(5);
 const MAX_TTL: Duration = Duration::from_secs(300);
-
-#[derive(Debug, Clone, Copy)]
-pub(super) enum QueryType {
-    A,
-    Aaaa,
-}
-
-impl QueryType {
-    fn code(self) -> u16 {
-        match self {
-            QueryType::A => 1,
-            QueryType::Aaaa => 28,
-        }
-    }
-}
 
 struct CacheEntry {
     ip: IpAddr,
@@ -103,7 +90,7 @@ impl DnsCache {
         &self,
         stream: impl AsyncRead + AsyncWrite + Unpin,
         domain: &str,
-        qtype: QueryType,
+        record_type: RecordType,
     ) -> Result<IpAddr> {
         let connector = TlsConnector::from(self.tls.clone());
         let server_name =
@@ -113,7 +100,7 @@ impl DnsCache {
             .context("DoH TLS 握手超时")?
             .context("DoH TLS 握手失败")?;
 
-        let query = build_query(domain, qtype.code())?;
+        let query = encode_dns_query(0, domain, record_type)?;
         let request = build_http_request(&query);
         tokio::time::timeout(QUERY_TIMEOUT, tls.write_all(&request))
             .await
@@ -126,35 +113,15 @@ impl DnsCache {
             .await
             .context("DoH 响应读取超时")??;
 
-        let (ip, ttl) = parse_answer(&body)?;
-        self.store(domain, ip, ttl).await;
+        let (addrs, ttl) = parse_dns_response(&body, 0, record_type)?;
+        let ip = addrs
+            .into_iter()
+            .next()
+            .context("DoH 响应未包含请求的地址记录")?;
+        self.store(domain, ip, Duration::from_secs(u64::from(ttl)))
+            .await;
         Ok(ip)
     }
-}
-
-/// 构造 RFC 1035 wire-format 单问题查询：ID 固定 0（RFC 8484 §4.1 建议，便于中间缓存），
-/// RD=1，QDCOUNT=1，无 AN/NS/AR。
-fn build_query(domain: &str, qtype: u16) -> Result<Vec<u8>> {
-    let mut msg = Vec::with_capacity(32 + domain.len());
-    msg.extend_from_slice(&[0x00, 0x00]); // ID = 0
-    msg.extend_from_slice(&[0x01, 0x00]); // Flags: RD=1
-    msg.extend_from_slice(&[0x00, 0x01]); // QDCOUNT = 1
-    msg.extend_from_slice(&[0x00, 0x00]); // ANCOUNT
-    msg.extend_from_slice(&[0x00, 0x00]); // NSCOUNT
-    msg.extend_from_slice(&[0x00, 0x00]); // ARCOUNT
-
-    for label in domain.trim_end_matches('.').split('.') {
-        if label.is_empty() || label.len() > 63 {
-            bail!("域名标签长度非法: {label:?}");
-        }
-        msg.push(label.len() as u8);
-        msg.extend_from_slice(label.as_bytes());
-    }
-    msg.push(0x00); // root
-
-    msg.extend_from_slice(&qtype.to_be_bytes());
-    msg.extend_from_slice(&[0x00, 0x01]); // QCLASS = IN
-    Ok(msg)
 }
 
 /// RFC 8484 §4.1：POST + `application/dns-message`，显式清空 body 编码，无需分块。
@@ -223,107 +190,9 @@ async fn read_http_response(stream: &mut (impl AsyncRead + Unpin)) -> Result<Vec
     Ok(body)
 }
 
-/// 从 DNS 响应报文里取第一条 A/AAAA 记录及其 TTL。
-fn parse_answer(msg: &[u8]) -> Result<(IpAddr, Duration)> {
-    if msg.len() < 12 {
-        bail!("DNS 响应过短");
-    }
-    let qdcount = u16::from_be_bytes([msg[4], msg[5]]) as usize;
-    let ancount = u16::from_be_bytes([msg[6], msg[7]]) as usize;
-
-    let mut pos = 12;
-    for _ in 0..qdcount {
-        pos = skip_name(msg, pos)?;
-        pos = pos.checked_add(4).context("QTYPE/QCLASS 越界")?; // QTYPE + QCLASS
-    }
-
-    for _ in 0..ancount {
-        pos = skip_name(msg, pos)?;
-        if pos + 10 > msg.len() {
-            bail!("DNS 答案记录截断");
-        }
-        let rtype = u16::from_be_bytes([msg[pos], msg[pos + 1]]);
-        let ttl = u32::from_be_bytes([msg[pos + 4], msg[pos + 5], msg[pos + 6], msg[pos + 7]]);
-        let rdlength = u16::from_be_bytes([msg[pos + 8], msg[pos + 9]]) as usize;
-        pos += 10;
-        if pos + rdlength > msg.len() {
-            bail!("DNS 答案数据截断");
-        }
-        let rdata = &msg[pos..pos + rdlength];
-        pos += rdlength;
-        match (rtype, rdlength) {
-            (1, 4) => {
-                let ip = IpAddr::from([rdata[0], rdata[1], rdata[2], rdata[3]]);
-                return Ok((ip, Duration::from_secs(u64::from(ttl))));
-            }
-            (28, 16) => {
-                let mut octets = [0u8; 16];
-                octets.copy_from_slice(rdata);
-                return Ok((IpAddr::from(octets), Duration::from_secs(u64::from(ttl))));
-            }
-            _ => continue,
-        }
-    }
-    bail!("DoH 响应未包含 A/AAAA 记录")
-}
-
-/// 跳过一个 DNS 名称（含压缩指针，指针本身不跟随，只按 2 字节跳过）。
-fn skip_name(msg: &[u8], mut pos: usize) -> Result<usize> {
-    loop {
-        if pos >= msg.len() {
-            bail!("DNS 名称越界");
-        }
-        let len = msg[pos];
-        if len == 0 {
-            return Ok(pos + 1);
-        }
-        if len & 0xc0 == 0xc0 {
-            if pos + 1 >= msg.len() {
-                bail!("DNS 压缩指针越界");
-            }
-            return Ok(pos + 2);
-        }
-        pos = pos
-            .checked_add(1 + len as usize)
-            .ok_or_else(|| anyhow::anyhow!("DNS 名称长度溢出"))?;
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn build_query_encodes_labels_and_qtype() {
-        let msg = build_query("cloudflare.com", 1).unwrap();
-        assert_eq!(&msg[..6], &[0x00, 0x00, 0x01, 0x00, 0x00, 0x01]);
-        // label "cloudflare"(10) + "com"(3) + root(0)
-        assert_eq!(msg[12], 10);
-        assert_eq!(&msg[13..23], b"cloudflare");
-        assert_eq!(msg[23], 3);
-        assert_eq!(&msg[24..27], b"com");
-        assert_eq!(msg[27], 0);
-        assert_eq!(&msg[28..30], &[0x00, 0x01]); // QTYPE=A
-        assert_eq!(&msg[30..32], &[0x00, 0x01]); // QCLASS=IN
-    }
-
-    #[test]
-    fn parse_answer_extracts_first_a_record() {
-        let mut msg = build_query("example.com", 1).unwrap();
-        msg[6] = 0x00;
-        msg[7] = 0x01; // ANCOUNT = 1
-                       // answer: 名称用压缩指针指回 offset 12（问题区），TYPE=A, CLASS=IN, TTL=300, RDLEN=4, RDATA
-        msg.extend_from_slice(&[0xc0, 0x0c]);
-        msg.extend_from_slice(&[0x00, 0x01]); // TYPE A
-        msg.extend_from_slice(&[0x00, 0x01]); // CLASS IN
-        msg.extend_from_slice(&300u32.to_be_bytes()); // TTL
-        msg.extend_from_slice(&[0x00, 0x04]); // RDLENGTH
-        msg.extend_from_slice(&[93, 184, 216, 34]); // RDATA
-
-        let (ip, ttl) = parse_answer(&msg).unwrap();
-        assert_eq!(ip, IpAddr::from([93, 184, 216, 34]));
-        assert_eq!(ttl, Duration::from_secs(300));
-    }
 
     #[test]
     fn http_request_has_matching_content_length() {

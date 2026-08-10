@@ -2,13 +2,13 @@
 
 一个面向 Linux 单机部署的 WARP SOCKS5 Docker 方案：SOCKS5 UDP relay 通过 host network 对远端客户端可达，业务出口由 MASQUE 或 userspace WireGuard 承载。
 
-主链路：`TEAMS_TOKEN -> account.json -> 隧道进程（默认优先尝试 MASQUE；关闭 WARP_SOCKS_ENABLE_MASQUE 或 MASQUE 失败则回退 userspace WireGuard）+ SOCKS5`
+主链路：`MASQUE reg.json` 或 `TEAMS_TOKEN -> account.json -> userspace WireGuard`，由同一个 Supervisor 选择后端并提供 SOCKS5。
 
 1. `WARP_SOCKS_ENABLE_MASQUE=1` 时先尝试 MASQUE（`reg.json`，缺失时自动注册，见下方 `WARP_SOCKS_ENABLE_MASQUE`），成功则全程不需要 `TEAMS_TOKEN`/`account.json`
 2. MASQUE 未开启，或开启但注册/建隧道失败需要回退时，才走 `TEAMS_TOKEN -> account.json`（首次注册，之后重启直接复用）-> `wg0.conf`
 3. `Supervisor` 起隧道 + 内置 SOCKS5：`WARP_SOCKS_ENABLE_MASQUE=1` 时先试 MASQUE（Cloudflare QUIC/H3 隧道），失败或未开启则用 userspace WireGuard
 4. 经 SOCKS5 出口探测通过（`warp=on`）后进入运行态
-5. 运行期 healthcheck 连续失败达到阈值后，请求容器重启
+5. 运行期探测失败时先按后端证据恢复；连续失败达到阈值后执行最后一次强制恢复和复测，仍失败才退出并由 Docker 重启
 
 说明：WireGuard 路径不再使用内核 `wg-quick` / `microsocks`。在中国等网络环境下，内核 WireGuard 常卡在 `0 B received`；当前实现改用带 WARP tricks 的 userspace 客户端。
 
@@ -16,17 +16,17 @@
 
 当前状态和恢复规则也很简单：
 
-- `account.json` 是唯一账户状态；`wg0.conf` 是 WireGuard 路径的当前运行配置，也是该路径 healthcheck 恢复时读取当前 endpoint 的唯一来源
+- `account.json` 是唯一 WireGuard 账户状态；`endpoint-state.json` 保存 endpoint 选择历史；`wg0.conf` 只是当前成功运行配置的可审计快照，不参与恢复决策
 - `reg.json` 是 MASQUE 路径的凭据文件（`WARP_SOCKS_ENABLE_MASQUE=1` 时使用），缺失会自动注册；MASQUE 路径没有 endpoint 候选轮换，不涉及 `endpoint-state.json`
 - `endpoint-state.json` 只保存 WireGuard 候选的 `last_good_endpoint` 和 cooldown
 - 启动阶段失败直接退出，由 Docker 重启容器
-- 运行期失败达到阈值后写入重启请求，由 PID 1 主动退出
+- 运行期失败由后端按证据恢复；达到阈值且强制恢复、复测仍失败时，PID 1 主动退出
 
 隧道、SOCKS5、注册、健康探测、候选编排均已收口到自研的 `warp-socks-rs` 单一二进制（`src/`），子命令划分：
 
 - `warp-socks serve`（默认）：`Supervisor`（`src/supervisor.rs`）常驻编排注册确认、endpoint 候选尝试、SOCKS5 服务与运行期健康检查
 - `warp-socks register reg/del <path>`：MASQUE 凭据注册/注销
-- `warp-socks healthcheck`：Docker HEALTHCHECK 用的无状态单次探测
+- `warp-socks healthcheck`：Docker HEALTHCHECK 使用的只读心跳时效检查
 
 容器入口直接是 `warp-socks-rs` 二进制本身（Dockerfile `ENTRYPOINT`），没有中间 shell 脚本转发。
 
@@ -40,12 +40,14 @@
 cp .env.example .env
 ```
 
-2. 填入 Teams registration token：
+2. 如果要强制使用 WireGuard，填入 Teams registration token。等号右侧只能是
+   注册链接 `token=` 参数的值，即由两个 `.` 分隔的原始三段 JWT：
 
 ```env
-TEAMS_TOKEN=com.cloudflare.warp://<your-team>.cloudflareaccess.com/auth?token=<your-token>
+TEAMS_TOKEN=header.payload.signature
 WARP_SOCKS_ENABLE_MASQUE=0
-SOCKS_LISTEN_ADDRS=127.0.0.1:1080
+SOCKS_LISTEN_ADDRS=auto
+SOCKS_LISTEN_PORT=1080
 ```
 
 3. 启动：
@@ -63,10 +65,10 @@ docker compose logs -f
 5. 验证代理：
 
 ```bash
-docker exec warp-socks curl --socks5 127.0.0.1:1080 https://cloudflare.com/cdn-cgi/trace
+docker exec warp-socks curl --socks5-hostname 127.0.0.1:1080 https://cloudflare.com/cdn-cgi/trace
 ```
 
-正常情况下应至少看到 `warp=on`，通常还会带 `gateway=on`。
+正常情况下应至少看到 `warp=on`；`gateway` 值取决于后端和账户类型。
 
 ## 配置
 
@@ -74,8 +76,9 @@ docker exec warp-socks curl --socks5 127.0.0.1:1080 https://cloudflare.com/cdn-c
 
 | 变量                      | 必填                   | 说明                                                                                               |
 | ------------------------- | ---------------------- | -------------------------------------------------------------------------------------------------- |
-| `TEAMS_TOKEN`             | 条件必填               | Cloudflare Teams registration token，推荐直接填完整 `com.cloudflare.warp://...auth?token=...` 链接。已有 `data/account.json` 后重启可以留空；`WARP_SOCKS_ENABLE_MASQUE=1` 且 MASQUE 注册与建隧道都成功时也不需要（纯 MASQUE 场景不会触碰 Teams 账户），只有实际需要走 WireGuard（未开启 MASQUE，或 MASQUE 失败要回退）时才会要求填写 |
-| `SOCKS_LISTEN_ADDRS`    | 否                     | 逗号分隔的显式监听地址，默认 `127.0.0.1:1080`；远端部署按实际网络加入宿主机可达的 IPv4/IPv6 地址 |
+| `TEAMS_TOKEN`             | 条件必填               | Cloudflare Teams registration token，只填写注册链接中 `token=` 后面的原始三段 JWT，例如 `header.payload.signature`；不能包含 `token=`、完整 URI、引号或前后空白。已有 `data/account.json` 后重启可以留空；`WARP_SOCKS_ENABLE_MASQUE=1` 且 MASQUE 注册与建隧道都成功时也不需要（纯 MASQUE 场景不会触碰 Teams 账户），只有实际需要走 WireGuard（未开启 MASQUE，或 MASQUE 失败要回退）时才会要求填写 |
+| `SOCKS_LISTEN_ADDRS`    | 否                     | 默认 `auto`：自动监听 IPv4/IPv6，只允许 loopback、RFC1918 IPv4、ULA/link-local IPv6 客户端；也可填写逗号分隔的显式地址列表 |
+| `SOCKS_LISTEN_PORT`     | 否                     | `auto` 模式的监听端口，默认 `1080`；显式地址列表模式忽略此项 |
 | `ENDPOINT_CANDIDATES`   | 否                     | 手工覆盖 endpoint 列表；留空时使用项目内置候选池                                                   |
 | `RESTART_POLICY`        | `unless-stopped`       | Docker 重启策略                                                                                    |
 | `RUST_LOG`              | `info`                 | 日志级别（`env_logger` 标准语法），默认 `info` 已包含连接建立/失败、隧道后端（MASQUE/WireGuard）等关键信息；调试可设 `RUST_LOG=debug` |
@@ -89,8 +92,8 @@ docker exec warp-socks curl --socks5 127.0.0.1:1080 https://cloudflare.com/cdn-c
 | `WARP_SOCKS_STARTUP_EGRESS_PROBE_DELAY`    | `1`    | 启动阶段两次探测之间的间隔秒数         |
 | `WARP_SOCKS_STARTUP_EGRESS_PROBE_TIMEOUT`  | `5`    | 单次启动阶段 SOCKS 出口探测超时秒数    |
 | `WARP_SOCKS_STARTUP_SOCKS_READY_TIMEOUT`   | `20`   | 启动阶段等待隧道+SOCKS 就绪的总秒数    |
-| `WARP_SOCKS_HEALTHCHECK_PROBE_TIMEOUT`     | 派生值（约 63，见下方说明） | 运行期单次健康检查探测超时秒数         |
-| `WARP_SOCKS_HEALTHCHECK_FAILURE_THRESHOLD` | `3`    | 运行期连续失败达到多少次后请求容器重启 |
+| `WARP_SOCKS_HEALTHCHECK_PROBE_TIMEOUT`     | `63`   | 运行期单次健康检查探测的独立总预算（秒） |
+| `WARP_SOCKS_HEALTHCHECK_FAILURE_THRESHOLD` | `3`    | 连续失败达到多少次后执行强制恢复；复测仍失败才退出 |
 | `WARP_RS_TRICK`                            | `none` | 反审查伪装包模式，`none`/`t1`/`t2` |
 | `WARP_SOCKS_ENABLE_MASQUE`                 | `1`    | 默认开启：自动确保 `reg.json` 存在（缺失则在进程内直接完成注册），warp-socks-rs 优先走 MASQUE，失败仍回退 WireGuard；显式设为 `0` 则跳过 MASQUE，只走 WireGuard |
 
@@ -110,8 +113,8 @@ WARP_SOCKS_HEALTHCHECK_FAILURE_THRESHOLD=2
 说明：
 
 - userspace 握手通常 3~8 秒，遇到重试可能到 15 秒以上；`WARP_SOCKS_STARTUP_SOCKS_READY_TIMEOUT` 是这段总等待时间，不建议低于 `15`。
-- `WARP_SOCKS_HEALTHCHECK_PROBE_TIMEOUT` 不建议手工调低：探测走的是和真实业务连接相同的路径，隧道自身的自愈重连（MASQUE 侧的 `open()`）需要完整跑完才能拿到真实结果；调低到低于隧道自愈预算，会把"正在自愈"误判成"探测失败"，反而更容易触发不必要的容器重启。默认值已经从隧道自愈预算自动派生，一般不需要覆盖。
-- `WARP_SOCKS_HEALTHCHECK_FAILURE_THRESHOLD` 是运行期恢复的唯一连续失败阈值来源；Docker `HEALTHCHECK` 只负责定时触发，不再叠加第二层 `retries` 语义。
+- `WARP_SOCKS_HEALTHCHECK_PROBE_TIMEOUT` 不建议手工调低：探测走的是和真实业务连接相同的路径，需要给后端内部的拨号、重连和协议握手留下完整执行时间。默认 63 秒是独立的运维总预算，不反向依赖某个具体后端的私有超时常量。
+- `WARP_SOCKS_HEALTHCHECK_FAILURE_THRESHOLD` 是运行期恢复的唯一连续失败阈值来源；Docker `HEALTHCHECK` 只读取最后成功心跳，不再形成第二套恢复状态机。
 - 注册链路遇到 `429` 时仍会尊重服务端 `Retry-After`，这部分不会被本地更小的 delay 强行覆盖。
 
 ## Endpoint 策略
@@ -123,19 +126,26 @@ WARP_SOCKS_HEALTHCHECK_FAILURE_THRESHOLD=2
 - 如果你显式填写了 `ENDPOINT_CANDIDATES`，启动阶段会按你给定的顺序逐个尝试。
 - 如果你留空，启动阶段会使用项目内置候选池（含官方主入口与少量补充）：
   - `162.159.193.5:2408`
-  - `162.159.193.9:2408`
-  - `162.159.193.8:2408`
-  - `162.159.193.3:2408`
+  - `162.159.193.9:500`
+  - `162.159.193.8:1701`
+  - `162.159.193.3:4500`
   - `162.159.193.7:2408`
-  - `162.159.193.47:2408`
-  - `162.159.192.1:2408`
-  - `162.159.195.1:2408`
+  - `162.159.193.47:500`
+  - `162.159.193.10:1701`
+  - `162.159.193.11:4500`
 
-运行期如果 healthcheck 连续失败达到阈值，当前 endpoint 会被临时标记为冷却；容器重启后，启动链会优先尝试最近一次成功的 endpoint，并把进入冷却的 endpoint 排到后面。内部恢复状态会持久化到 `./data/endpoint-state.json`。
+这些地址和端口位于 Cloudflare 为 Zero Trust WireGuard 公布的入口范围内；候选池同时覆盖
+主端口 `2408` 和回退端口 `500`、`1701`、`4500`，使 endpoint 切换具备实际路径多样性。
+
+生产环境不建议只填写一个 endpoint；单候选会让运行期自愈没有可切换目标。通常保持为空即可。
+
+运行期单次 healthcheck 失败默认只累计计数，不立即切换 endpoint，避免短时拥塞打断仍在工作的连接。WireGuard 会记录当前 netstack 代际的业务包、已认证回包、outer UDP 收发、下游丢包和 BoringTun session 统计；业务发送后连续 10 秒没有认证业务回包时只输出一次诊断快照，同一代际恢复时再输出一次恢复快照，不会仅凭日志事件切换 endpoint。只有真实 SOCKS 探测已完整等待 10 秒仍失败，并且这段时间没有认证业务回包时，才会提前建立新 endpoint generation 并复测。否则等连续失败达到阈值后再自愈。新 generation 完成握手后会原子替换当前网络栈并立即终止旧 generation：WireGuard 同一 peer 只能有一个有效 endpoint，保留旧 outer UDP socket 排空会触发 endpoint roaming 竞争。已有连接会失败并由客户端重试，不承诺跨代际迁移。自愈和复测仍失败且达到阈值才退出进程，交给 Docker 重启。容器重启后，启动链会优先尝试最近一次成功的 endpoint，并把进入冷却的 endpoint 排到后面。内部恢复状态会持久化到 `./data/endpoint-state.json`。
 
 启动阶段会按顺序逐个尝试候选，单个候选最坏耗时约为 `WARP_SOCKS_STARTUP_SOCKS_READY_TIMEOUT` 秒；默认候选池 8 个时，全部失败的最坏总耗时约 `8 × 20s ≈ 160` 秒，之后由 Docker 按 `RESTART_POLICY` 重启容器重试。这段等待期间容器还没有标记 runtime ready，healthcheck 不会介入，不会被误判为不健康。
 
-Compose 使用 `network_mode: host`，因为 UDP ASSOCIATE relay 使用随机端口，Docker bridge 无法提前发布。程序只监听 `SOCKS_LISTEN_ADDRS` 中列出的地址；默认仅监听 `127.0.0.1:1080`。需要远端客户端时，应加入该客户端实际可达的宿主机 IPv4/IPv6 地址。当前 SOCKS5 无认证，不应使用 `0.0.0.0`、`[::]` 或直接暴露到公网的地址。
+Compose 使用 `network_mode: host`，因为 UDP ASSOCIATE relay 使用随机端口，Docker bridge 无法提前发布。默认 `SOCKS_LISTEN_ADDRS=auto` 会建立独立的 `0.0.0.0:1080` 与 `[::]:1080` listener，其中 IPv6 socket 显式启用 `IPV6_V6ONLY`。程序根据控制连接实际到达的本机地址和地址族自动绑定 UDP relay，因此宿主机地址变化时无需更新配置。
+
+当前 SOCKS5 无认证。自动模式虽然监听全部接口，但在协议分发前只允许 loopback、RFC1918 IPv4、ULA 和 link-local IPv6 客户端；公网来源会被拒绝。仍建议使用主机防火墙限制允许访问的来源。需要其它网络范围时，可以改用显式地址列表；显式模式代表管理员已经选择暴露接口，不附加自动 LAN 来源限制。
 
 例如，以下只展示格式，使用的是不可路由的 RFC 文档地址，不能直接复制到生产：
 
@@ -143,13 +153,14 @@ Compose 使用 `network_mode: host`，因为 UDP ASSOCIATE relay 使用随机端
 SOCKS_LISTEN_ADDRS=127.0.0.1:1080,192.0.2.10:1080,[2001:db8::10]:1080
 ```
 
-WireGuard 后端使用项目内的 `smoltcp 0.13.1` 异步适配层，同时配置 WARP IPv4 `/32`、IPv6 `/128` 和两种默认路由。TCP 与 UDP 都按目标地址族选择对应的 WARP 源地址，因此 IPv4/IPv6 字面量均走隧道。域名第一阶段继续在隧道内只查询 A 记录，所以域名目标当前固定使用 IPv4，不主动查询 AAAA，也不做 Happy Eyeballs。一个 SOCKS5 UDP ASSOCIATE 可以同时访问多个 IPv4、IPv6 或域名目标；每个 association 最多保留 64 个活跃目标，目标通道建立最多等待 10 秒，建立后空闲 120 秒释放。MASQUE 不支持隧道内 UDP，默认会在 SOCKS5 UDP ASSOCIATE 阶段明确拒绝，不会静默回退宿主机出口。
+WireGuard 后端使用项目内的 `smoltcp 0.13.1` 异步适配层，同时配置 WARP IPv4 `/32`、IPv6 `/128` 和两种默认路由。TCP 与 UDP 都按目标地址族选择对应的 WARP 源地址，因此 IPv4/IPv6 字面量均走隧道。域名在隧道内并发查询 A/AAAA；TCP 按 IPv4、IPv6 交错并每隔 250 ms 发起下一地址，首个成功连接胜出；UDP 确定性使用 A 优先、AAAA 兜底，因此 IPv6-only 域名也可工作。一个 SOCKS5 UDP ASSOCIATE 可以同时访问多个 IPv4、IPv6 或域名目标；每个 association 最多保留 64 个活跃目标，目标通道建立最多等待 10 秒，建立后空闲 120 秒释放。MASQUE 不支持隧道内 UDP，默认会在 SOCKS5 UDP ASSOCIATE 阶段明确拒绝，不会静默回退宿主机出口。
 
 入口在复用或新建 `account.json` 后，会自动清理旧模型遗留的 `state.json` 和 `wgcf-*` 文件。
 
 ## 获取 Teams Token
 
-`TEAMS_TOKEN` 推荐直接填完整的 `com.cloudflare.warp://...auth?token=...` 链接。
+`TEAMS_TOKEN` 只接受注册链接中 `token=` 后面的原始三段 JWT。它的形态应为
+`header.payload.signature`，中间恰好有两个 `.`。
 
 1. 打开 `https://<team-name>.cloudflareaccess.com/warp`
 2. 完成登录
@@ -159,7 +170,8 @@ WireGuard 后端使用项目内的 `smoltcp 0.13.1` 异步适配层，同时配�
 com.cloudflare.warp://<team-name>.cloudflareaccess.com/auth?token=...
 ```
 
-4. 把整条链接复制到 `.env`
+4. 只复制 `token=` 后面的内容到 `.env`。最终配置必须是一行
+   `TEAMS_TOKEN=实际JWT`，不要包含 `token=`、完整链接、引号或前后空白
 
 这类 token 时效很短，复制后尽量立刻启动。
 
@@ -176,7 +188,7 @@ docker compose logs --tail=80
 最常见原因：
 
 - `TEAMS_TOKEN` 为空且 `./data` 下也没有可复用的 `account.json`
-- Teams token 已过期
+- Teams token 格式错误或已过期
 - Cloudflare 返回 `429 Too Many Requests`
 
 Teams 注册链路遇到 `429` 时会按线性退避重试，并尊重服务端 `Retry-After`。
@@ -234,9 +246,9 @@ services:
 | --- | --- |
 | SOCKS TCP → IPv4 字面量 | 连接成功，日志为 `backend=WireGuard` |
 | SOCKS TCP → IPv6 字面量 | 成功，日志为 `backend=WireGuard`，trace 为 `warp=on|plus` |
-| SOCKS TCP → 域名 | 成功，DNS 仍在隧道内查询 A 记录 |
+| SOCKS TCP → 域名 | 成功，DNS 在隧道内并发查询 A/AAAA，并择优连接 |
 | SOCKS UDP → IPv4 DNS | UDP ASSOCIATE 成功，relay 返回客户端可达的宿主机 IPv4 随机端口 |
 | SOCKS UDP → IPv6 目标 | 成功，真实建立 UDP ASSOCIATE，且无宿主机直出日志 |
 | MASQUE UDP | 默认在 ASSOCIATE 阶段明确失败，无宿主机直出 |
 
-程序内部 liveness 使用 `SOCKS_LISTEN_ADDRS` 的第一个地址做一次域名 TCP `warp=on|plus` 探测，用于判断进程和隧道主链路是否需要重启；它不冒充完整能力矩阵。`tcp4`、`tcp6`、`udp4`、`udp6` 应由实际客户端或上层代理分别验证。远端部署还必须用主机防火墙限制允许访问 TCP 1080 和随机 UDP relay 端口的来源地址。
+程序内部 liveness 在 auto 模式固定使用 `127.0.0.1:SOCKS_LISTEN_PORT`，显式模式使用列表第一个地址，执行一次域名 TCP `warp=on|plus` 探测。它只判断进程和隧道主链路是否需要重启，不冒充完整能力矩阵；`tcp4`、`tcp6`、`udp4`、`udp6` 应由实际客户端或上层代理分别验证。

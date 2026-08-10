@@ -6,16 +6,18 @@ use std::net::IpAddr;
 
 use super::JsonFileEndpointStore;
 
-/// 内置默认 endpoint 候选池，对应 lib/app/env.sh: DEFAULT_ENDPOINT_CANDIDATES。
+/// 内置默认 endpoint 候选池。地址限定在 Cloudflare Zero Trust 官方公布的
+/// `162.159.193.0/24`，并覆盖官方 WireGuard UDP 主端口与回退端口，避免所有
+/// 候选都穿过同一条 `:2408` 网络路径。
 const BUILTIN_CANDIDATES: &[&str] = &[
     "162.159.193.5:2408",
-    "162.159.193.9:2408",
-    "162.159.193.8:2408",
-    "162.159.193.3:2408",
+    "162.159.193.9:500",
+    "162.159.193.8:1701",
+    "162.159.193.3:4500",
     "162.159.193.7:2408",
-    "162.159.193.47:2408",
-    "162.159.192.1:2408",
-    "162.159.195.1:2408",
+    "162.159.193.47:500",
+    "162.159.193.10:1701",
+    "162.159.193.11:4500",
 ];
 
 /// 归一化单个 endpoint：`host[:port]`，IPv6 归一化为 `[host]:port`；缺省端口 2408。
@@ -84,7 +86,7 @@ pub fn candidate_pool(manual_csv: &str) -> Vec<String> {
 #[must_use]
 pub fn plan_candidates(pool: Vec<String>, store: &JsonFileEndpointStore) -> Vec<String> {
     let mut merged = Vec::new();
-    if let Some(last_good) = store.last_good() {
+    if let Some(last_good) = store.last_good().filter(|endpoint| pool.contains(endpoint)) {
         merged.push(last_good);
     }
     merged.extend(pool);
@@ -135,5 +137,33 @@ mod tests {
 
         let plan = plan_candidates(pool, &store);
         assert_eq!(plan, vec!["3.3.3.3:2408", "2.2.2.2:2408", "1.1.1.1:2408"]);
+    }
+
+    #[test]
+    fn plan_candidates_ignores_last_good_outside_current_pool() {
+        let pool = candidate_pool("2.2.2.2:2408,3.3.3.3:2408");
+        let dir = tempfile::tempdir().unwrap();
+        let mut store =
+            JsonFileEndpointStore::load(dir.path().join("endpoint-state.json")).unwrap();
+        store.record_success("1.1.1.1:2408").unwrap();
+
+        assert_eq!(
+            plan_candidates(pool, &store),
+            vec!["2.2.2.2:2408", "3.3.3.3:2408"]
+        );
+    }
+
+    #[test]
+    fn built_in_pool_has_address_and_port_diversity() {
+        let pool = candidate_pool("");
+        let ports = pool
+            .iter()
+            .filter_map(|endpoint| endpoint.rsplit_once(':'))
+            .map(|(_, port)| port)
+            .collect::<HashSet<_>>();
+        assert_eq!(ports, HashSet::from(["2408", "500", "1701", "4500"]));
+        assert!(pool
+            .iter()
+            .all(|endpoint| endpoint.starts_with("162.159.193.")));
     }
 }

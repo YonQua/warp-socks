@@ -20,14 +20,18 @@
 
 use std::io;
 use std::net::{IpAddr, SocketAddr};
+use std::pin::Pin;
+use std::task::{Context, Poll};
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context as _, Result};
 use async_trait::async_trait;
-use log::{info, warn};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use log::{debug, info, warn};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::sync::Mutex;
+use tokio::task::JoinHandle;
 
+use crate::dns::RecordType;
 use crate::outbound::{Connected, Host, Outbound, Stream};
 use crate::registration::RegCredentials;
 
@@ -55,23 +59,12 @@ const CONTROL_STREAM_TIMEOUT: Duration = Duration::from_secs(10);
 const OPEN_RETRY_BUDGET: Duration = Duration::from_secs(
     OPEN_TIMEOUT.as_secs() * 2 + DIAL_TIMEOUT.as_secs() + CONTROL_STREAM_TIMEOUT.as_secs(),
 );
-// connect_stream 的总预算，从上面两个子预算推导而非独立取一个数字：这样
-// OPEN_TIMEOUT/DIAL_TIMEOUT 改动后这里自动跟着变，不会出现"改了内层超时
-// 却忘了同步外层"的漂移。外层调用方（relay::CONNECT_TIMEOUT、健康检查的
-// healthcheck_probe_timeout）都必须 ≥ 这个值，否则会在这里的重连自愈还没
-// 跑完之前就被提前掐断，把一次本可恢复的重连误判成超时失败——这正是最初
-// 加上 open() 重连后仍然复现崩溃的根因：多层超时互不知情、外层比内层更没
-// 耐心。`pub(crate)` 是为了让 relay.rs / appconfig.rs 直接从这个值派生自己
-// 的外层超时，而不是各自手抄一个数字再靠注释提醒"记得保持同步"。
-pub(crate) const CONNECT_STREAM_TIMEOUT: Duration =
+// connect_stream 的总预算只约束 MASQUE 后端内部，从子预算推导而非另抄数字。
+// relay 不再叠加第二层后端感知超时；健康探测只保留独立的运维总预算。
+const CONNECT_STREAM_TIMEOUT: Duration =
     Duration::from_secs(OPEN_RETRY_BUDGET.as_secs() + EXCHANGE_TIMEOUT.as_secs());
-// 对照 warp-go relayDrainGrace：客户端半关（上行结束）后，最多再等这么久的
-// 下行数据；超时强制放弃，避免边缘一侧还在发送、但客户端早已消失（视频类
-// 播放器频繁跳转/中止请求就是这种模式）时，这条 H3 流被无限期占着——大量
-// 这种"孤儿流"累积起来会耗尽边缘对这条 QUIC 连接分配的并发流配额，表现为
-// 之后所有新连接的 open_bi 都挂起超时。
-const DRAIN_GRACE: Duration = Duration::from_secs(30);
 const RELAY_BUF: usize = 64 * 1024;
+const MAX_HEADERS_FRAME_SIZE: usize = 64 * 1024;
 
 /// 一条到边缘的 MASQUE 连接。控制流随 Link 一起存活/释放，避免 forget 的内存语义模糊。
 struct Link {
@@ -177,11 +170,13 @@ impl Masque {
             return Ok(ip);
         }
         let mut last_err = None;
-        for qtype in [doh::QueryType::A, doh::QueryType::Aaaa] {
-            match self.doh_query(domain, qtype).await {
+        for record_type in [RecordType::A, RecordType::Aaaa] {
+            match self.doh_query(domain, record_type).await {
                 Ok(ip) => return Ok(ip),
                 Err(e) => {
-                    warn!("DoH 查询 {domain}（{qtype:?}）失败: {e:#}");
+                    // A-only 或 AAAA-only 域名在第一种记录类型上没有答案是正常
+                    // 回退路径；只有两种类型都失败时才由最终连接错误对外报告。
+                    debug!("DoH 查询 {domain}（{record_type:?}）未命中: {e:#}");
                     last_err = Some(e);
                 }
             }
@@ -190,10 +185,10 @@ impl Masque {
     }
 
     /// 依次尝试 DoH 候选出口 IP，逐个走隧道 CONNECT + 标准 TLS + HTTP/1.1 查询。
-    async fn doh_query(&self, domain: &str, qtype: doh::QueryType) -> Result<IpAddr> {
+    async fn doh_query(&self, domain: &str, record_type: RecordType) -> Result<IpAddr> {
         let mut last_err = None;
         for doh_addr in doh::DOH_ADDRS {
-            match self.doh_query_via(doh_addr, domain, qtype).await {
+            match self.doh_query_via(doh_addr, domain, record_type).await {
                 Ok(ip) => return Ok(ip),
                 Err(e) => last_err = Some(e),
             }
@@ -205,13 +200,13 @@ impl Masque {
         &self,
         doh_addr: &str,
         domain: &str,
-        qtype: doh::QueryType,
+        record_type: RecordType,
     ) -> Result<IpAddr> {
         let (stream, _colo) = self
             .connect_stream(doh_addr)
             .await
             .context("建立 DoH 隧道失败")?;
-        self.dns.resolve_over(stream, domain, qtype).await
+        self.dns.resolve_over(stream, domain, record_type).await
     }
 
     /// 打开一条隧道流并完成 H3 CONNECT 握手，返回可直接读写业务字节的流。
@@ -297,16 +292,16 @@ async fn exchange(
     let payload = 'frames: {
         for _ in 0..MAX_SKIPPED_FRAMES {
             let frame_type = read_varint(recv).await?;
-            let len = read_varint(recv).await? as usize;
+            let len = read_varint(recv).await?;
             if frame_type == 0x01 {
+                let len = checked_headers_len(len)?;
                 let mut payload = vec![0u8; len];
                 recv.read_exact(&mut payload)
                     .await
                     .context("读取 CONNECT 响应失败")?;
                 break 'frames payload;
             }
-            let mut skip = vec![0u8; len];
-            recv.read_exact(&mut skip).await.context("跳过未知帧失败")?;
+            discard_frame(recv, len).await?;
         }
         bail!("连续 {MAX_SKIPPED_FRAMES} 个非 HEADERS 帧后仍未收到响应");
     };
@@ -317,17 +312,64 @@ async fn exchange(
     Ok(headers.colo)
 }
 
+fn checked_headers_len(len: u64) -> Result<usize> {
+    let len = usize::try_from(len).context("HEADERS frame 长度超出平台上限")?;
+    if len > MAX_HEADERS_FRAME_SIZE {
+        bail!("CONNECT 响应 HEADERS frame 过大: {len}");
+    }
+    Ok(len)
+}
+
 /// CONNECT 成功后，把仍带 H3 DATA frame 分帧的裸双向流包成上层不用关心分帧
 /// 的字节流：起一个泵任务做编解码，中间用一对 duplex 转发；调用方拿到的
 /// `remote` 端只看到裸隧道字节。收方向遇到非 DATA 帧（如 GREASE）直接丢弃。
 fn wrap_data_framing(send: quinn::SendStream, recv: quinn::RecvStream) -> Box<dyn Stream> {
     let (local, remote) = tokio::io::duplex(RELAY_BUF);
-    tokio::spawn(pump(send, recv, local));
-    Box::new(remote)
+    let task = tokio::spawn(pump(send, recv, local));
+    Box::new(FramedStream { io: remote, task })
 }
 
-/// 两个方向在同一个任务内并发跑；上行先结束就只给下行 DRAIN_GRACE 的宽限
-/// 期（见该常量注释），超时或下行先结束都会让 send/recv 被 drop 掉。
+/// H3 framing pump 的生命周期与返回给 relay 的流绑定；流被丢弃时直接取消
+/// pump，因此半关闭宽限只由 relay 维护一份。
+struct FramedStream {
+    io: tokio::io::DuplexStream,
+    task: JoinHandle<()>,
+}
+
+impl AsyncRead for FramedStream {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().io).poll_read(cx, buf)
+    }
+}
+
+impl AsyncWrite for FramedStream {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.get_mut().io).poll_write(cx, buf)
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().io).poll_flush(cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().io).poll_shutdown(cx)
+    }
+}
+
+impl Drop for FramedStream {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
 async fn pump(
     mut send: quinn::SendStream,
     mut recv: quinn::RecvStream,
@@ -344,28 +386,44 @@ async fn pump(
         () = &mut download => return,
         () = &mut upload => {}
     }
-    let _ = tokio::time::timeout(DRAIN_GRACE, download).await;
+    download.await;
 }
 
 /// 边缘 → 本地：收 H3 DATA frame 解出负载写回本地；非 DATA 帧（如 GREASE）直接丢弃。
 async fn drain_download(recv: &mut quinn::RecvStream, out: &mut (impl AsyncWrite + Unpin)) {
+    let mut buf = vec![0u8; RELAY_BUF];
     loop {
         let frame_type = match read_varint(recv).await {
             Ok(v) => v,
             Err(_) => return,
         };
-        let len = match read_varint(recv).await {
-            Ok(v) => v as usize,
+        let mut remaining = match read_varint(recv).await {
+            Ok(v) => v,
             Err(_) => return,
         };
-        let mut buf = vec![0u8; len];
-        if recv.read_exact(&mut buf).await.is_err() {
-            return;
-        }
-        if frame_type == 0x00 && out.write_all(&buf).await.is_err() {
-            return;
+        while remaining > 0 {
+            let chunk = usize::try_from(remaining.min(RELAY_BUF as u64)).unwrap_or(RELAY_BUF);
+            if recv.read_exact(&mut buf[..chunk]).await.is_err() {
+                return;
+            }
+            if frame_type == 0x00 && out.write_all(&buf[..chunk]).await.is_err() {
+                return;
+            }
+            remaining -= chunk as u64;
         }
     }
+}
+
+async fn discard_frame(recv: &mut quinn::RecvStream, mut remaining: u64) -> Result<()> {
+    let mut buf = vec![0u8; RELAY_BUF];
+    while remaining > 0 {
+        let chunk = usize::try_from(remaining.min(RELAY_BUF as u64)).unwrap_or(RELAY_BUF);
+        recv.read_exact(&mut buf[..chunk])
+            .await
+            .context("跳过未知帧失败")?;
+        remaining -= chunk as u64;
+    }
+    Ok(())
 }
 
 /// 本地 → 边缘：读本地字节，包成 H3 DATA frame 发出。
@@ -395,11 +453,9 @@ fn build_endpoint() -> Result<quinn::Endpoint> {
 /// 并发拨号所有候选边缘，最先握手成功的中标，其余候选直接丢弃（未完成的
 /// QUIC 握手 drop 时自然放弃，无需显式取消）。
 ///
-/// 之所以并发而非逐个尝试：`open()` 重连时持有 `link` 锁调用这里，期间所有
-/// 并发的隧道操作（业务连接/DNS/健康检查探测）都会阻塞在锁上；逐个尝试在
-/// 候选数多、DIAL_TIMEOUT 较大时最坏耗时是"候选数 × DIAL_TIMEOUT"，容易超过
-/// 健康检查轮询间隔导致探测连续失败触发容器重启。并发拨号把最坏耗时压到
-/// 接近单次 DIAL_TIMEOUT。
+/// 之所以并发而非逐个尝试：重连由 `reconnecting` 串行化，逐个尝试在候选数
+/// 多时最坏耗时是“候选数 × DIAL_TIMEOUT”，会让所有等待同一次重连的调用者
+/// 长时间停顿；并发拨号把最坏耗时压到接近单次 DIAL_TIMEOUT。
 async fn connect(
     endpoint: &quinn::Endpoint,
     cfg: &quinn::ClientConfig,
@@ -494,4 +550,28 @@ async fn read_varint(recv: &mut quinn::RecvStream) -> Result<u64> {
 
 fn io_err(msg: String) -> io::Error {
     io::Error::other(msg)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn connect_headers_frame_has_bounded_allocation() {
+        assert_eq!(
+            checked_headers_len(MAX_HEADERS_FRAME_SIZE as u64).unwrap(),
+            MAX_HEADERS_FRAME_SIZE
+        );
+        assert!(checked_headers_len(MAX_HEADERS_FRAME_SIZE as u64 + 1).is_err());
+    }
+
+    #[tokio::test]
+    async fn dropping_framed_stream_aborts_its_pump() {
+        let (io, _peer) = tokio::io::duplex(1);
+        let task = tokio::spawn(std::future::pending::<()>());
+        let abort = task.abort_handle();
+        drop(FramedStream { io, task });
+        tokio::task::yield_now().await;
+        assert!(abort.is_finished());
+    }
 }
