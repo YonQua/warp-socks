@@ -16,7 +16,7 @@ pub mod masque;
 pub mod wireguard;
 
 pub use masque::Masque;
-pub use wireguard::{WgOutbound, WgRecoveryConfig};
+pub use wireguard::WgOutbound;
 
 /// 双向字节流。项目内 netstack 的 TcpStream、quinn (Send,Recv) 组合都满足。
 pub trait Stream: AsyncRead + AsyncWrite + Unpin + Send {}
@@ -68,22 +68,6 @@ pub struct Connected {
     pub note: Option<String>,
 }
 
-/// 健康探测失败后允许后端采用的恢复强度。
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum RecoveryMode {
-    /// 仅在后端已有明确数据面失联证据时恢复。
-    Opportunistic,
-    /// 连续失败已达阈值，要求后端执行最后一次恢复尝试。
-    Forced,
-}
-
-/// 后端处理一次恢复请求后的结果。
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum RecoveryOutcome {
-    NotNeeded,
-    Recovered,
-}
-
 /// 出网后端：给定 host:port 产出一条双向字节流，可选支持 UDP。
 #[async_trait]
 pub trait Outbound: Send + Sync {
@@ -112,14 +96,5 @@ pub trait Outbound: Send + Sync {
             std::io::ErrorKind::Unsupported,
             "该出网后端不支持 UDP",
         ))
-    }
-
-    /// 处理一次健康探测失败。后端同时拥有“是否需要恢复”和“如何恢复”的
-    /// 决策权，调用方只负责选择恢复强度并在恢复后复测。
-    ///
-    /// # Errors
-    /// 后端决定执行恢复、但恢复过程失败时返回错误。
-    async fn recover(&self, _mode: RecoveryMode) -> anyhow::Result<RecoveryOutcome> {
-        Ok(RecoveryOutcome::NotNeeded)
     }
 }

@@ -7,15 +7,12 @@
 ### Changed
 
 - **breaking**：`TEAMS_TOKEN` 统一为注册链接中 `token=` 后面的原始三段 JWT（`header.payload.signature`）；不再接受或自动截取 `token=`、完整 `com.cloudflare.warp://...` 链接或引号，错误格式会在发送注册请求前明确失败。
-- WireGuard transport 改为单任务持有 BoringTun 状态机、outer UDP 和 timer；数据通道按 1024 包有界背压，解密队列拥塞时丢弃并计数，不阻塞 outer UDP 接收、握手和 rekey。
-- netstack 的有限发送批次改为 `feed + flush`，不再把每个批次误当成完整 Stream 并关闭 packet sink；outer UDP 同时申请 4 MiB 收发缓冲并记录内核实际值。
-- WireGuard 自愈切换后立即停止旧 netstack generation，禁止同一 peer 的新旧 outer UDP socket 并行发送并触发 endpoint roaming；已有连接明确失败并由客户端重试。
-- WireGuard 恢复接口收敛为后端拥有的 `recover(mode)`，业务连接只克隆不可变 generation 快照，不再持有 `RwLock` 跨 DNS/拨号；`wg0.conf` 改为成功建立后写入的审计快照，不再通过“先写文件再解析”构造运行配置。
+- WireGuard transport 收敛为直接实现 netstack `AsyncDevice` 的单 `Tunn`、单 outer UDP socket、单 `Net` 生命周期；移除数据中转 task、packet channel、代际热切换和基于 TX/RX 顺序的伪停滞判断。
+- netstack 的有限发送批次改为 `feed + flush`，不再把每个批次误当成完整 Stream 并关闭 packet sink。
+- WireGuard 运行期只以真实 SOCKS trace 失败作为恢复信号；首次失败即冷却当前 endpoint 并退出，让 Docker 以全新的 `Tunn`、outer UDP socket 和 `Net` 验证池中其它路径，同时释放无法靠原地重绑可靠续传的旧 TCP。
 - TCP relay 在客户端上行结束后最多保留下行 30 秒，远端先结束则立即释放；视频 Range 请求被取消时不再因无限等待另一方向而堆积 `CLOSE_WAIT` 和虚拟 TCP socket。
-- 运行期探测失败默认只累计计数；WireGuard 仅在 reactor 已停止或数据面持续失联等明确证据下提前恢复，达到连续失败阈值后再执行强制恢复。单次拥塞不再无条件替换 netstack；Docker HEALTHCHECK 只检查最后一次成功探测是否过期，不维护第二套失败状态。
-- WireGuard 为每个 netstack 代际记录业务包发送和已认证回包活性；真实 SOCKS 探测完整等待 10 秒失败且期间没有认证业务回包时，会提前建立新 endpoint 代际并复测。普通瞬时失败仍按连续失败阈值处理，MASQUE 行为不变。
-- WireGuard transport 在近期持续业务发送，且认证回包与 outer UDP 回包同时静默 10 秒时，限频重绑同 endpoint UDP socket 并重握手；保留 BoringTun 状态机实例与 smoltcp generation，session/key 由 BoringTun 正常轮换，失败继续交给原有健康检查恢复。
-- WireGuard peer index 改为与 BoringTun 正式 device 一致的随机非零 24-bit 值，避免重握手或原地重建重复使用固定 sender index。
+- WireGuard peer index 改为与 BoringTun 正式 device 一致的随机非零 24-bit 值，避免不同生命周期重复使用固定 sender index。
+- WireGuard 每 5 秒输出一个只读数据面窗口，聚合 outer UDP、BoringTun 解封装结果、TCP 头部进度、smoltcp reactor/backlog/socket 和 cgroup CPU throttling；不记录 IP 或载荷内容。
 - endpoint 历史状态只会优先当前候选池中的 `last_good`；手工 `ENDPOINT_CANDIDATES` 不再被已移除的旧 endpoint 越界覆盖。
 - WireGuard 域名解析改为隧道内并发 A/AAAA：NODATA/NXDOMAIN 不再误等到 DNS 超时，TCP 使用 IPv4 优先、250 ms 交错启动的轻量 Happy Eyeballs，UDP 使用 A 优先、AAAA 兜底；MASQUE 的单记录类型未命中降为 debug 日志。
 - `SOCKS_LISTEN_ADDRS` 默认改为 `auto`：自动建立 IPv4 与 V6-only IPv6 listener，并按控制连接的实际本机地址返回同地址族 UDP relay；自动模式只接受本地或 LAN 客户端，不再要求部署者手填宿主机 IPv4/ULA。

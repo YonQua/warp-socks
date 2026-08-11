@@ -30,6 +30,11 @@ use smoltcp::time::{Duration as SmolDuration, Instant as SmolInstant};
 use smoltcp::wire::{IpAddress, IpCidr, IpEndpoint, IpListenEndpoint};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::Notify;
+use tokio::time::MissedTickBehavior;
+
+use crate::dataplane::{
+    DataPlaneObserver, ReactorWake, ReportState, SocketSnapshot, REPORT_INTERVAL,
+};
 
 const DEFAULT_MAX_BURST_SIZE: usize = 100;
 const DEFAULT_POLL_INTERVAL: SmolDuration = SmolDuration::from_secs(60);
@@ -105,6 +110,22 @@ impl Net {
     /// # Errors
     /// 配置缺少地址、地址重复，或默认路由无法安装时返回错误。
     pub fn new<D: AsyncDevice + 'static>(device: D, config: NetConfig) -> io::Result<Self> {
+        Self::new_inner(device, config, None)
+    }
+
+    pub(crate) fn new_observed<D: AsyncDevice + 'static>(
+        device: D,
+        config: NetConfig,
+        observer: DataPlaneObserver,
+    ) -> io::Result<Self> {
+        Self::new_inner(device, config, Some(observer))
+    }
+
+    fn new_inner<D: AsyncDevice + 'static>(
+        device: D,
+        config: NetConfig,
+        observer: Option<DataPlaneObserver>,
+    ) -> io::Result<Self> {
         let caps = device.capabilities().clone();
         let mut buffered = BufferDevice::new(caps);
         let mut interface =
@@ -150,7 +171,16 @@ impl Net {
             })?;
         }
 
-        let (reactor, task) = Reactor::new(device, interface, buffered, config.buffer_size);
+        let (reactor, task) = Reactor::new(
+            device,
+            interface,
+            buffered,
+            config.buffer_size,
+            observer.clone(),
+        );
+        if let Some(observer) = observer {
+            spawn_reporter(observer, reactor.allocator.table.clone());
+        }
         let reactor = Arc::new(reactor);
         let task_reactor = Arc::downgrade(&reactor);
         tokio::spawn(async move {
@@ -194,10 +224,7 @@ impl Net {
         self.reactor.is_stopped()
     }
 
-    /// 立即停止本代网络栈，并中断所有仍持有本代 reactor 的 TCP/UDP socket。
-    ///
-    /// WireGuard 同一 peer 不能让两个使用不同 outer UDP socket 的 generation
-    /// 同时发送，否则对端的 endpoint roaming 会让新旧 generation 互相抢占。
+    /// 立即停止当前网络栈，并中断所有仍持有该 reactor 的 TCP/UDP socket。
     pub fn shutdown(&self) {
         self.reactor.shutdown();
     }
@@ -494,6 +521,7 @@ struct Reactor {
     stopper: Arc<Notify>,
     interface: Arc<Mutex<Interface>>,
     allocator: SocketAllocator,
+    observer: Option<DataPlaneObserver>,
     stopped: AtomicBool,
 }
 
@@ -503,6 +531,7 @@ impl Reactor {
         interface: Interface,
         buffered: BufferDevice,
         buffer_size: BufferSize,
+        observer: Option<DataPlaneObserver>,
     ) -> (
         Self,
         impl std::future::Future<Output = io::Result<()>> + Send,
@@ -518,6 +547,7 @@ impl Reactor {
             allocator.clone(),
             notify.clone(),
             stopper.clone(),
+            observer.clone(),
         );
         (
             Self {
@@ -525,6 +555,7 @@ impl Reactor {
                 stopper,
                 interface,
                 allocator,
+                observer,
                 stopped: AtomicBool::new(false),
             },
             task,
@@ -542,6 +573,9 @@ impl Reactor {
     }
 
     fn wake(&self) {
+        if let Some(observer) = &self.observer {
+            observer.record_reactor_wake_call();
+        }
         self.notify.notify_one();
     }
 
@@ -579,6 +613,7 @@ async fn run_reactor(
     allocator: SocketAllocator,
     notify: Arc<Notify>,
     stopper: Arc<Notify>,
+    observer: Option<DataPlaneObserver>,
 ) -> io::Result<()> {
     let max_burst = device
         .capabilities()
@@ -587,7 +622,13 @@ async fn run_reactor(
     let mut received = VecDeque::with_capacity(max_burst);
 
     loop {
+        if let Some(observer) = &observer {
+            observer.record_reactor_loop();
+        }
         let outgoing = buffered.take_send_queue();
+        if let Some(observer) = &observer {
+            observer.record_device_backlog(buffered.recv_queue.len(), outgoing.len());
+        }
         flush_packets(&mut device, outgoing).await?;
 
         let mut stream_ended = false;
@@ -596,14 +637,30 @@ async fn run_reactor(
                 .lock()
                 .poll_delay(SmolInstant::now(), &allocator.table.lock().sockets)
                 .unwrap_or(DEFAULT_POLL_INTERVAL);
+            if let Some(observer) = &observer {
+                observer.record_reactor_wait();
+            }
             tokio::select! {
-                _ = tokio::time::sleep(delay.into()) => {}
-                packet = device.next() => match packet {
-                    Some(Ok(packet)) => received.push_back(packet),
-                    Some(Err(error)) => return Err(error),
-                    None => break,
+                _ = tokio::time::sleep(delay.into()) => {
+                    if let Some(observer) = &observer {
+                        observer.record_reactor_wake(ReactorWake::Timer);
+                    }
+                }
+                packet = device.next() => {
+                    if let Some(observer) = &observer {
+                        observer.record_reactor_wake(ReactorWake::Device);
+                    }
+                    match packet {
+                        Some(Ok(packet)) => received.push_back(packet),
+                        Some(Err(error)) => return Err(error),
+                        None => break,
+                    }
                 },
-                _ = notify.notified() => {}
+                _ = notify.notified() => {
+                    if let Some(observer) = &observer {
+                        observer.record_reactor_wake(ReactorWake::Notify);
+                    }
+                }
                 _ = stopper.notified() => break,
             }
 
@@ -621,17 +678,69 @@ async fn run_reactor(
         }
 
         buffered.push_received(received.drain(..));
+        if let Some(observer) = &observer {
+            observer.record_device_backlog(buffered.recv_queue.len(), buffered.send_queue.len());
+        }
         interface.lock().poll(
             SmolInstant::now(),
             &mut buffered,
             &mut allocator.table.lock().sockets,
         );
+        if let Some(observer) = &observer {
+            observer.record_reactor_poll();
+            observer.record_device_backlog(buffered.recv_queue.len(), buffered.send_queue.len());
+        }
 
         if stream_ended {
             break;
         }
     }
     Ok(())
+}
+
+fn spawn_reporter(observer: DataPlaneObserver, table: SharedSocketTable) {
+    let observer = observer.downgrade();
+    let table = Arc::downgrade(&table);
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(REPORT_INTERVAL);
+        interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        interval.tick().await;
+        let mut state = ReportState::default();
+        loop {
+            interval.tick().await;
+            let Some(observer) = observer.upgrade() else {
+                break;
+            };
+            let Some(table) = table.upgrade() else {
+                break;
+            };
+            let sockets = socket_snapshot(&table.lock().sockets);
+            observer.report_window(&mut state, sockets);
+        }
+    });
+}
+
+fn socket_snapshot(sockets: &SocketSet<'_>) -> SocketSnapshot {
+    let mut snapshot = SocketSnapshot::default();
+    for (_, socket) in sockets.iter() {
+        match socket {
+            smoltcp::socket::Socket::Tcp(socket) => {
+                snapshot.tcp_total += 1;
+                snapshot.tcp_rx_queue += socket.recv_queue();
+                snapshot.tcp_tx_queue += socket.send_queue();
+                match socket.state() {
+                    tcp::State::Established => snapshot.tcp_established += 1,
+                    tcp::State::SynSent | tcp::State::SynReceived | tcp::State::Listen => {
+                        snapshot.tcp_connecting += 1;
+                    }
+                    tcp::State::Closed => snapshot.tcp_closed += 1,
+                    _ => snapshot.tcp_closing += 1,
+                }
+            }
+            smoltcp::socket::Socket::Udp(_) => snapshot.udp_total += 1,
+        }
+    }
+    snapshot
 }
 
 async fn flush_packets(
@@ -1126,7 +1235,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dropping_net_keeps_existing_socket_generation_alive_until_explicit_shutdown() {
+    async fn dropping_net_keeps_reactor_alive_while_socket_exists() {
         let net = dual_stack_net();
         let socket = net.udp_bind("0.0.0.0:0".parse().unwrap()).await.unwrap();
         let reactor = Arc::downgrade(&socket.reactor);
@@ -1140,7 +1249,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn shutdown_stops_existing_socket_generation() {
+    async fn shutdown_stops_existing_sockets() {
         let net = dual_stack_net();
         let socket = net.udp_bind("0.0.0.0:0".parse().unwrap()).await.unwrap();
 

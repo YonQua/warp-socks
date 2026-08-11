@@ -8,7 +8,7 @@
 2. MASQUE 未开启，或开启但注册/建隧道失败需要回退时，才走 `TEAMS_TOKEN -> account.json`（首次注册，之后重启直接复用）-> `wg0.conf`
 3. `Supervisor` 起隧道 + 内置 SOCKS5：`WARP_SOCKS_ENABLE_MASQUE=1` 时先试 MASQUE（Cloudflare QUIC/H3 隧道），失败或未开启则用 userspace WireGuard
 4. 经 SOCKS5 出口探测通过（`warp=on`）后进入运行态
-5. 运行期探测失败时先按后端证据恢复；连续失败达到阈值后执行最后一次强制恢复和复测，仍失败才退出并由 Docker 重启
+5. 运行期 WireGuard 真实 SOCKS 探测首次失败时，冷却 endpoint 并退出，由 Docker 用全新隧道生命周期从候选池重新选择
 
 说明：WireGuard 路径不再使用内核 `wg-quick` / `microsocks`。在中国等网络环境下，内核 WireGuard 常卡在 `0 B received`；当前实现改用带 WARP tricks 的 userspace 客户端。
 
@@ -20,7 +20,7 @@
 - `reg.json` 是 MASQUE 路径的凭据文件（`WARP_SOCKS_ENABLE_MASQUE=1` 时使用），缺失会自动注册；MASQUE 路径没有 endpoint 候选轮换，不涉及 `endpoint-state.json`
 - `endpoint-state.json` 只保存 WireGuard 候选的 `last_good_endpoint` 和 cooldown
 - 启动阶段失败直接退出，由 Docker 重启容器
-- 运行期失败由后端按证据恢复；达到阈值且强制恢复、复测仍失败时，PID 1 主动退出
+- WireGuard 运行期首次探测失败即退出；MASQUE 连续失败达到阈值后退出
 
 隧道、SOCKS5、注册、健康探测、候选编排均已收口到自研的 `warp-socks-rs` 单一二进制（`src/`），子命令划分：
 
@@ -94,7 +94,7 @@ docker exec warp-socks curl --socks5-hostname 127.0.0.1:1080 https://cloudflare.
 | `WARP_SOCKS_STARTUP_EGRESS_PROBE_TIMEOUT`  | `5`    | 单次启动阶段 SOCKS 出口探测超时秒数    |
 | `WARP_SOCKS_STARTUP_SOCKS_READY_TIMEOUT`   | `20`   | 启动阶段等待隧道+SOCKS 就绪的总秒数    |
 | `WARP_SOCKS_HEALTHCHECK_PROBE_TIMEOUT`     | `63`   | 运行期单次健康检查探测的独立总预算（秒） |
-| `WARP_SOCKS_HEALTHCHECK_FAILURE_THRESHOLD` | `3`    | 连续失败达到多少次后执行强制恢复；复测仍失败才退出 |
+| `WARP_SOCKS_HEALTHCHECK_FAILURE_THRESHOLD` | `3`    | MASQUE 连续失败多少次后退出；WireGuard 固定首次真实探测失败即退出 |
 | `WARP_RS_TRICK`                            | `none` | 反审查伪装包模式，`none`/`t1`/`t2` |
 | `WARP_SOCKS_ENABLE_MASQUE`                 | `1`    | 默认开启：自动确保 `reg.json` 存在（缺失则在进程内直接完成注册），warp-socks-rs 优先走 MASQUE，失败仍回退 WireGuard；显式设为 `0` 则跳过 MASQUE，只走 WireGuard |
 
@@ -115,7 +115,7 @@ WARP_SOCKS_HEALTHCHECK_FAILURE_THRESHOLD=2
 
 - userspace 握手通常 3~8 秒，遇到重试可能到 15 秒以上；`WARP_SOCKS_STARTUP_SOCKS_READY_TIMEOUT` 是这段总等待时间，不建议低于 `15`。
 - `WARP_SOCKS_HEALTHCHECK_PROBE_TIMEOUT` 不建议手工调低：探测走的是和真实业务连接相同的路径，需要给后端内部的拨号、重连和协议握手留下完整执行时间。默认 63 秒是独立的运维总预算，不反向依赖某个具体后端的私有超时常量。
-- `WARP_SOCKS_HEALTHCHECK_FAILURE_THRESHOLD` 是运行期恢复的唯一连续失败阈值来源；Docker `HEALTHCHECK` 只读取最后成功心跳，不再形成第二套恢复状态机。
+- WireGuard 不使用包计数猜测停滞：首次真实 SOCKS trace 失败即冷却当前 endpoint 并退出，让整个 `Tunn + UDP socket + Net` 生命周期和所有半死 TCP 一起释放。`WARP_SOCKS_HEALTHCHECK_FAILURE_THRESHOLD` 只用于 MASQUE。Docker `HEALTHCHECK` 只读取最后成功心跳，不形成第二套恢复状态机。
 - 注册链路遇到 `429` 时仍会尊重服务端 `Retry-After`，这部分不会被本地更小的 delay 强行覆盖。
 
 ## Endpoint 策略
@@ -138,9 +138,9 @@ WARP_SOCKS_HEALTHCHECK_FAILURE_THRESHOLD=2
 这些地址和端口位于 Cloudflare 为 Zero Trust WireGuard 公布的入口范围内；候选池同时覆盖
 主端口 `2408` 和回退端口 `500`、`1701`、`4500`，使 endpoint 切换具备实际路径多样性。
 
-生产环境不建议只填写一个 endpoint；单候选会让运行期自愈没有可切换目标。通常保持为空即可。
+生产环境不建议只填写一个 endpoint；单候选失效时，下一生命周期没有其它可验证路径。通常保持为空即可。
 
-运行期单次 healthcheck 失败默认只累计计数，不立即切换 endpoint，避免短时拥塞打断仍在工作的连接。WireGuard 只在近期持续发送业务包，且认证回包与 outer UDP 回包都静默 10 秒时，限频替换同 endpoint 的 UDP socket 并重握手；原 BoringTun 状态机实例和 smoltcp generation 继续使用，session/key 由 BoringTun 正常轮换。若仍未恢复，则继续使用原有健康检查与 endpoint generation 切换路径。新 generation 完成握手后会原子替换当前网络栈并立即终止旧 generation；已有连接由客户端重试。容器重启后优先尝试最近成功的 endpoint，内部状态保存在 `./data/endpoint-state.json`。
+运行期不根据 TX/RX 包顺序猜测“数据面停滞”。BoringTun 按协议处理 keepalive 和 rekey；只有真实 SOCKS trace 失败，Supervisor 才冷却当前 endpoint 并退出。Docker 新生命周期重新创建单一 `Tunn + outer UDP socket + Net`，同时强制释放旧的虚拟 TCP，让客户端明确重连，再验证候选池。每个候选必须完成握手和真实 SOCKS trace 后才写入 `wg0.conf` 与 `endpoint-state.json`。
 
 启动阶段会按顺序逐个尝试候选，单个候选最坏耗时约为 `WARP_SOCKS_STARTUP_SOCKS_READY_TIMEOUT` 秒；默认候选池 8 个时，全部失败的最坏总耗时约 `8 × 20s ≈ 160` 秒，之后由 Docker 按 `RESTART_POLICY` 重启容器重试。这段等待期间容器还没有标记 runtime ready，healthcheck 不会介入，不会被误判为不健康。
 

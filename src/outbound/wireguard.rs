@@ -3,30 +3,24 @@
 // connect_tcp 走虚拟网卡的 TCP 栈；域名目标在隧道内用虚拟网卡的 UDP socket
 // 发 DNS 查询解析。这层只是薄封装，实际逻辑在 crate::netstack 和 crate::dns 里。
 //
-// 恢复语义对齐 masque::Masque::open()：探测失败时由后端单飞重连。
-// Supervisor 只传入恢复强度并复测；候选池、活性证据和切换都由本后端持有。
+// WireGuard 后端持有单一、不可变的 Net 生命周期。运行期不原地重建或切换；
+// 真实出口探测失败时由 Supervisor 结束整个进程生命周期。
 
 use std::collections::VecDeque;
 use std::future::Future;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use futures::stream::{FuturesUnordered, StreamExt};
-use log::{info, warn};
 use smoltcp::iface::Config as IfaceConfig;
 use smoltcp::wire::{HardwareAddress, IpAddress, IpCidr};
-use tokio::sync::{Mutex, RwLock};
 
-use super::{Connected, Datagram, Host, Outbound, RecoveryMode, RecoveryOutcome};
+use super::{Connected, Datagram, Host, Outbound};
 use crate::config::WgConfig;
 use crate::dns::{resolve, RecordType};
-use crate::endpoint::{plan_candidates, JsonFileEndpointStore};
 use crate::netstack::{BufferSize, Net, NetConfig, UdpSocket as TunnelUdpSocket};
-use crate::registration::{self, WgAccount};
-use crate::tunnel::TunnelActivity;
 use crate::tunnel::{Trick, WgTunnel};
 
 const DNS_SERVER: SocketAddr = SocketAddr::new(
@@ -36,72 +30,27 @@ const DNS_SERVER: SocketAddr = SocketAddr::new(
 const DNS_TIMEOUT: Duration = Duration::from_secs(5);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const HAPPY_EYEBALLS_DELAY: Duration = Duration::from_millis(250);
-// 一次完整 TCP 拨号已经等待 CONNECT_TIMEOUT 仍失败，且期间没有任何已认证
-// 业务回包，就已有足够证据判定数据面失联；与拨号超时对齐可避免刚好错过
-// 门槛后再等待一个健康检查周期。
-const TUNNEL_STALL_TIMEOUT: Duration = CONNECT_TIMEOUT;
-
-/// `establish` 需要的、连接本身用不到、只在运行期自愈时才会用上的那部分
-/// 状态，打包传入避免参数表过长，也把"自愈需要什么"集中在一处声明。
-pub struct WgRecoveryConfig {
-    pub pool: Vec<String>,
-    pub endpoint_state_file: PathBuf,
-    pub wg_conf_path: PathBuf,
-    pub cooldown: Duration,
-}
-
-/// 自愈上下文：换一个候选 endpoint 原地重建隧道需要的一切。整体收在这里、
-/// 整体锁住——这把锁本身就是单飞锁（对齐 masque::Masque 的 `reconnecting`），
-/// 不需要再单独维护一把 `Mutex<()>`。
-struct RecoveryCtx {
-    account: WgAccount,
-    pool: Vec<String>,
-    endpoint_state_file: PathBuf,
-    wg_conf_path: PathBuf,
-    trick: Trick,
-    handshake_timeout: Duration,
-    cooldown: Duration,
-}
 
 pub struct WgOutbound {
-    generation: RwLock<std::sync::Arc<WgGeneration>>,
-    recovery_ctx: Mutex<RecoveryCtx>,
-}
-
-struct WgGeneration {
     net: Net,
-    activity: std::sync::Arc<TunnelActivity>,
-    endpoint: String,
 }
 
 impl WgOutbound {
-    /// 用给定候选 endpoint 建立 WireGuard 隧道（连接 + 握手）并起虚拟网卡；
-    /// 同时保存自愈所需的账户/候选池/冷却状态，供运行期 [`Outbound::recover`] 使用。
+    /// 用已派生的配置建立 WireGuard 隧道（连接 + 握手）并起虚拟网卡。
     ///
     /// # Errors
     /// 隧道连接、握手失败时返回错误。
     pub async fn establish(
-        account: &WgAccount,
-        endpoint: &str,
+        config: &WgConfig,
         trick: Trick,
         handshake_timeout: Duration,
-        recovery: WgRecoveryConfig,
     ) -> Result<Self> {
-        let wg_config = registration::build_wg_config(account, Some(endpoint))?;
-        let generation = build_generation(&wg_config, trick, handshake_timeout).await?;
-        registration::write_wg_conf(&wg_config, &recovery.wg_conf_path)?;
-        Ok(Self {
-            generation: RwLock::new(std::sync::Arc::new(generation)),
-            recovery_ctx: Mutex::new(RecoveryCtx {
-                account: account.clone(),
-                pool: recovery.pool,
-                endpoint_state_file: recovery.endpoint_state_file,
-                wg_conf_path: recovery.wg_conf_path,
-                trick,
-                handshake_timeout,
-                cooldown: recovery.cooldown,
-            }),
-        })
+        let mut tunnel = WgTunnel::connect(config, trick).await?;
+        tunnel.handshake(handshake_timeout).await?;
+        let observer = tunnel.observer();
+        let net = Net::new_observed(tunnel, build_net_config(config), observer)
+            .context("启动 WireGuard 双栈网络栈失败")?;
+        Ok(Self { net })
     }
 
     // 域名的 A/AAAA 并发走隧道内 DNS；IP 字面量直接返回。地址按 IPv4、IPv6
@@ -203,26 +152,6 @@ where
     ))
 }
 
-/// 建 `Tunn` + 握手 + 起虚拟网卡；初次建立与运行期恢复共用。
-async fn build_generation(
-    config: &WgConfig,
-    trick: Trick,
-    handshake_timeout: Duration,
-) -> Result<WgGeneration> {
-    let mut tunnel = WgTunnel::connect(config, trick).await?;
-    tunnel.handshake(handshake_timeout).await?;
-    let activity = tunnel.activity();
-    let device = tunnel.start();
-
-    let net_config = build_net_config(config);
-    let net = Net::new(device, net_config).context("启动 WireGuard 双栈网络栈失败")?;
-    Ok(WgGeneration {
-        net,
-        activity,
-        endpoint: config.endpoint.to_string(),
-    })
-}
-
 fn build_net_config(config: &WgConfig) -> NetConfig {
     let mut interface_config = IfaceConfig::new(HardwareAddress::Ip);
     interface_config.random_seed = rand::random();
@@ -284,11 +213,10 @@ impl Outbound for WgOutbound {
 
     async fn connect_tcp(&self, host: Host, port: u16) -> std::io::Result<Connected> {
         // smoltcp 对未响应的 SYN 只会把重传间隔倍增到 60s 封顶，不加超时会永远挂着。
-        let generation = self.generation.read().await.clone();
-        let targets = Self::resolve_targets(&generation.net, host, port).await?;
+        let targets = Self::resolve_targets(&self.net, host, port).await?;
         let connected = tokio::time::timeout(
             CONNECT_TIMEOUT,
-            connect_first(targets, |addr| generation.net.tcp_connect(addr)),
+            connect_first(targets, |addr| self.net.tcp_connect(addr)),
         )
         .await
         .map_err(|_| {
@@ -304,8 +232,7 @@ impl Outbound for WgOutbound {
     }
 
     async fn connect_udp(&self, host: Host, port: u16) -> std::io::Result<Box<dyn Datagram>> {
-        let generation = self.generation.read().await.clone();
-        let target = Self::resolve_targets(&generation.net, host, port)
+        let target = Self::resolve_targets(&self.net, host, port)
             .await?
             .into_iter()
             .next()
@@ -319,86 +246,12 @@ impl Outbound for WgOutbound {
             SocketAddr::V4(_) => SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
             SocketAddr::V6(_) => SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0),
         };
-        let sock = generation
+        let sock = self
             .net
             .udp_bind(bind_addr)
             .await
             .map_err(|e| std::io::Error::other(format!("绑定隧道内 UDP socket 失败: {e}")))?;
         Ok(Box::new(WgDatagram { sock, target }))
-    }
-
-    /// 按恢复强度判断并重建一个未冷却的 endpoint；语义对齐
-    /// `masque::Masque::open()` 的单飞重连——`recovery_ctx` 锁本身就是单飞锁，
-    /// 重建这段网络 I/O 在锁内进行。明确失联证据和 endpoint 选择都属于同一
-    /// 恢复决策，不再拆成调用方预判与后端执行两套可能漂移的状态。
-    async fn recover(&self, mode: RecoveryMode) -> Result<RecoveryOutcome> {
-        let ctx = self.recovery_ctx.lock().await;
-        let current_generation = self.generation.read().await.clone();
-        if mode == RecoveryMode::Opportunistic {
-            if current_generation.net.is_stopped() {
-                warn!("WireGuard netstack reactor 已停止；立即重建");
-            } else if let Some(silent_for) = current_generation
-                .activity
-                .stalled_for(TUNNEL_STALL_TIMEOUT)
-            {
-                let snapshot = current_generation.activity.snapshot();
-                warn!(
-                    "WireGuard 数据面已发送业务包，但 {silent_for:?} 未收到已认证业务回包；提前重建（outer_rx={}, outer_tx={}, outer_rx_silent_for={:?}, netstack_rx_dropped={}）",
-                    snapshot.outer_rx_packets,
-                    snapshot.outer_tx_packets,
-                    snapshot.outer_rx_silent_for,
-                    snapshot.netstack_rx_dropped,
-                );
-            } else {
-                return Ok(RecoveryOutcome::NotNeeded);
-            }
-        }
-
-        let mut store = JsonFileEndpointStore::load(&ctx.endpoint_state_file)?;
-        store.mark_cooldown(&current_generation.endpoint, ctx.cooldown)?;
-
-        let next = plan_candidates(ctx.pool.clone(), &store)
-            .into_iter()
-            .find(|ep| ep != &current_generation.endpoint)
-            .context("候选池已无其它可用 endpoint")?;
-
-        let build = async {
-            let wg_config = registration::build_wg_config(&ctx.account, Some(&next))?;
-            let fresh = build_generation(&wg_config, ctx.trick, ctx.handshake_timeout).await?;
-            Ok::<_, anyhow::Error>((wg_config, fresh))
-        };
-        let (wg_config, fresh) = match build.await {
-            Ok(result) => result,
-            Err(e) => {
-                // next 本身建立失败，标记冷却避免下次探测失败又立刻选中它，对齐
-                // run_wireguard() 启动循环里每个候选失败都会 mark_cooldown 的做法。
-                // 冷却写入是 best-effort：就算它也失败（如本机 fd 耗尽），也不该
-                // 掩盖真正的建隧道错误 e。
-                let _ = store.mark_cooldown(&next, ctx.cooldown);
-                return Err(e);
-            }
-        };
-        registration::write_wg_conf(&wg_config, &ctx.wg_conf_path)?;
-        // 隧道已经真正切换成功——generation 替换是纯内存操作，不依赖磁盘
-        // I/O，必须在这里就完成，不能让下面 record_success 的写盘
-        // 失败倒过来污染"自愈是否成功"这个判断：不然调用方看到 recover() 返回
-        // Err 会误以为隧道没切过去，实际 net 早已指向 next，只是没记到
-        // endpoint-state.json 里而已（下次心跳探测走的是新隧道，会正常通过）。
-        let previous = {
-            let mut generation = self.generation.write().await;
-            let old = std::mem::replace(&mut *generation, std::sync::Arc::new(fresh));
-            // 同一 WireGuard peer 的 endpoint 会随最新认证包漫游。旧 generation
-            // 若继续使用另一个 UDP socket 发送，会把刚切好的新 generation 抢走；
-            // 因此必须在释放写锁、放行新连接前终止旧连接。
-            old.net.shutdown();
-            old.endpoint.clone()
-        };
-        info!("WireGuard endpoint 已切换: {previous} -> {next}");
-
-        if let Err(e) = store.record_success(&next) {
-            warn!("记录 endpoint {next} 成功状态失败（不影响本次自愈结果）: {e:#}");
-        }
-        Ok(RecoveryOutcome::Recovered)
     }
 }
 

@@ -1,5 +1,6 @@
 pub mod appconfig;
 pub mod config;
+pub(crate) mod dataplane;
 pub mod dns;
 pub mod endpoint;
 pub mod fsutil;

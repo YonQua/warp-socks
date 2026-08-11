@@ -35,11 +35,8 @@ pub struct AppConfig {
     pub startup_endpoint_cooldown: Duration,
     pub healthcheck_probe_timeout: Duration,
     pub healthcheck_failure_threshold: u32,
-    /// 运行期健康检查轮询间隔；对应此前 Dockerfile HEALTHCHECK --interval=30s。
+    /// Supervisor 运行期真实 SOCKS 探测的轮询间隔。
     pub healthcheck_interval: Duration,
-    /// 运行期健康检查触发退出时对当前 endpoint 打的冷却时长；对应
-    /// env.sh: RUNTIME_ENDPOINT_COOLDOWN_SECONDS_DEFAULT=60。
-    pub runtime_endpoint_cooldown: Duration,
 }
 
 impl AppConfig {
@@ -99,8 +96,9 @@ impl AppConfig {
                 &env_var("WARP_SOCKS_HEALTHCHECK_FAILURE_THRESHOLD", "3"),
                 3,
             ),
-            healthcheck_interval: Duration::from_secs(30),
-            runtime_endpoint_cooldown: Duration::from_secs(60),
+            // 30 秒轮询叠加一次失败连接的 10 秒拨号预算，会让真实 UDP
+            // 黑洞最多持续约 40 秒；10 秒在探测开销和视频恢复时间之间折中。
+            healthcheck_interval: Duration::from_secs(10),
         }
     }
 }

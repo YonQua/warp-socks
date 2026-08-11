@@ -113,9 +113,9 @@ async fn run_healthcheck() -> Result<()> {
 }
 
 fn heartbeat_max_age(config: &AppConfig) -> std::time::Duration {
-    // Supervisor 才是连续失败和自愈的唯一决策者。Docker 的只读心跳窗口
-    // 必须覆盖完整阈值周期，再多留一轮给达到阈值后的 heal + 复测；否则
-    // Supervisor 仍按设计容忍瞬时拥塞时，容器会先显示 unhealthy。
+    // Docker 只读心跳，不参与恢复决策。窗口覆盖 MASQUE 配置的
+    // 完整失败阈值，并额外留一轮调度余量；WireGuard 在首次失败后
+    // 由 PID 1 主动退出，不依赖这个过期窗口。
     let rounds = config.healthcheck_failure_threshold.saturating_add(1);
     (config.healthcheck_interval + config.healthcheck_probe_timeout) * rounds
         + std::time::Duration::from_secs(10)

@@ -46,8 +46,8 @@ RUN chmod +x /usr/local/bin/warp-socks-rs
 # warp-socks-rs 自己的运行期健康检查循环里（见 src/supervisor.rs）。
 #
 # healthcheck 子命令不再自己发起一次真实的隧道探测，只读运行期循环写的心跳
-# 文件（见 src/health/heartbeat.rs）——纯本地文件读取，跟隧道自愈重连需要
-# 多久完全无关，--timeout 不需要再跟着内部任何超时预算走，给个宽松的固定
+# 文件（见 src/health/heartbeat.rs）——纯本地文件读取，跟真实探测的内部
+# 超时预算无关，--timeout 给一个宽松的固定
 # 值即可。
 HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=1 \
   CMD ["/usr/local/bin/warp-socks-rs", "healthcheck"]

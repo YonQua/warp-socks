@@ -8,7 +8,7 @@
 2. MASQUE 未开启，或开启但注册/建隧道失败需要回退时，才走 `TEAMS_TOKEN -> account.json`（首次注册，之后重启直接复用）-> `wg0.conf`（WireGuard 路径用）；`TEAMS_TOKEN` 只接受注册链接 `token=` 后面的原始三段 JWT，不接受 `token=` 本身、完整 URI 或引号
 3. `Supervisor`（`src/supervisor.rs`）在进程内起隧道（`WARP_SOCKS_ENABLE_MASQUE=1` 时优先 MASQUE，失败或未开启则 userspace WireGuard）+ 内置 SOCKS5
 4. 经 SOCKS5 出口探测通过（`warp=on`）后进入运行态
-5. 运行期 healthcheck 失败由后端按证据决定是否提前恢复；连续失败达到阈值后执行最后一次强制恢复和复测，仍失败才退出并由 Docker 重启
+5. WireGuard 运行期真实 SOCKS trace 首次失败即冷却 endpoint、退出，并由 Docker 用全新隧道生命周期重新执行候选验证
 
 说明：内核 `wg-quick` / `microsocks` 路径已废弃。中国等网络环境下，内核 WireGuard 常表现为 `0 B received`；带 WARP tricks 的 userspace 实现才能稳定握手。旧版 shell 编排（`lib/app/main.sh` 等按 endpoint 候选逐个拉起子进程）也已废弃，改为 `Supervisor` 在同一进程内完成候选尝试、SOCKS5 服务与健康检查，不再有子进程生命周期管理。
 
@@ -28,7 +28,7 @@
 
 - `data/wg0.conf`
   - 由 `account.json` 和 endpoint 派生
-  - 仅作为当前成功运行配置的可审计快照；运行态 endpoint 由内存 generation 持有，恢复排序由 `endpoint-state.json` 决定
+  - 仅作为当前已通过端到端探测的运行配置快照；不参与运行期恢复决策
 
 - `data/endpoint-state.json`
   - 只保存 `last_good_endpoint` 和 cooldown
@@ -58,17 +58,21 @@
 
 - `src/outbound/`
   - `mod.rs`：出网抽象 `Outbound` trait，SOCKS5/SOCKS4/HTTP 代理层只依赖它，不关心底层是 WireGuard 虚拟网卡还是 MASQUE H3 CONNECT 流
-  - `wireguard.rs`：WireGuard 出网后端，封装项目内双栈 `Net` 虚拟网卡，为 WARP IPv4 `/32` 和 IPv6 `/128` 同时安装默认路由，域名并发解析 A/AAAA，TCP 交错竞速地址，UDP 使用 A 优先/AAAA 兜底；业务克隆不可变 generation 快照，不持锁执行网络 I/O；恢复由单一 `recover(mode)` 接口在后端内判断并执行，原子替换后立即停止旧 generation，避免同一 peer 的 endpoint roaming 竞争
+  - `wireguard.rs`：WireGuard 出网后端，封装项目内双栈 `Net` 虚拟网卡，为 WARP IPv4 `/32` 和 IPv6 `/128` 同时安装默认路由，域名并发解析 A/AAAA，TCP 交错竞速地址，UDP 使用 A 优先、AAAA 兜底；只持有单一不可变 `Net`
   - `masque/`：MASQUE 出网后端（QUIC/H3 CONNECT），含 `tls.rs`（证书/pinned-key 握手）、`qpack.rs`（H3 头部编解码）、`huffman.rs`（QPACK 静态表 Huffman 编解码）、`doh.rs`（隧道内 DoH 解析，边缘不接受裸域名 CONNECT）
 
 - `src/netstack.rs`
   - 项目专用 Tokio/smoltcp 适配层；一个 reactor 驱动 `Interface`、TCP/UDP `SocketSet` 与 WireGuard packet device，不包含监听器或 raw socket 等无关能力
 
+- `src/dataplane.rs`
+  - WireGuard 数据面的只读聚合观测；热路径只更新原子计数，独立 reporter 每 5 秒关联 outer UDP、解封装、TCP 头部进度、reactor/backlog/socket 与 cgroup throttling
+  - TCP 只保留端口、seq/ack/flags、载荷长度和事件年龄，不记录 IP 或载荷内容；观测不参与恢复决策
+
 - `src/tunnel.rs`
   - boringtun `Tunn` 状态机的 I/O 驱动：UDP 收发、reserved bytes 覆写/清零、可选 t1/t2 反审查伪装包、握手与重传定时器
-  - BoringTun 状态机、outer UDP 和 timer 由单个 transport task 持有；smoltcp 与 transport 之间使用 1024 包有界通道。发送方按背压等待，解密队列满时丢弃 IP 包并计数，确保 outer UDP 接收、握手和 timer 不等待下游 netstack
-  - netstack 有限发送批次使用 `feed + flush`，不关闭长寿命 packet sink；outer UDP socket 显式申请 4 MiB 收发缓冲并记录内核实际值
-  - 同一 transport task 在近期业务 TX 持续发生，且认证 RX 与 outer UDP RX 同时静默 10 秒时，限频重绑同 endpoint UDP socket 并强制重握手；保留 BoringTun 状态机实例与 smoltcp generation，session/key 由 BoringTun 正常轮换，失败继续交给上层健康路径
+  - `WgTunnel` 直接实现 netstack 的 `AsyncDevice`，同一个 reactor 驱动 smoltcp、BoringTun、outer UDP 和 timer；没有数据中转 task、代际或 packet channel
+  - netstack 有限发送批次使用 `feed + flush`；outer UDP 暂时不可写时由 `Sink` 背压保留待发报文，不静默丢包，也不关闭长寿命 packet sink
+  - transport 不根据业务 TX/RX 顺序推断请求是否得到响应，也不执行重绑或 endpoint 切换；真实 trace 失败由 Supervisor 结束整个进程生命周期
 
 - `src/config.rs`
   - 解析 `wg0.conf`
@@ -80,9 +84,9 @@
 
 - `src/health/`
   - `probe.rs`：`SocksTraceProbe`，走本地 SOCKS5 请求 trace 接口检查 `warp=on|plus`
-  - `recovery.rs`：只累计连续失败并在达到阈值时发出强制恢复信号，不负责后端恢复或退出
+  - `recovery.rs`：`ThresholdRecovery` 只累计连续失败并请求退出，不执行恢复动作；WireGuard 阈值固定为 1，MASQUE 使用配置值
   - `heartbeat.rs`：`Supervisor` 只记录最后一次成功探测时间，`healthcheck` 子命令检查其是否过期，不再自己发起真实探测
-  - `mod.rs`：探测方式与恢复策略的 trait 抽象
+  - `mod.rs`：汇总探测、计数和心跳的具体实现
 
 - `src/mixed.rs`
   - 多监听地址共享同一出网后端和并发上限；auto 模式创建独立 IPv4 与 V6-only IPv6 wildcard listener，并在协议分发前拒绝公网来源；每个入口仍按首字节分发 SOCKS5/SOCKS4/HTTP
@@ -107,7 +111,7 @@
 - 只支持 Teams 注册登录
 - 隧道与代理由仓库根 `src/` 编译出的单一二进制提供，无子进程编排
 - 启动阶段必须先拿到可用 SOCKS 出口，再标记 runtime ready
-- 运行期恢复先由后端按证据处理；达到连续失败阈值后强制恢复和复测，仍失败才退出并由 Docker 重启
+- WireGuard 运行期首次真实探测失败即冷却 endpoint、退出；MASQUE 达到失败阈值后退出
 
 ## 读代码顺序
 
