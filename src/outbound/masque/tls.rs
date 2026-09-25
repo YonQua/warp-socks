@@ -71,26 +71,7 @@ impl rustls::client::danger::ServerCertVerifier for PinnedEdge {
 /// # Errors
 /// TLS 配置构建失败（无可用密码套件、证书/私钥不匹配等）时返回错误。
 pub(super) fn client_config(creds: &RegCredentials) -> Result<quinn::ClientConfig> {
-    // 曲线偏好：ring 无 P-521，只用 P-256/P-384，避免 X25519 导致 HelloRetryRequest。
-    let mut provider = rustls::crypto::ring::default_provider();
-    provider.kx_groups = vec![
-        rustls::crypto::ring::kx_group::SECP256R1,
-        rustls::crypto::ring::kx_group::SECP384R1,
-    ];
-
-    let cert = vec![rustls::pki_types::CertificateDer::from(
-        creds.client_cert_der.clone(),
-    )];
-    let key = rustls::pki_types::PrivateKeyDer::Pkcs8(rustls::pki_types::PrivatePkcs8KeyDer::from(
-        creds.client_key_der.clone(),
-    ));
-
-    let mut tls = rustls::ClientConfig::builder_with_provider(Arc::new(provider))
-        .with_safe_default_protocol_versions()?
-        .dangerous()
-        .with_custom_certificate_verifier(Arc::new(PinnedEdge(creds.pinned_spki_der.clone())))
-        .with_client_auth_cert(cert, key)?;
-    tls.alpn_protocols = vec![b"h3".to_vec()];
+    let tls = client_identity(creds, b"h3")?;
 
     // QUIC 参数对齐 warp-svc 的 tokio-quiche 默认值（见 warp-go/tunnel/masque.go:180-201）。
     let mut transport = quinn::TransportConfig::default();
@@ -106,4 +87,31 @@ pub(super) fn client_config(creds: &RegCredentials) -> Result<quinn::ClientConfi
     let mut cfg = quinn::ClientConfig::new(Arc::new(crypto));
     cfg.transport_config(Arc::new(transport));
     Ok(cfg)
+}
+
+/// MASQUE over TCP uses the same registered client identity and pinned edge key.
+pub(super) fn h2_client_config(creds: &RegCredentials) -> Result<Arc<rustls::ClientConfig>> {
+    Ok(Arc::new(client_identity(creds, b"h2")?))
+}
+
+fn client_identity(creds: &RegCredentials, alpn: &[u8]) -> Result<rustls::ClientConfig> {
+    // 曲线偏好：ring 无 P-521，只用 P-256/P-384，避免 X25519 导致 HelloRetryRequest。
+    let mut provider = rustls::crypto::ring::default_provider();
+    provider.kx_groups = vec![
+        rustls::crypto::ring::kx_group::SECP256R1,
+        rustls::crypto::ring::kx_group::SECP384R1,
+    ];
+    let cert = vec![rustls::pki_types::CertificateDer::from(
+        creds.client_cert_der.clone(),
+    )];
+    let key = rustls::pki_types::PrivateKeyDer::Pkcs8(rustls::pki_types::PrivatePkcs8KeyDer::from(
+        creds.client_key_der.clone(),
+    ));
+    let mut config = rustls::ClientConfig::builder_with_provider(Arc::new(provider))
+        .with_safe_default_protocol_versions()?
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(PinnedEdge(creds.pinned_spki_der.clone())))
+        .with_client_auth_cert(cert, key)?;
+    config.alpn_protocols = vec![alpn.to_vec()];
+    Ok(config)
 }

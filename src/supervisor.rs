@@ -4,8 +4,8 @@
 //
 // 对应 lib/app/main.sh + lib/runtime/tunnel.sh + lib/runtime/recovery.sh 的编排部分。
 
+use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Instant;
 
 use anyhow::{bail, Context, Result};
 use log::{info, warn};
@@ -14,10 +14,13 @@ use tokio::time::sleep;
 
 use crate::appconfig::AppConfig;
 use crate::endpoint::{candidate_pool, plan_candidates, JsonFileEndpointStore};
-use crate::health::{heartbeat, RecoveryAction, SocksTraceProbe, ThresholdRecovery};
+use crate::health::{
+    heartbeat, probe::probe_outbound, ProbeOutcome, RecoveryAction, SocksTraceProbe,
+    ThresholdRecovery,
+};
 use crate::mixed;
-use crate::outbound::{Masque, Outbound, WgOutbound};
-use crate::registration::{self, TeamsRegistrar, WgAccount};
+use crate::outbound::{masque::MasqueH2, psiphon::Psiphon, Masque, Outbound, WgOutbound};
+use crate::registration::{self, RegCredentials, TeamsRegistrar, WgAccount};
 
 const WG_HEALTH_FAILURE_THRESHOLD: u32 = 1;
 
@@ -26,43 +29,20 @@ pub struct Supervisor {
 }
 
 struct RunningProxy {
-    serve_handle: Option<JoinHandle<Result<()>>>,
+    serve_handle: JoinHandle<Result<()>>,
     probe_addr: std::net::SocketAddr,
     backend: &'static str,
     failure_threshold: u32,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum RuntimeExit {
-    Shutdown,
-    Unhealthy,
-}
-
-impl RunningProxy {
-    fn into_parts(
-        mut self,
-    ) -> (
-        JoinHandle<Result<()>>,
-        std::net::SocketAddr,
-        &'static str,
-        u32,
-    ) {
-        (
-            self.serve_handle
-                .take()
-                .expect("RunningProxy 必须持有监听任务"),
-            self.probe_addr,
-            self.backend,
-            self.failure_threshold,
-        )
-    }
+struct SelectedWarp {
+    outbound: Arc<dyn Outbound>,
+    wg_endpoint: Option<String>,
 }
 
 impl Drop for RunningProxy {
     fn drop(&mut self) {
-        if let Some(handle) = self.serve_handle.take() {
-            handle.abort();
-        }
+        self.serve_handle.abort();
     }
 }
 
@@ -76,6 +56,10 @@ impl Supervisor {
     /// 必要的注册/配置步骤失败、或所有 endpoint 候选均无法就绪时返回错误
     /// （调用方应以非零退出码结束进程，交给 Docker `restart: unless-stopped` 重启）。
     pub async fn run(&self) -> Result<()> {
+        let (listen_mode, probe_addr) =
+            parse_listen_mode(&self.config.listen_addrs, self.config.listen_port)?;
+        let psiphon_country = self.validate_psiphon_config()?;
+        heartbeat::invalidate().context("重置启动健康状态失败")?;
         std::fs::create_dir_all(&self.config.state_dir)
             .with_context(|| format!("创建 {} 失败", self.config.state_dir.display()))?;
 
@@ -93,56 +77,142 @@ impl Supervisor {
             self.config.healthcheck_failure_threshold,
         );
 
-        if self.config.enable_masque {
-            match self.try_masque().await {
-                Ok(proxy) => {
-                    info!("✓ MASQUE 隧道已建立（{}）", self.config.reg_json.display());
-                    return match self.serve_and_watch(proxy).await? {
-                        RuntimeExit::Shutdown => Ok(()),
-                        RuntimeExit::Unhealthy => {
-                            bail!("MASQUE 端到端探测失败，退出并重新选择后端与路径。")
-                        }
-                    };
-                }
-                Err(reason) => warn!("MASQUE 不可用（{reason}），回退 WireGuard ..."),
+        tokio::select! {
+            result = self.run_service(listen_mode, probe_addr, psiphon_country.as_deref()) => result,
+            signal = shutdown_signal() => {
+                signal?;
+                info!("收到退出信号，正在停止隧道/SOCKS5。");
+                Ok(())
             }
         }
-
-        self.run_wireguard().await
     }
 
-    /// WireGuard 出网策略：确保 Teams 账户存在（这是唯一会要求 `TEAMS_TOKEN`
-    /// 的地方——只有真正跑到这里才需要）、按候选顺序依次尝试 endpoint。
-    async fn run_wireguard(&self) -> Result<()> {
-        let account = self.ensure_account().await?;
+    async fn run_service(
+        &self,
+        listen_mode: mixed::ListenMode,
+        probe_addr: SocketAddr,
+        country: Option<&str>,
+    ) -> Result<()> {
+        let selected = self.prepare_base().await?;
+        let failure_threshold = if country.is_some() || selected.wg_endpoint.is_none() {
+            self.config.healthcheck_failure_threshold
+        } else {
+            WG_HEALTH_FAILURE_THRESHOLD
+        };
+        let outbound: Arc<dyn Outbound> = match country {
+            Some(country) => {
+                self.prepare_region(Arc::clone(&selected.outbound), country)
+                    .await?
+            }
+            None => Arc::clone(&selected.outbound),
+        };
+        let (proxy, outcome) = self
+            .spawn_and_probe(outbound, listen_mode, probe_addr, failure_threshold)
+            .await?;
+        if let Some(country) = country {
+            info!(
+                "Psiphon 前置已就绪: country={country}, Cloudflare 最终出口: IP={}, loc={}",
+                outcome.ip.as_deref().unwrap_or("未知"),
+                outcome.loc.as_deref().unwrap_or("未知"),
+            );
+        } else if let Some(ip) = outcome.ip {
+            info!("当前出口 IP: {ip}");
+        }
+        self.serve_and_watch(proxy).await?;
+        if country.is_none() {
+            if let Some(endpoint) = &selected.wg_endpoint {
+                let mut store = JsonFileEndpointStore::load(&self.config.endpoint_state_file)?;
+                if let Err(error) =
+                    store.mark_cooldown(endpoint, self.config.startup_endpoint_cooldown)
+                {
+                    warn!("记录失效 endpoint 冷却失败: endpoint={endpoint}, error={error:#}");
+                }
+            }
+        }
+        bail!("SOCKS 端到端探测失败，退出并重新选择后端与路径。")
+    }
 
+    async fn prepare_region(
+        &self,
+        base: Arc<dyn Outbound>,
+        country: &str,
+    ) -> Result<Arc<dyn Outbound>> {
+        let creds = self.ensure_masque_credentials().await?;
+        let candidates = Psiphon::candidates(base.as_ref(), country).await?;
+        if candidates.is_empty() {
+            bail!("所选地区没有可用 SSH 候选: {country}");
+        }
+        let mut last_error = None;
+        for (index, entry) in candidates.into_iter().take(8).enumerate() {
+            let attempt = async {
+                let ssh = tokio::time::timeout(
+                    std::time::Duration::from_secs(20),
+                    Psiphon::connect_entry(Arc::clone(&base), entry, country),
+                )
+                .await
+                .context("Psiphon SSH 建立超时")??;
+                let outbound: Arc<dyn Outbound> = Arc::new(
+                    MasqueH2::new(&creds, Arc::new(ssh))
+                        .await
+                        .context("经 Psiphon 建立 MASQUE H2 失败")?,
+                );
+                self.wait_for_warp(outbound.as_ref()).await?;
+                Ok::<_, anyhow::Error>(outbound)
+            }
+            .await;
+            match attempt {
+                Ok(outbound) => return Ok(outbound),
+                Err(error) => {
+                    warn!(
+                        "地区路径候选 {} 失败: country={country}, error={error:#}",
+                        index + 1
+                    );
+                    last_error = Some(error);
+                }
+            }
+        }
+        Err(last_error
+            .unwrap_or_else(|| anyhow::anyhow!("没有执行任何候选"))
+            .context(format!("所选地区所有已尝试路径均不可用: {country}")))
+    }
+
+    async fn prepare_base(&self) -> Result<SelectedWarp> {
+        if self.config.enable_masque {
+            match self.try_masque().await {
+                Ok(outbound) => {
+                    info!("✓ MASQUE 隧道已建立（{}）", self.config.reg_json.display());
+                    return Ok(SelectedWarp {
+                        outbound,
+                        wg_endpoint: None,
+                    });
+                }
+                Err(reason) => warn!("MASQUE 不可用（{reason:#}），回退 WireGuard ..."),
+            }
+        }
+        self.prepare_wireguard().await
+    }
+
+    async fn prepare_wireguard(&self) -> Result<SelectedWarp> {
+        let account = self.ensure_account().await?;
         let mut store = JsonFileEndpointStore::load(&self.config.endpoint_state_file)?;
         let candidates = plan_candidates(candidate_pool(&self.config.endpoint_candidates), &store);
         if candidates.is_empty() {
             bail!("未生成任何可用 endpoint 候选。");
         }
         log_candidate_plan(&candidates, &store);
-
         let total = candidates.len();
         for (index, endpoint) in candidates.iter().enumerate() {
             match self.try_wg_candidate(&account, endpoint).await {
-                Ok(proxy) => {
+                Ok(outbound) => {
                     store.record_success(endpoint)?;
-                    info!("隧道与 SOCKS 已就绪：endpoint={endpoint}");
-                    return match self.serve_and_watch(proxy).await? {
-                        RuntimeExit::Shutdown => Ok(()),
-                        RuntimeExit::Unhealthy => {
-                            if let Err(error) =
-                                store.mark_cooldown(endpoint, self.config.startup_endpoint_cooldown)
-                            {
-                                warn!("记录失效 endpoint 冷却失败: endpoint={endpoint}, error={error:#}");
-                            }
-                            bail!("WireGuard 端到端探测失败，当前 endpoint 已降级，退出并选择下一候选。")
-                        }
-                    };
+                    info!("WireGuard 隧道已就绪：endpoint={endpoint}");
+                    return Ok(SelectedWarp {
+                        outbound,
+                        wg_endpoint: Some(endpoint.clone()),
+                    });
                 }
                 Err(reason) => {
-                    warn!("候选 {endpoint} 就绪失败: {reason}");
+                    warn!("候选 {endpoint} 就绪失败: {reason:#}");
                     store.mark_cooldown(endpoint, self.config.startup_endpoint_cooldown)?;
                     if index + 1 < total {
                         warn!(
@@ -155,8 +225,7 @@ impl Supervisor {
                 }
             }
         }
-
-        bail!("启动阶段出口探测失败，退出等待容器重启。");
+        bail!("启动阶段出口探测失败，退出等待容器重启。")
     }
 
     async fn ensure_account(&self) -> Result<WgAccount> {
@@ -177,10 +246,15 @@ impl Supervisor {
         registrar.register().await
     }
 
-    /// MASQUE 出网策略：确保 `reg.json` 存在（缺失则自动注册）、加载凭据、建立
-    /// 隧道并起 SOCKS5 监听。调用前提是 `self.config.enable_masque == true`；
-    /// 任何一步失败都统一在这里汇总成一个原因，交给调用方决定是否回退。
-    async fn try_masque(&self) -> Result<RunningProxy, String> {
+    async fn try_masque(&self) -> Result<Arc<dyn Outbound>> {
+        let creds = self.ensure_masque_credentials().await?;
+        let outbound: Arc<dyn Outbound> =
+            Arc::new(Masque::new(creds).await.context("MASQUE 建立失败")?);
+        self.wait_for_warp(&*outbound).await?;
+        Ok(outbound)
+    }
+
+    async fn ensure_masque_credentials(&self) -> Result<RegCredentials> {
         if self.config.reg_json.is_file() {
             info!(
                 "检测到已有 MASQUE 注册（{}），跳过重新注册。",
@@ -193,33 +267,27 @@ impl Supervisor {
             );
             let creds = registration::register_masque()
                 .await
-                .map_err(|e| format!("MASQUE 注册失败（{e:#}）"))?;
+                .context("MASQUE 注册失败")?;
             creds
                 .registration
                 .save(&self.config.reg_json)
-                .map_err(|e| format!("MASQUE 注册信息保存失败（{e}）"))?;
+                .context("MASQUE 注册信息保存失败")?;
             crate::fsutil::restrict_to_owner(&self.config.reg_json);
             info!("MASQUE 注册完成：{}", self.config.reg_json.display());
         }
 
-        let creds = registration::load(&self.config.reg_json)
-            .map_err(|e| format!("加载 {} 失败（{e}）", self.config.reg_json.display()))?;
-        let masque = Masque::new(creds)
-            .await
-            .map_err(|e| format!("MASQUE 建立失败（{e:#}）"))?;
-        let outbound: Arc<dyn Outbound> = Arc::new(masque);
-        let proxy = self
-            .spawn_and_probe(outbound, self.config.healthcheck_failure_threshold)
-            .await
-            .map_err(|e| format!("{e:#}"))?;
-        Ok(proxy)
+        registration::load(&self.config.reg_json)
+            .with_context(|| format!("加载 {} 失败", self.config.reg_json.display()))
     }
 
-    /// 用给定 endpoint 建立 WireGuard 隧道 + 起 SOCKS5 监听；只有端到端
-    /// 出口探测通过后才把配置写成 `wg0.conf` 审计快照。
-    async fn try_wg_candidate(&self, account: &WgAccount, endpoint: &str) -> Result<RunningProxy> {
+    /// 只把通过真实 WARP trace 的候选记录为成功。
+    async fn try_wg_candidate(
+        &self,
+        account: &WgAccount,
+        endpoint: &str,
+    ) -> Result<Arc<dyn Outbound>> {
         let wg_config = registration::build_wg_config(account, Some(endpoint))?;
-        let outbound = Arc::new(
+        let outbound: Arc<dyn Outbound> = Arc::new(
             WgOutbound::establish(
                 &wg_config,
                 self.config.trick,
@@ -228,120 +296,129 @@ impl Supervisor {
             .await
             .context("建立 WireGuard 隧道失败")?,
         );
-        let proxy = self
-            .spawn_and_probe(outbound, WG_HEALTH_FAILURE_THRESHOLD)
-            .await?;
+        self.wait_for_warp(&*outbound).await?;
         registration::write_wg_conf(&wg_config, &self.config.wg_conf)
             .context("写入已验证的 WireGuard 配置快照失败")?;
-        Ok(proxy)
+        Ok(outbound)
     }
 
-    /// 起 SOCKS5 监听并反复探测直到就绪或启动预算耗尽；失败时监听任务会被中止。
+    async fn wait_for_warp(&self, outbound: &dyn Outbound) -> Result<()> {
+        let mut last_error = None;
+        tokio::time::timeout(self.config.startup_ready_timeout, async {
+            loop {
+                match probe_outbound(outbound, self.config.startup_probe_timeout).await {
+                    Ok(outcome) => {
+                        if let Some(ip) = outcome.ip {
+                            info!("当前出口 IP: {ip}");
+                        }
+                        return Ok(());
+                    }
+                    Err(error) => {
+                        last_error = Some(error);
+                        sleep(self.config.startup_probe_delay).await;
+                    }
+                }
+            }
+        })
+        .await
+        .map_err(|_| startup_probe_error("WARP 出口启动探测超时", last_error))?
+    }
+
+    fn validate_psiphon_config(&self) -> Result<Option<String>> {
+        let country = self.config.psiphon_country.trim();
+        if country.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(crate::outbound::psiphon::normalize_country(country)?))
+    }
+
+    /// 起唯一公开 SOCKS 入口；启动探测失败或取消时 Drop 会停止监听。
     async fn spawn_and_probe(
         &self,
         outbound: Arc<dyn Outbound>,
+        listen_mode: mixed::ListenMode,
+        probe_addr: SocketAddr,
         failure_threshold: u32,
-    ) -> Result<RunningProxy> {
-        let (listen_mode, probe_addr) =
-            parse_listen_mode(&self.config.listen_addrs, self.config.listen_port)?;
+    ) -> Result<(RunningProxy, ProbeOutcome)> {
         let backend = outbound.name();
-        let serve_handle = tokio::spawn(mixed::serve(outbound, listen_mode));
-
+        let mut proxy = RunningProxy {
+            serve_handle: tokio::spawn(mixed::serve(outbound, listen_mode)),
+            probe_addr,
+            backend,
+            failure_threshold,
+        };
         let probe = SocksTraceProbe::new(probe_addr, self.config.startup_probe_timeout);
-        let deadline = Instant::now() + self.config.startup_ready_timeout;
-
-        loop {
-            if serve_handle.is_finished() {
-                let err = match serve_handle.await {
-                    Ok(Ok(())) => anyhow::anyhow!("SOCKS5 服务提前退出。"),
-                    Ok(Err(e)) => e.context("SOCKS5 服务提前退出"),
-                    Err(e) => anyhow::anyhow!("SOCKS5 服务任务异常终止: {e}"),
-                };
-                return Err(err);
-            }
-
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                serve_handle.abort();
-                bail!("启动探测超时。");
-            }
-
-            match probe.probe().await {
-                Ok(outcome) => {
-                    if let Some(ip) = outcome.ip {
-                        info!("当前出口 IP: {ip}");
+        let mut last_error = None;
+        let outcome = tokio::time::timeout(self.config.startup_ready_timeout, async {
+            loop {
+                tokio::select! {
+                    result = &mut proxy.serve_handle => return Err(listener_result(result)),
+                    result = probe.probe() => {
+                        match result {
+                            Ok(outcome) => return Ok(outcome),
+                            Err(error) => {
+                                last_error = Some(error);
+                                sleep(self.config.startup_probe_delay).await;
+                            }
+                        }
                     }
-                    return Ok(RunningProxy {
-                        serve_handle: Some(serve_handle),
-                        probe_addr,
-                        backend,
-                        failure_threshold,
-                    });
-                }
-                Err(_) => {
-                    sleep(self.config.startup_probe_delay.min(remaining)).await;
                 }
             }
-        }
+        })
+        .await
+        .map_err(|_| startup_probe_error("SOCKS 启动探测超时", last_error))??;
+        Ok((proxy, outcome))
     }
 
-    /// 提供服务并跑内部健康检查循环。达到当前后端的连续失败阈值后退出；
-    /// WireGuard 阈值固定为一次，确保半死 TCP 随进程一起释放。
-    async fn serve_and_watch(&self, proxy: RunningProxy) -> Result<RuntimeExit> {
-        let (mut serve_handle, probe_addr, backend, failure_threshold) = proxy.into_parts();
+    /// 运行期只探测唯一公开入口。`Ok(())` 仅表示连续失败达到阈值。
+    async fn serve_and_watch(&self, mut proxy: RunningProxy) -> Result<()> {
+        let (probe_addr, backend, failure_threshold) =
+            (proxy.probe_addr, proxy.backend, proxy.failure_threshold);
         info!("代理监听模式: {}", self.config.listen_addrs);
         info!("内部健康探测入口: {probe_addr}");
         info!("隧道后端: {backend}");
-
-        // spawn_and_probe 里已经跑过一次成功的就绪探测，这里直接记一次心跳，
-        // 避免容器刚起来、第一轮 healthcheck_interval 还没到时，Docker
-        // HEALTHCHECK 读不到任何心跳而误判成不健康（见 heartbeat.rs 注释）。
         heartbeat::record_success();
-
-        // 探测走的是跟真实业务连接完全相同的路径（SOCKS5 -> outbound），隧道
-        // 一时拥塞导致的自愈重连（如 masque::open() 内部换 QUIC 连接）也会在
-        // 这次探测里自然发生——前提是 healthcheck_probe_timeout 给得够长，
-        // 详见 appconfig.rs 里该字段默认值的注释。
         let probe = SocksTraceProbe::new(probe_addr, self.config.healthcheck_probe_timeout);
         let mut recovery = ThresholdRecovery::new(failure_threshold);
-        let mut shutdown = Box::pin(shutdown_signal());
-
         loop {
             tokio::select! {
-                _ = &mut shutdown => {
-                    info!("收到退出信号，正在停止隧道/SOCKS5。");
-                    serve_handle.abort();
-                    return Ok(RuntimeExit::Shutdown);
-                }
-                result = &mut serve_handle => {
-                    return match result {
-                        Ok(Ok(())) => bail!("SOCKS5 服务提前退出。"),
-                        Ok(Err(e)) => Err(e.context("SOCKS5 服务提前退出")),
-                        Err(e) => bail!("SOCKS5 服务任务异常终止: {e}"),
-                    };
-                }
+                result = &mut proxy.serve_handle => return Err(listener_result(result)),
                 () = sleep(self.config.healthcheck_interval) => {
                     match probe.probe().await {
                         Ok(_) => {
                             heartbeat::record_success();
                             recovery.on_success();
                         }
-                        Err(e) => {
+                        Err(error) => {
                             let action = recovery.on_failure();
                             warn!(
-                                "SOCKS 出口探测失败: {e}; failures={}/{}",
-                                recovery.consecutive_failures(),
-                                failure_threshold
+                                "SOCKS 出口探测失败: {error}; failures={}/{}",
+                                recovery.consecutive_failures(), failure_threshold
                             );
-                            if action == RecoveryAction::RequestExit {
-                                serve_handle.abort();
-                                return Ok(RuntimeExit::Unhealthy);
-                            }
+                            if action == RecoveryAction::RequestExit { return Ok(()); }
                         }
                     }
                 }
             }
         }
+    }
+}
+
+fn startup_probe_error(
+    context: &str,
+    last_error: Option<crate::health::ProbeError>,
+) -> anyhow::Error {
+    match last_error {
+        Some(error) => anyhow::Error::new(error).context(context.to_owned()),
+        None => anyhow::anyhow!("{context}，首次探测尚未完成"),
+    }
+}
+
+fn listener_result(result: Result<Result<()>, tokio::task::JoinError>) -> anyhow::Error {
+    match result {
+        Ok(Ok(())) => anyhow::anyhow!("SOCKS5 服务提前退出。"),
+        Ok(Err(error)) => error.context("SOCKS5 服务提前退出"),
+        Err(error) => anyhow::anyhow!("SOCKS5 服务任务异常终止: {error}"),
     }
 }
 
@@ -365,7 +442,15 @@ fn parse_listen_mode(raw: &str, port: u16) -> Result<(mixed::ListenMode, std::ne
     if addrs.is_empty() {
         bail!("SOCKS_LISTEN_ADDRS 至少需要一个监听地址");
     }
-    let probe_addr = addrs[0];
+    let probe_addr = match addrs[0] {
+        SocketAddr::V4(addr) if addr.ip().is_unspecified() => {
+            SocketAddr::from(([127, 0, 0, 1], addr.port()))
+        }
+        SocketAddr::V6(addr) if addr.ip().is_unspecified() => {
+            SocketAddr::from(([0, 0, 0, 0, 0, 0, 0, 1], addr.port()))
+        }
+        addr => addr,
+    };
     Ok((mixed::ListenMode::Explicit(addrs), probe_addr))
 }
 
@@ -383,16 +468,17 @@ fn log_candidate_plan(candidates: &[String], store: &JsonFileEndpointStore) {
     }
 }
 
-async fn shutdown_signal() {
+async fn shutdown_signal() -> Result<()> {
     use tokio::signal::unix::{signal, SignalKind};
-    let mut term = signal(SignalKind::terminate()).expect("安装 SIGTERM handler 失败");
-    let mut int = signal(SignalKind::interrupt()).expect("安装 SIGINT handler 失败");
-    let mut hup = signal(SignalKind::hangup()).expect("安装 SIGHUP handler 失败");
+    let mut term = signal(SignalKind::terminate()).context("安装 SIGTERM handler 失败")?;
+    let mut int = signal(SignalKind::interrupt()).context("安装 SIGINT handler 失败")?;
+    let mut hup = signal(SignalKind::hangup()).context("安装 SIGHUP handler 失败")?;
     tokio::select! {
         _ = term.recv() => {}
         _ = int.recv() => {}
         _ = hup.recv() => {}
     }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -419,7 +505,7 @@ mod tests {
             Ok(())
         });
         let proxy = RunningProxy {
-            serve_handle: Some(handle),
+            serve_handle: handle,
             probe_addr: "127.0.0.1:1080".parse().unwrap(),
             backend: "test",
             failure_threshold: 1,

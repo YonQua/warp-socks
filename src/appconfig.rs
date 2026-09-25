@@ -6,7 +6,7 @@ use std::time::Duration;
 use crate::tunnel::Trick;
 
 // 健康探测是运维策略，不应反向依赖某个 Outbound 的私有协议预算。63 秒保持
-// 现有默认行为，并覆盖当前两种后端各自有界的 connect_tcp 实现。
+// 现有默认行为，并覆盖各后端有界的 connect_tcp 实现。
 const HEALTHCHECK_PROBE_TIMEOUT_DEFAULT: u64 = 63;
 
 pub struct AppConfig {
@@ -25,6 +25,8 @@ pub struct AppConfig {
     /// 显式监听地址，此时第一个地址同时作为内部健康探测入口。
     pub listen_addrs: String,
     pub listen_port: u16,
+    /// 空值保持原 WARP 出口；启用时经所选国家的 Psiphon 前置连接 Cloudflare。
+    pub psiphon_country: String,
 
     pub register_retries: u32,
     pub register_retry_delay: Duration,
@@ -61,6 +63,7 @@ impl AppConfig {
 
             listen_addrs: env_var("SOCKS_LISTEN_ADDRS", "auto"),
             listen_port: sanitize_port(&env_var("SOCKS_LISTEN_PORT", "1080"), 1080),
+            psiphon_country: env_var("PSIPHON_COUNTRY", ""),
 
             register_retries: sanitize_positive_int(
                 &env_var("WARP_SOCKS_REGISTER_RETRIES", "2"),

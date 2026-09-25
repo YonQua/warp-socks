@@ -1,5 +1,7 @@
 # WireGuard 稳定生命周期方案
 
+本文的 endpoint 冷却规则针对未启用 `PSIPHON_COUNTRY` 的普通 WireGuard 模式。地区模式只监督最终 Cloudflare 入口，整条链路失败时不直接归因或冷却基础 WireGuard endpoint。
+
 ## 已验证根因边界
 
 同一故障可在 Docker `network_mode: host`、macOS 宿主机原生运行、多个 WARP
@@ -15,7 +17,7 @@ endpoint 和 `2408`、`500`、`4500` 端口上复现。切换 netstack 与 WireG
 
 每个 WireGuard 生命周期只有：
 
-1. 一个已通过握手和 SOCKS trace 的 endpoint。
+1. 一个已通过握手和隧道内 HTTPS trace 的 endpoint。
 2. 一个 BoringTun `Tunn`。
 3. 一个 outer UDP socket。
 4. 一个 smoltcp `Net`。
@@ -26,7 +28,7 @@ transport 不维护 stall counter、generation、endpoint 池、重绑通道或�
 1. trace 成功：记录心跳，不改变任何状态。
 2. trace 失败：冷却当前 endpoint，退出进程。
 3. Docker 新生命周期创建全新的 `Tunn`、outer UDP socket 和 `Net`，遍历候选
-   池并对每个候选重新执行握手和 SOCKS trace。
+   池并对每个候选重新执行握手和隧道内 HTTPS trace，最终再验证公共 SOCKS 入口。
 
 进程退出是刻意的恢复边界：当前代理实现的连接任务独立持有 `Outbound`，只停止
 listener 不能同步销毁所有旧 TCP；进程级退出才能保证旧 peer、socket 和半死连接

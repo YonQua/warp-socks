@@ -5,10 +5,17 @@
 use std::net::SocketAddr;
 use std::time::Duration;
 
+use crate::outbound::{https, Outbound};
+
+const TRACE_HOST: &str = "cloudflare.com";
+const TRACE_PATH: &str = "/cdn-cgi/trace";
+const MAX_TRACE_BYTES: usize = 4096;
+
 /// 探测成功时携带的信息（当前出口 IP，若响应里有）。
 #[derive(Debug, Default, Clone)]
 pub struct ProbeOutcome {
     pub ip: Option<String>,
+    pub loc: Option<String>,
 }
 
 #[derive(Debug)]
@@ -68,17 +75,33 @@ impl SocksTraceProbe {
             return Err(ProbeError::Request(format!("HTTP {status}")));
         }
 
-        let has_warp_marker = body
-            .lines()
-            .any(|line| line == "warp=on" || line == "warp=plus");
-        if !has_warp_marker {
-            return Err(ProbeError::MissingWarpMarker(summarize(&body)));
-        }
-
-        Ok(ProbeOutcome {
-            ip: extract_trace_field(&body, "ip"),
-        })
+        parse_trace(&body)
     }
+}
+
+pub(crate) async fn probe_outbound(
+    outbound: &dyn Outbound,
+    timeout: Duration,
+) -> Result<ProbeOutcome, ProbeError> {
+    let bytes = https::get(outbound, TRACE_HOST, TRACE_PATH, MAX_TRACE_BYTES, timeout)
+        .await
+        .map_err(|error| ProbeError::Request(format!("{error:#}")))?;
+    let body = String::from_utf8(bytes).map_err(|error| ProbeError::Request(error.to_string()))?;
+    parse_trace(&body)
+}
+
+fn parse_trace(body: &str) -> Result<ProbeOutcome, ProbeError> {
+    let has_warp_marker = body
+        .lines()
+        .any(|line| line == "warp=on" || line == "warp=plus");
+    if !has_warp_marker {
+        return Err(ProbeError::MissingWarpMarker(summarize(body)));
+    }
+
+    Ok(ProbeOutcome {
+        ip: extract_trace_field(body, "ip"),
+        loc: extract_trace_field(body, "loc"),
+    })
 }
 
 fn extract_trace_field(body: &str, field: &str) -> Option<String> {

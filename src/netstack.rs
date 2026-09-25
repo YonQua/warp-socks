@@ -189,7 +189,7 @@ impl Net {
                 reactor.stop_sockets();
             }
             if let Err(error) = result {
-                log::error!("WireGuard netstack reactor 已停止: {error}");
+                log::error!("IP netstack reactor 已停止: {error}");
             }
         });
 
@@ -540,15 +540,22 @@ impl Reactor {
         let notify = Arc::new(Notify::new());
         let stopper = Arc::new(Notify::new());
         let allocator = SocketAllocator::new(buffer_size);
-        let task = run_reactor(
+        let run = run_reactor(
             device,
             interface.clone(),
             buffered,
             allocator.clone(),
             notify.clone(),
-            stopper.clone(),
             observer.clone(),
         );
+        let stop = stopper.clone();
+        let task = async move {
+            // Cancellation covers device backpressure as well as receive waits.
+            tokio::select! {
+                result = run => result,
+                _ = stop.notified() => Ok(()),
+            }
+        };
         (
             Self {
                 notify,
@@ -612,7 +619,6 @@ async fn run_reactor(
     mut buffered: BufferDevice,
     allocator: SocketAllocator,
     notify: Arc<Notify>,
-    stopper: Arc<Notify>,
     observer: Option<DataPlaneObserver>,
 ) -> io::Result<()> {
     let max_burst = device
@@ -661,7 +667,6 @@ async fn run_reactor(
                         observer.record_reactor_wake(ReactorWake::Notify);
                     }
                 }
-                _ = stopper.notified() => break,
             }
 
             while received.len() < max_burst {

@@ -36,9 +36,13 @@ use crate::outbound::{Connected, Host, Outbound, Stream};
 use crate::registration::RegCredentials;
 
 mod doh;
+pub(super) mod h2;
+mod h2_outbound;
 mod huffman;
 mod qpack;
 mod tls;
+
+pub use h2_outbound::MasqueH2;
 
 const SNI: &str = "consumer-masque-proxy.cloudflareclient.com";
 const DIAL_TIMEOUT: Duration = Duration::from_secs(8);

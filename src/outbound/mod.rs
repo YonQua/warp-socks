@@ -1,18 +1,15 @@
-// 出网抽象：SOCKS5/SOCKS4/HTTP 代理层只依赖这个 trait，不关心底层是
-// WireGuard 虚拟网卡还是 MASQUE H3 CONNECT 流。
-//
-// 域名如何解析是后端的实现细节，绝不出现在 trait 上：
-//   - WireGuard 走虚拟网卡 DNS
-//   - MASQUE 收到域名后先经隧道内 DoH 解析成 IP，再拿 IP 建 CONNECT
-//     （边缘不会自己解析裸域名，会 403；详见 outbound/masque/doh.rs）
-// 域名字符串本身只在 Host::Domain 里传到后端，之后如何解析完全由各后端决定。
+// 代理协议层仅依赖 Outbound；WARP、Psiphon 载体与最终 H2 在进程内组合。
+// 域名解析归后端：WireGuard/H2 使用 IP 栈内 DNS，H3 使用隧道内 DoH。
 
 use std::net::{IpAddr, SocketAddr};
 
 use async_trait::async_trait;
 use tokio::io::{AsyncRead, AsyncWrite};
 
+pub(crate) mod https;
+mod ip;
 pub mod masque;
+pub mod psiphon;
 pub mod wireguard;
 
 pub use masque::Masque;

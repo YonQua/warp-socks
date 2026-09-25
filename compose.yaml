@@ -27,8 +27,11 @@ services:
       # 控制连接实际使用的本机地址和地址族。
       SOCKS_LISTEN_ADDRS: ${SOCKS_LISTEN_ADDRS:-auto}
       SOCKS_LISTEN_PORT: ${SOCKS_LISTEN_PORT:-1080}
+      # 非空时经所选地区 Psiphon 建立 MASQUE H2；入口不变，出口仍是 Cloudflare。
+      PSIPHON_COUNTRY: ${PSIPHON_COUNTRY:-}
       ENDPOINT_CANDIDATES: ${ENDPOINT_CANDIDATES:-}
-      # 默认优先走 MASQUE 隧道（缺 reg.json 会自动注册，不需要 TEAMS_TOKEN），失败仍回退 WireGuard；显式设为 0 可强制只用 WireGuard。
+      # 首层优先 MASQUE H3，失败回退 WireGuard；0 表示首层只用 WireGuard。
+      # PSIPHON_COUNTRY 非空时，最终一层固定使用 MASQUE H2。
       WARP_SOCKS_ENABLE_MASQUE: ${WARP_SOCKS_ENABLE_MASQUE:-1}
       # 日志级别改用 Rust 标准的 RUST_LOG（env_logger），默认 info；调试可设 RUST_LOG=debug。
       RUST_LOG: ${RUST_LOG:-info}

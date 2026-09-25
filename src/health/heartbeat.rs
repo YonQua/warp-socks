@@ -15,6 +15,11 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const HEARTBEAT_PATH: &str = "/tmp/warp-socks-health";
 
+/// Invalidate a previous process's heartbeat until the final outlet is ready.
+pub fn invalidate() -> std::io::Result<()> {
+    std::fs::write(HEARTBEAT_PATH, "0\n")
+}
+
 /// Supervisor 每次成功探测后调用，记录最后成功时间。
 pub fn record_success() {
     let body = format!("{}\n", now_secs());
