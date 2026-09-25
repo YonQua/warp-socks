@@ -17,13 +17,13 @@ const HEARTBEAT_PATH: &str = "/tmp/warp-socks-health";
 
 /// Invalidate a previous process's heartbeat until the final outlet is ready.
 pub fn invalidate() -> std::io::Result<()> {
-    std::fs::write(HEARTBEAT_PATH, "0\n")
+    crate::fsutil::write_private(std::path::Path::new(HEARTBEAT_PATH), "0\n")
 }
 
 /// Supervisor 每次成功探测后调用，记录最后成功时间。
 pub fn record_success() {
     let body = format!("{}\n", now_secs());
-    if let Err(e) = std::fs::write(HEARTBEAT_PATH, body) {
+    if let Err(e) = crate::fsutil::write_private(std::path::Path::new(HEARTBEAT_PATH), body) {
         log::warn!("写健康检查心跳文件失败（不影响探测本身）: {e}");
     }
 }

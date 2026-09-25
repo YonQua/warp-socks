@@ -13,6 +13,7 @@ use log::{error, warn};
 use socket2::{Domain, Protocol, Socket, Type};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Semaphore;
+use tokio::time::{timeout_at, Instant};
 
 use crate::outbound::Outbound;
 use crate::{http_proxy, socks4, socks5};
@@ -33,6 +34,7 @@ const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_secs(1);
 // 里，也不是资源配额），跟 appconfig.rs 里 startup_endpoint_cooldown /
 // healthcheck_interval 同类处理：固定常量，不做成环境变量。
 const MAX_CONNECTIONS: usize = 4096;
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Clone, Debug)]
 pub enum ListenMode {
@@ -179,15 +181,18 @@ fn is_connection_error(e: &io::Error) -> bool {
 }
 
 async fn dispatch(client: TcpStream, peer: SocketAddr, outbound: Arc<dyn Outbound>) -> Result<()> {
+    let deadline = Instant::now() + HANDSHAKE_TIMEOUT;
     let mut first_byte = [0u8; 1];
-    let n = client.peek(&mut first_byte).await?;
+    let n = timeout_at(deadline, client.peek(&mut first_byte))
+        .await
+        .context("代理协议探测超时")??;
     if n == 0 {
         return Ok(());
     }
     match first_byte[0] {
-        0x05 => socks5::handle_client(client, peer, outbound).await,
-        0x04 => socks4::handle_client(client, peer, &*outbound).await,
-        _ => http_proxy::handle_client(client, peer, &*outbound).await,
+        0x05 => socks5::handle_client(client, peer, outbound, deadline).await,
+        0x04 => socks4::handle_client(client, peer, &*outbound, deadline).await,
+        _ => http_proxy::handle_client(client, peer, &*outbound, deadline).await,
     }
 }
 

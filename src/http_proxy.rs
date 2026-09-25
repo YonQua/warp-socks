@@ -11,6 +11,7 @@ use std::net::SocketAddr;
 use anyhow::{anyhow, bail, Context, Result};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
+use tokio::time::{timeout_at, Instant};
 
 use crate::outbound::{Host, Outbound};
 use crate::relay;
@@ -125,8 +126,11 @@ pub(crate) async fn handle_client(
     mut client: TcpStream,
     peer: SocketAddr,
     outbound: &dyn Outbound,
+    deadline: Instant,
 ) -> Result<()> {
-    let parsed = read_request(&mut client).await?;
+    let parsed = timeout_at(deadline, read_request(&mut client))
+        .await
+        .context("HTTP 代理请求头超时")??;
     let is_connect = parsed.method.eq_ignore_ascii_case("CONNECT");
     let target_info = parse_target(&parsed.method, &parsed.path, parsed.host_header.as_deref())?;
     // 域名交给后端解析（MASQUE 交边缘，WireGuard 走虚拟网卡 DNS）。

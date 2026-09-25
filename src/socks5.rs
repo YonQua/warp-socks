@@ -19,6 +19,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
+use tokio::time::{timeout_at, Instant};
 
 use crate::outbound::{Datagram, Host, Outbound};
 use crate::relay;
@@ -65,7 +66,23 @@ pub(crate) async fn handle_client(
     mut client: TcpStream,
     peer: SocketAddr,
     outbound: Arc<dyn Outbound>,
+    deadline: Instant,
 ) -> Result<()> {
+    let request = timeout_at(deadline, read_request(&mut client))
+        .await
+        .context("SOCKS5 握手超时")??;
+    match request {
+        Request::Connect(target) => handle_connect(client, peer, target, &*outbound).await,
+        Request::UdpAssociate => handle_udp_associate(client, peer, outbound).await,
+    }
+}
+
+enum Request {
+    Connect(Target),
+    UdpAssociate,
+}
+
+async fn read_request(client: &mut TcpStream) -> Result<Request> {
     // 方法协商：只接受“无认证”（0x00）。
     let mut head = [0u8; 2];
     client.read_exact(&mut head).await?;
@@ -87,19 +104,25 @@ pub(crate) async fn handle_client(
         bail!("不支持的 SOCKS 版本: {}", req[0]);
     }
     if !matches!(req[1], CMD_CONNECT | CMD_UDP_ASSOCIATE) {
-        let _ = reply(&mut client, REP_CMD_NOT_SUPPORTED).await;
+        let _ = reply(client, REP_CMD_NOT_SUPPORTED).await;
         bail!("不支持的命令: {}", req[1]);
     }
 
     if !matches!(req[3], 0x01 | 0x03 | 0x04) {
-        let _ = reply(&mut client, REP_ATYP_NOT_SUPPORTED).await;
+        let _ = reply(client, REP_ATYP_NOT_SUPPORTED).await;
         bail!("不支持的地址类型: {}", req[3]);
     }
-
-    match req[1] {
-        CMD_CONNECT => handle_connect(client, peer, req[3], &*outbound).await,
-        CMD_UDP_ASSOCIATE => handle_udp_associate(client, peer, req[3], outbound).await,
-        _ => unreachable!(),
+    if req[1] == CMD_UDP_ASSOCIATE {
+        // 建议地址不参与路由，保持原有跳过行为，不附加域名 UTF-8 校验。
+        skip_target(client, req[3]).await?;
+        return Ok(Request::UdpAssociate);
+    }
+    match read_target(client, req[3]).await {
+        Ok(target) => Ok(Request::Connect(target)),
+        Err(error) => {
+            let _ = reply(client, REP_HOST_UNREACHABLE).await;
+            Err(error)
+        }
     }
 }
 
@@ -113,17 +136,9 @@ struct Target {
 async fn handle_connect(
     mut client: TcpStream,
     peer: SocketAddr,
-    atyp: u8,
+    target: Target,
     outbound: &dyn Outbound,
 ) -> Result<()> {
-    let target = match read_target(&mut client, atyp).await {
-        Ok(t) => t,
-        Err(e) => {
-            let _ = reply(&mut client, REP_HOST_UNREACHABLE).await;
-            return Err(e);
-        }
-    };
-
     let conn = match relay::connect(outbound, target.host.clone(), target.port).await {
         Ok(s) => s,
         Err(e) => {
@@ -357,13 +372,8 @@ async fn run_udp_egress(
 async fn handle_udp_associate(
     mut client: TcpStream,
     peer: SocketAddr,
-    atyp: u8,
     outbound: Arc<dyn Outbound>,
 ) -> Result<()> {
-    // 客户端在请求里带的 DST.ADDR/DST.PORT 只是建议地址，实际以每个 UDP 包
-    // 自带的头部为准（多数客户端直接填 0.0.0.0:0），这里读掉但不解析、不使用。
-    skip_target(&mut client, atyp).await?;
-
     if !outbound.supports_udp() {
         reply(&mut client, REP_CMD_NOT_SUPPORTED).await?;
         bail!(

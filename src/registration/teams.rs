@@ -18,7 +18,7 @@ use log::{info, warn};
 use rand::rngs::OsRng;
 use serde::{Deserialize, Serialize};
 
-use crate::fsutil::restrict_to_owner;
+use crate::fsutil::write_private;
 use crate::{config::decode_key, config::WgConfig};
 
 const REGISTER_URL: &str = "https://api.cloudflareclient.com/v0a2158/reg";
@@ -78,9 +78,7 @@ impl WgAccount {
     /// 写入失败时返回错误。
     pub fn save(&self, path: &Path) -> Result<()> {
         let data = serde_json::to_vec_pretty(self).context("序列化账户信息失败")?;
-        fs::write(path, data).with_context(|| format!("写入 {} 失败", path.display()))?;
-        restrict_to_owner(path);
-        Ok(())
+        write_private(path, data).with_context(|| format!("写入 {} 失败", path.display()))
     }
 
     /// 从 JSON 文件加载。
@@ -394,9 +392,7 @@ pub fn write_wg_conf(config: &WgConfig, path: &Path) -> Result<()> {
         config.reserved[2],
     );
 
-    fs::write(path, text).with_context(|| format!("写入 {} 失败", path.display()))?;
-    restrict_to_owner(path);
-    Ok(())
+    write_private(path, text).with_context(|| format!("写入 {} 失败", path.display()))
 }
 
 #[cfg(test)]

@@ -28,6 +28,7 @@ const DOH_PATH: &str = "/dns-query";
 const QUERY_TIMEOUT: Duration = Duration::from_secs(8);
 const MIN_TTL: Duration = Duration::from_secs(5);
 const MAX_TTL: Duration = Duration::from_secs(300);
+const MAX_CACHE_ENTRIES: usize = 512;
 
 struct CacheEntry {
     ip: IpAddr,
@@ -62,21 +63,37 @@ impl DnsCache {
     }
 
     pub(super) async fn cached(&self, domain: &str) -> Option<IpAddr> {
-        let entries = self.entries.lock().await;
-        entries
-            .get(domain)
-            .filter(|e| e.expires_at > Instant::now())
-            .map(|e| e.ip)
+        let mut entries = self.entries.lock().await;
+        match entries.get(domain) {
+            Some(entry) if entry.expires_at > Instant::now() => Some(entry.ip),
+            Some(_) => {
+                entries.remove(domain);
+                None
+            }
+            None => None,
+        }
     }
 
     async fn store(&self, domain: &str, ip: IpAddr, ttl: Duration) {
-        let ttl = ttl.clamp(MIN_TTL, MAX_TTL);
         let mut entries = self.entries.lock().await;
+        let now = Instant::now();
+        if !entries.contains_key(domain) && entries.len() >= MAX_CACHE_ENTRIES {
+            entries.retain(|_, entry| entry.expires_at > now);
+            if entries.len() >= MAX_CACHE_ENTRIES {
+                let victim = entries
+                    .iter()
+                    .min_by_key(|(_, entry)| entry.expires_at)
+                    .map(|(name, _)| name.clone());
+                if let Some(name) = victim {
+                    entries.remove(&name);
+                }
+            }
+        }
         entries.insert(
             domain.to_string(),
             CacheEntry {
                 ip,
-                expires_at: Instant::now() + ttl,
+                expires_at: now + ttl.clamp(MIN_TTL, MAX_TTL),
             },
         );
     }

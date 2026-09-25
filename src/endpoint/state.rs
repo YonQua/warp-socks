@@ -9,7 +9,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::fsutil::restrict_to_owner;
+use crate::fsutil::write_private;
 
 #[derive(Serialize, Deserialize, Default)]
 struct State {
@@ -68,10 +68,8 @@ impl JsonFileEndpointStore {
                 .with_context(|| format!("创建 {} 失败", parent.display()))?;
         }
         let data = serde_json::to_vec_pretty(&self.state).context("序列化 endpoint 状态失败")?;
-        fs::write(&self.path, data)
-            .with_context(|| format!("写入 {} 失败", self.path.display()))?;
-        restrict_to_owner(&self.path);
-        Ok(())
+        write_private(&self.path, data)
+            .with_context(|| format!("写入 {} 失败", self.path.display()))
     }
 }
 

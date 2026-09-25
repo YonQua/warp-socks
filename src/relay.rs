@@ -59,24 +59,30 @@ where
 {
     let (mut rc, mut wc) = tokio::io::split(client);
     let (mut ro, mut wo) = tokio::io::split(outbound);
-    let up = async {
-        let n = tokio::io::copy(&mut rc, &mut wo).await;
-        let _ = wo.shutdown().await;
-        n
-    };
     let down = async {
         let n = tokio::io::copy(&mut ro, &mut wc).await;
         let _ = wc.shutdown().await;
         n
     };
-    tokio::pin!(up);
     tokio::pin!(down);
-    tokio::select! {
-        _ = &mut down => {}
-        _ = &mut up => {
-            let _ = tokio::time::timeout(drain_grace, &mut down).await;
+    {
+        let up = tokio::io::copy(&mut rc, &mut wo);
+        tokio::pin!(up);
+        tokio::select! {
+            _ = &mut down => return,
+            _ = &mut up => {},
         }
     }
+    // shutdown 与响应读取并发，整个收尾阶段共用一份预算。
+    let _ = tokio::time::timeout(drain_grace, async {
+        tokio::select! {
+            _ = &mut down => {}
+            _ = wo.shutdown() => {
+                let _ = down.await;
+            }
+        }
+    })
+    .await;
 }
 
 #[cfg(test)]

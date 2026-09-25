@@ -402,7 +402,8 @@ impl Registration {
     /// 写入失败时返回错误。
     pub fn save(&self, path: &Path) -> Result<()> {
         let data = serde_json::to_vec_pretty(self).context("序列化注册信息失败")?;
-        std::fs::write(path, data).with_context(|| format!("写入 {} 失败", path.display()))
+        crate::fsutil::write_private(path, data)
+            .with_context(|| format!("写入 {} 失败", path.display()))
     }
 }
 

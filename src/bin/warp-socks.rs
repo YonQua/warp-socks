@@ -13,7 +13,6 @@ use std::path::PathBuf;
 use anyhow::{bail, Context, Result};
 
 use warp_rs::appconfig::AppConfig;
-use warp_rs::fsutil::restrict_to_owner;
 use warp_rs::health::heartbeat;
 use warp_rs::registration;
 use warp_rs::supervisor::Supervisor;
@@ -83,7 +82,6 @@ async fn run_register(args: &[String]) -> Result<()> {
                 .registration
                 .save(&path)
                 .with_context(|| format!("写入 {} 失败", path.display()))?;
-            restrict_to_owner(&path);
             println!("✓ 注册信息已保存到 {}", path.display());
         }
         "del" => {

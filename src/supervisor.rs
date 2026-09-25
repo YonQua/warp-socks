@@ -272,7 +272,6 @@ impl Supervisor {
                 .registration
                 .save(&self.config.reg_json)
                 .context("MASQUE 注册信息保存失败")?;
-            crate::fsutil::restrict_to_owner(&self.config.reg_json);
             info!("MASQUE 注册完成：{}", self.config.reg_json.display());
         }
 

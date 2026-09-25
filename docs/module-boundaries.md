@@ -66,6 +66,7 @@ Psiphon 只作为 H2 的 TCP 载体，不是公共出口。节点列表通过基
   - `ip.rs`：WireGuard / H2 共用的 IP 栈配置、隧道内 A/AAAA 解析和 TCP 地址竞速
   - `https.rs`：在现有 `Outbound` 上执行有大小和时间上限的 HTTPS GET，供启动 trace 与签名节点列表下载使用；Hyper 解析 HTTP，rustls 验证公开 CA
   - `wireguard.rs`：建立 WireGuard packet device 和单一 `Net`，通过共享 IP 拨号逻辑提供 TCP，并提供隧道内 UDP
+  - H3 半关闭待验证：`masque::pump` 上传结束后直接等待下载，未在此边界显式结束 QUIC 发送方向；relay 的清理预算不等于端到端 EOF 传播已正确实现。需用等待请求 EOF 才响应的目标单独验证。
   - `psiphon/`：签名节点列表验证、国家筛选、SSH 主机密钥校验和 direct-tcpip；持有基础 WARP，不提供监听入口
   - `masque/`：H3 CONNECT 与 H2 CONNECT-IP。`tls.rs` 共用客户端身份与边缘公钥校验；`qpack.rs` / `huffman.rs` 提供 H3 编解码，`doh.rs` 处理 H3 隧道内 DNS
   - `masque/h2.rs`：通过 Psiphon 建立 H2 CONNECT-IP，封装 IP capsule，收发任务遵守 H2 流控；有界入站 IP 队列满时丢包，保持 H2 读取和窗口释放，避免与 IP reactor 发送形成循环等待
@@ -84,6 +85,9 @@ Psiphon 只作为 H2 的 TCP 载体，不是公共出口。节点列表通过基
   - netstack 有限发送批次使用 `feed + flush`；outer UDP 暂时不可写时由 `Sink` 背压保留待发报文，不静默丢包，也不关闭长寿命 packet sink
   - transport 不根据业务 TX/RX 顺序推断请求是否得到响应，也不执行重绑或 endpoint 切换；真实 trace 失败由 Supervisor 结束整个进程生命周期
 
+- `src/fsutil.rs`
+  - 状态文件与心跳共用私有权限的同目录临时文件及原子替换；保存边界负责权限，不再由调用方补 chmod
+
 - `src/config.rs`
   - 解析 `wg0.conf`
 
@@ -99,7 +103,7 @@ Psiphon 只作为 H2 的 TCP 载体，不是公共出口。节点列表通过基
   - `mod.rs`：汇总探测、计数和心跳的具体实现
 
 - `src/mixed.rs`
-  - 多监听地址共享同一出网后端和并发上限；auto 模式创建独立 IPv4 与 V6-only IPv6 wildcard listener，并在协议分发前拒绝公网来源；每个入口仍按首字节分发 SOCKS5/SOCKS4/HTTP
+  - 多监听地址共享同一出网后端和并发上限；auto 模式创建独立 IPv4 与 V6-only IPv6 wildcard listener，并在协议分发前拒绝公网来源；每个入口仍按首字节分发 SOCKS5/SOCKS4/HTTP；从探测开始到请求头读取完成共享 10 秒握手期限，不覆盖出站拨号或转发
 
 - `src/socks5.rs` / `src/socks4.rs` / `src/http_proxy.rs`
   - 三种代理协议的服务端实现
@@ -110,9 +114,6 @@ Psiphon 只作为 H2 的 TCP 载体，不是公共出口。节点列表通过基
 
 - `src/dns.rs`
   - 隧道内 DNS 解析（SOCKS5 CONNECT 域名解析必须在隧道内完成）
-
-- `src/fsutil.rs`
-  - 文件权限收紧为仅所有者可读写
 
 容器入口直接是 Dockerfile 里的 `ENTRYPOINT ["/usr/local/bin/warp-socks-rs"]`，不再经过 `entrypoint.sh` 转发（旧版 shell 编排年代的 exec 包装脚本已删除，二进制本身就作为 PID 1 运行）。
 
