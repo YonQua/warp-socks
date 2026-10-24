@@ -17,7 +17,7 @@
 当前状态和恢复规则也很简单：
 
 - `account.json` 是唯一 WireGuard 账户状态；`endpoint-state.json` 保存 endpoint 选择历史；`wg0.conf` 只是当前成功运行配置的可审计快照，不参与恢复决策
-- `reg.json` 是 MASQUE 路径的凭据文件（基础 MASQUE 或地区模式使用），缺失会自动注册；MASQUE 路径没有 endpoint 候选轮换，不涉及 `endpoint-state.json`
+- `reg.json` 是 MASQUE 路径的凭据文件（基础 MASQUE 或地区模式使用），缺失会自动注册；MASQUE 边缘选择不使用 WireGuard 的候选池或 `endpoint-state.json`
 - `endpoint-state.json` 只保存 WireGuard 候选的 `last_good_endpoint` 和 cooldown
 - 启动阶段失败直接退出，由 Docker 重启容器
 - 普通 WireGuard 运行期首次探测失败即退出；MASQUE 和地区模式连续失败达到阈值后退出。地区链路失败不直接归因于基础 WireGuard endpoint
@@ -123,7 +123,7 @@ WARP_SOCKS_HEALTHCHECK_FAILURE_THRESHOLD=2
 
 ## Endpoint 策略
 
-这一节只适用于基础 WARP 选择 WireGuard 的场景（`WARP_SOCKS_ENABLE_MASQUE=0`，或 MASQUE 尝试失败回退后）。地区模式也可能以 WireGuard 为基础链路，但最终服务失败不会直接冷却该 endpoint。MASQUE 路径走固定的边缘地址（隧道内 DoH 解析），没有候选轮换。
+这一节只适用于基础 WARP 选择 WireGuard 的场景（`WARP_SOCKS_ENABLE_MASQUE=0`，或 MASQUE 尝试失败回退后）。地区模式也可能以 WireGuard 为基础链路，但最终服务失败不会直接冷却该 endpoint。MASQUE 使用注册结果中的边缘 IP 和端口，H3 并发拨号，H2 逐个尝试 443 端口地址；两者都不使用 `ENDPOINT_CANDIDATES` 或 WireGuard 的冷却状态。目标域名解析是另一条路径：H3 使用隧道内 DoH，WireGuard/H2 使用隧道内 A/AAAA 查询。
 
 `ENDPOINT_CANDIDATES` 是唯一手工覆盖入口。
 
@@ -143,7 +143,7 @@ WARP_SOCKS_HEALTHCHECK_FAILURE_THRESHOLD=2
 
 生产环境不建议只填写一个 endpoint；单候选失效时，下一生命周期没有其它可验证路径。通常保持为空即可。
 
-普通 WireGuard 模式运行期不根据 TX/RX 包顺序猜测“数据面停滞”。BoringTun 按协议处理 keepalive 和 rekey；只有真实 SOCKS trace 失败，Supervisor 才冷却当前 endpoint 并退出。Docker 新生命周期重新创建单一 `Tunn + outer UDP socket + Net`，同时强制释放旧的虚拟 TCP，让客户端明确重连，再验证候选池。每个候选必须完成握手和经过该 Outbound 的真实 HTTPS trace 后才写入 `wg0.conf` 与 `endpoint-state.json`。
+普通 WireGuard 模式运行期不根据 TX/RX 包顺序猜测“数据面停滞”。BoringTun 按协议处理 keepalive 和 rekey；真实 SOCKS trace 失败或 IP reactor 已终止时，Supervisor 冷却当前 endpoint 并退出。Docker 新生命周期重新创建单一 `Tunn + outer UDP socket + Net`，同时强制释放旧的虚拟 TCP，让客户端明确重连，再验证候选池。每个候选必须完成握手和经过该 Outbound 的真实 HTTPS trace 后才写入 `wg0.conf` 与 `endpoint-state.json`。
 
 启动阶段按顺序尝试候选；握手与就绪探测分别有超时预算，不能把 `WARP_SOCKS_STARTUP_SOCKS_READY_TIMEOUT` 当作整个启动的总时限。只有最终 SOCKS 探测通过才记录健康心跳。全部候选失败后退出，由 Docker 按 `RESTART_POLICY` 重启。
 
@@ -152,6 +152,12 @@ Compose 使用 `network_mode: host`，因为 UDP ASSOCIATE relay 使用随机端
 当前 SOCKS5 无认证。自动模式虽然监听全部接口，但在协议分发前只允许 loopback、RFC1918 IPv4、ULA 和 link-local IPv6 客户端；公网来源会被拒绝。仍建议使用主机防火墙限制允许访问的来源。需要其它网络范围时，可以改用显式地址列表；显式模式代表管理员已经选择暴露接口，不附加自动 LAN 来源限制。
 
 客户端须在接受连接后 10 秒内完成代理协议探测与请求头握手；该期限不限制后端拨号或已建立连接的传输时间。SOCKS4 USERID 最多 1024 字节，SOCKS4a 域名最多 253 字节。客户端结束发送后，出站关闭与响应排空共享 30 秒宽限，避免远端不关闭时永久保留连接。H3 DNS 缓存最多保留 512 个域名，过期查询会移除对应条目；满容量新增时先清理过期项，仍满则只淘汰最早到期的一项。
+
+普通 HTTP 请求按请求目标逐次路由，支持同一客户端连接访问不同目标及流式请求/响应；CONNECT 和 Upgrade 保留预读数据。H3 每次 TCP 拨号的 DNS、必要重连和 CONNECT 共用 53 秒预算，流额度超时不重建健康连接，上传 EOF 显式结束 QUIC 发送方向。H3 重连用原注册密钥刷新短期证书。
+
+WireGuard/H2 的 DNS 缓存随网络栈实例隔离，并区分解析器地址。UDP 不做 IP 分片，超过设备 MTU 扣除 IP/UDP 头部或发送缓存容量的数据报立即失败。远程注销失败时保留本地注册凭据。
+
+已知基础或最终 IP reactor 终止时，监督器立即退出进程交给 Docker 重建；健康探测继续覆盖无明确终止信号的网络黑洞。此行为优先于下文的探测失败阈值，不提供已有 TCP 连接的跨隧道续传。
 
 状态文件与健康心跳在 Unix 上以 `0600` 同目录临时文件写入，再原子替换目标；不会通过目标符号链接写入其他文件。状态目录须由管理员控制且可写，部署应挂载整个目录，不支持把这些目标单文件作为挂载点；该写入方式不承诺断电持久性。
 
@@ -163,7 +169,7 @@ SOCKS_LISTEN_ADDRS=127.0.0.1:1080,192.0.2.10:1080,[2001:db8::10]:1080
 
 WireGuard 后端使用项目内的 `smoltcp 0.13.1` 异步适配层，同时配置 WARP IPv4 `/32`、IPv6 `/128` 和两种默认路由。TCP 与 UDP 都按目标地址族选择对应的 WARP 源地址，因此 IPv4/IPv6 字面量均走隧道。域名在隧道内并发查询 A/AAAA；TCP 按 IPv4、IPv6 交错并每隔 250 ms 发起下一地址，首个成功连接胜出；UDP 确定性使用 A 优先、AAAA 兜底，因此 IPv6-only 域名也可工作。一个 SOCKS5 UDP ASSOCIATE 可以同时访问多个 IPv4、IPv6 或域名目标；每个 association 最多保留 64 个活跃目标，目标通道建立最多等待 10 秒，建立后空闲 120 秒释放。MASQUE 不支持隧道内 UDP，默认会在 SOCKS5 UDP ASSOCIATE 阶段明确拒绝，不会静默回退宿主机出口。
 
-入口在复用或新建 `account.json` 后，会自动清理旧模型遗留的 `state.json` 和 `wgcf-*` 文件。
+旧模型遗留的 `state.json` 和 `wgcf-*` 文件不参与当前运行；程序不会自动删除这些文件。
 
 ## 获取 Teams Token
 

@@ -13,7 +13,6 @@ use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::ops::Deref;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
@@ -29,7 +28,7 @@ use smoltcp::socket::{tcp, udp, AnySocket};
 use smoltcp::time::{Duration as SmolDuration, Instant as SmolInstant};
 use smoltcp::wire::{IpAddress, IpCidr, IpEndpoint, IpListenEndpoint};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-use tokio::sync::Notify;
+use tokio::sync::{watch, Notify};
 use tokio::time::MissedTickBehavior;
 
 use crate::dataplane::{
@@ -99,6 +98,7 @@ impl NetConfig {
 
 /// 运行于 WireGuard packet device 上的双栈 TCP/UDP 网络栈。
 pub struct Net {
+    pub(crate) dns_cache: crate::dns::DnsCache,
     reactor: Arc<Reactor>,
     source_v4: Option<IpAddress>,
     source_v6: Option<IpAddress>,
@@ -186,7 +186,10 @@ impl Net {
         tokio::spawn(async move {
             let result = task.await;
             if let Some(reactor) = task_reactor.upgrade() {
-                reactor.stop_sockets();
+                reactor.stop_sockets(match &result {
+                    Ok(()) => "IP packet device 已结束".to_string(),
+                    Err(error) => format!("IP netstack reactor 已停止: {error}"),
+                });
             }
             if let Err(error) = result {
                 log::error!("IP netstack reactor 已停止: {error}");
@@ -194,6 +197,7 @@ impl Net {
         });
 
         Ok(Self {
+            dns_cache: crate::dns::DnsCache::default(),
             reactor,
             source_v4,
             source_v6,
@@ -222,6 +226,18 @@ impl Net {
     #[must_use]
     pub fn is_stopped(&self) -> bool {
         self.reactor.is_stopped()
+    }
+
+    /// 等待网络栈结束，返回设备错误或终止原因。
+    pub async fn terminated(&self) -> String {
+        let mut state = self.reactor.stopped.subscribe();
+        let result = state.wait_for(|reason| reason.is_some()).await;
+        match result {
+            Ok(reason) => reason
+                .clone()
+                .unwrap_or_else(|| "IP netstack 已停止".into()),
+            Err(_) => "IP netstack 状态通道已关闭".into(),
+        }
     }
 
     /// 立即停止当前网络栈，并中断所有仍持有该 reactor 的 TCP/UDP socket。
@@ -517,12 +533,13 @@ impl Drop for SocketHandle {
 }
 
 struct Reactor {
+    mtu: usize,
     notify: Arc<Notify>,
     stopper: Arc<Notify>,
     interface: Arc<Mutex<Interface>>,
     allocator: SocketAllocator,
     observer: Option<DataPlaneObserver>,
-    stopped: AtomicBool,
+    stopped: watch::Sender<Option<String>>,
 }
 
 impl Reactor {
@@ -536,6 +553,7 @@ impl Reactor {
         Self,
         impl std::future::Future<Output = io::Result<()>> + Send,
     ) {
+        let mtu = device.capabilities().max_transmission_unit;
         let interface = Arc::new(Mutex::new(interface));
         let notify = Arc::new(Notify::new());
         let stopper = Arc::new(Notify::new());
@@ -558,12 +576,13 @@ impl Reactor {
         };
         (
             Self {
+                mtu,
                 notify,
                 stopper,
                 interface,
                 allocator,
                 observer,
-                stopped: AtomicBool::new(false),
+                stopped: watch::channel(None).0,
             },
             task,
         )
@@ -587,11 +606,18 @@ impl Reactor {
     }
 
     fn is_stopped(&self) -> bool {
-        self.stopped.load(Ordering::Acquire)
+        self.stopped.borrow().is_some()
     }
 
-    fn stop_sockets(&self) {
-        self.stopped.store(true, Ordering::Release);
+    fn stop_sockets(&self, reason: String) {
+        self.stopped.send_if_modified(|current| {
+            if current.is_some() {
+                false
+            } else {
+                *current = Some(reason);
+                true
+            }
+        });
         for (_, socket) in self.allocator.table.lock().sockets.iter_mut() {
             match socket {
                 smoltcp::socket::Socket::Tcp(socket) => socket.abort(),
@@ -601,7 +627,7 @@ impl Reactor {
     }
 
     fn shutdown(&self) {
-        self.stop_sockets();
+        self.stop_sockets("IP netstack 已主动停止".into());
         self.stopper.notify_one();
         self.notify.notify_waiters();
     }
@@ -923,6 +949,16 @@ impl UdpSocket {
                 return Poll::Ready(Err(reactor_stopped()));
             }
             let mut socket = self.reactor.socket::<udp::Socket>(*self.handle);
+            let header_size = if target.is_ipv4() { 28 } else { 48 };
+            let limit = socket
+                .payload_send_capacity()
+                .min(self.reactor.mtu.saturating_sub(header_size));
+            if buf.len() > limit {
+                return Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "UDP 数据报超过设备 MTU 或发送缓冲容量",
+                )));
+            }
             match socket.send_slice(buf, target) {
                 Err(udp::SendError::BufferFull) => {
                     socket.register_send_waker(cx.waker());

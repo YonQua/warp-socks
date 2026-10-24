@@ -29,17 +29,35 @@ const MAX_CAPSULE_BUFFER: usize = 256 * 1024;
 
 pub(super) struct H2Device {
     outgoing: mpsc::Sender<Vec<u8>>,
-    incoming: tokio_mpsc::Receiver<io::Result<Vec<u8>>>,
+    incoming: tokio_mpsc::Receiver<Vec<u8>>,
     capabilities: DeviceCapabilities,
-    _tasks: JoinSet<()>,
+    tasks: JoinSet<Result<()>>,
     _upstream: Arc<dyn Outbound>,
+}
+
+impl H2Device {
+    // 任一载体任务结束即终止设备；发送背压期间也必须轮询任务结果。
+    fn poll_termination(&mut self, cx: &mut TaskContext<'_>) -> Poll<io::Error> {
+        match self.tasks.poll_join_next(cx) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(Some(Ok(Err(error)))) => Poll::Ready(io::Error::other(error)),
+            Poll::Ready(Some(Err(error))) => Poll::Ready(io::Error::other(error)),
+            Poll::Ready(_) => Poll::Ready(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "MASQUE H2 载体任务已结束",
+            )),
+        }
+    }
 }
 
 impl Stream for H2Device {
     type Item = io::Result<Vec<u8>>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<Option<Self::Item>> {
-        self.incoming.poll_recv(cx)
+        if let Poll::Ready(error) = self.poll_termination(cx) {
+            return Poll::Ready(Some(Err(error)));
+        }
+        self.incoming.poll_recv(cx).map(|packet| packet.map(Ok))
     }
 }
 
@@ -47,6 +65,9 @@ impl Sink<Vec<u8>> for H2Device {
     type Error = io::Error;
 
     fn poll_ready(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
+        if let Poll::Ready(error) = self.poll_termination(cx) {
+            return Poll::Ready(Err(error));
+        }
         Pin::new(&mut self.outgoing)
             .poll_ready(cx)
             .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "MASQUE H2 发送任务已停止"))
@@ -65,12 +86,18 @@ impl Sink<Vec<u8>> for H2Device {
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
+        if let Poll::Ready(error) = self.poll_termination(cx) {
+            return Poll::Ready(Err(error));
+        }
         Pin::new(&mut self.outgoing)
             .poll_flush(cx)
             .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "MASQUE H2 发送任务已停止"))
     }
 
     fn poll_close(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
+        if let Poll::Ready(error) = self.poll_termination(cx) {
+            return Poll::Ready(Err(error));
+        }
         Pin::new(&mut self.outgoing)
             .poll_close(cx)
             .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "MASQUE H2 发送任务已停止"))
@@ -137,11 +164,7 @@ async fn dial_one(
         .await
         .context("MASQUE H2 协商超时")??;
     let mut tasks = JoinSet::new();
-    tasks.spawn(async move {
-        if let Err(error) = connection.await {
-            log::warn!("MASQUE H2 连接结束: {error}");
-        }
-    });
+    tasks.spawn(async move { connection.await.context("MASQUE H2 连接已结束") });
     sender = tokio::time::timeout(HANDSHAKE_TIMEOUT, sender.ready())
         .await
         .context("MASQUE H2 就绪超时")?
@@ -170,17 +193,8 @@ async fn dial_one(
 
     let (outgoing, outgoing_rx) = mpsc::channel(64);
     let (incoming_tx, incoming) = tokio_mpsc::channel(64);
-    let send_error = incoming_tx.clone();
-    tasks.spawn(async move {
-        if let Err(error) = send_packets(send_stream, outgoing_rx).await {
-            let _ = send_error.send(Err(io::Error::other(error))).await;
-        }
-    });
-    tasks.spawn(async move {
-        if let Err(error) = receive_packets(recv_stream, incoming_tx.clone()).await {
-            let _ = incoming_tx.send(Err(io::Error::other(error))).await;
-        }
-    });
+    tasks.spawn(send_packets(send_stream, outgoing_rx));
+    tasks.spawn(receive_packets(recv_stream, incoming_tx));
     let mut capabilities = DeviceCapabilities::default();
     capabilities.medium = Medium::Ip;
     capabilities.max_transmission_unit = PACKET_MTU;
@@ -188,7 +202,7 @@ async fn dial_one(
         outgoing,
         incoming,
         capabilities,
-        _tasks: tasks,
+        tasks,
         _upstream: upstream,
     })
 }
@@ -225,7 +239,7 @@ async fn send_packets(
 
 async fn receive_packets(
     mut stream: h2::RecvStream,
-    sender: tokio_mpsc::Sender<io::Result<Vec<u8>>>,
+    sender: tokio_mpsc::Sender<Vec<u8>>,
 ) -> Result<()> {
     let mut buf = Vec::new();
     while let Some(chunk) = stream.data().await {
@@ -258,7 +272,7 @@ async fn receive_packets(
                 if packet.first().is_some_and(|b| matches!(b >> 4, 4 | 6)) {
                     // IP 设备允许队列满时丢包；持续读取并释放 H2 窗口，避免
                     // reactor 等待发送时，入站队列反过来阻塞整条 H2 连接。
-                    match sender.try_send(Ok(packet.to_vec())) {
+                    match sender.try_send(packet.to_vec()) {
                         Ok(()) | Err(tokio_mpsc::error::TrySendError::Full(_)) => {}
                         Err(tokio_mpsc::error::TrySendError::Closed(_)) => return Ok(()),
                     }

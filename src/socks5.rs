@@ -333,38 +333,35 @@ async fn run_udp_egress(
     replies: mpsc::Sender<UdpReply>,
     idle_timeout: Duration,
 ) {
-    let idle = tokio::time::sleep(idle_timeout);
-    tokio::pin!(idle);
     let mut recv_buf = [0u8; 65536];
-
     loop {
-        tokio::select! {
-            _ = &mut idle => return,
-            command = sends.recv() => {
-                let Some(payload) = command else { return };
-                if let Err(error) = egress.send(&payload).await {
-                    warn!("UDP ASSOCIATE 向 {target:?} 发送失败: {error}");
-                    return;
+        // 一次操作包括等待数据与完成转发，背压不能绕过空闲预算。
+        let operation = async {
+            tokio::select! {
+                command = sends.recv() => {
+                    let Some(payload) = command else { return Ok(false) };
+                    egress.send(&payload).await?;
                 }
-                idle.as_mut().reset(tokio::time::Instant::now() + idle_timeout);
-            }
-            result = egress.recv(&mut recv_buf) => {
-                let size = match result {
-                    Ok(size) => size,
-                    Err(error) => {
-                        warn!("UDP ASSOCIATE 从 {target:?} 接收失败: {error}");
-                        return;
+                result = egress.recv(&mut recv_buf) => {
+                    let size = result?;
+                    let reply = UdpReply {
+                        from: egress.peer_addr(),
+                        payload: recv_buf[..size].to_vec(),
+                    };
+                    if replies.send(reply).await.is_err() {
+                        return Ok(false);
                     }
-                };
-                let reply = UdpReply {
-                    from: egress.peer_addr(),
-                    payload: recv_buf[..size].to_vec(),
-                };
-                if replies.send(reply).await.is_err() {
-                    return;
                 }
-                idle.as_mut().reset(tokio::time::Instant::now() + idle_timeout);
             }
+            Ok::<_, std::io::Error>(true)
+        };
+        match tokio::time::timeout(idle_timeout, operation).await {
+            Ok(Ok(true)) => {}
+            Ok(Err(error)) => {
+                warn!("UDP ASSOCIATE 目标 {target:?} 转发失败: {error}");
+                return;
+            }
+            Ok(Ok(false)) | Err(_) => return,
         }
     }
 }

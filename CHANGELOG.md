@@ -27,6 +27,8 @@
 
 ### Added
 
+- 新增纯 Rust Psiphon 地区前置：通过 `PSIPHON_COUNTRY` 选择 31 个国家之一，经基础 WARP → Psiphon SSH → MASQUE H2 建立最终 Cloudflare 出口，保留唯一公共代理入口。地区模式仅支持 TCP；所选国家只限定前置节点，不保证最终 IP 地区或目标服务解锁。候选需通过 SSH、H2 和 WARP 出口验证，最多尝试 8 个，全部失败则启动失败，不回退为直接 Psiphon 出口。
+
 - 新增 `WARP_SOCKS_STATE_DIR`，可覆盖默认状态目录 `/etc/warp-socks`，便于原生运行时直接复用仓库 `data` 目录。
 - WireGuard userspace 网络栈改为项目内 `smoltcp 0.13.1` 异步适配层：同时配置 WARP IPv4/IPv6 地址与默认路由，TCP/UDP 均按目标地址族选择源地址，完整支持隧道内 IPv4/IPv6 字面量。
 - SOCKS5 UDP ASSOCIATE 支持在同一 association 内访问多个 IPv4、IPv6 和域名目标；每目标使用独立隧道通道，关闭的 worker 由 sender 状态统一清理；活跃目标最多 64 个，建立超时 10 秒，建立后空闲 120 秒自动释放。

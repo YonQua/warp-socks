@@ -14,7 +14,6 @@
 
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::sync::LazyLock;
 use std::time::{Duration, Instant};
 
 use crate::netstack::Net;
@@ -37,11 +36,7 @@ impl RecordType {
     }
 }
 
-// 进程级 DNS 缓存：浏览器加载单个网页常常对同一 host 开多条并发连接（比如
-// HTTP/1.1 每 origin 6 条是经典行为），每条 SOCKS5/SOCKS4/HTTP CONNECT 都
-// 各自调用一次 resolve()，缓存前会各走一次隧道内往返，重复消耗本就吃紧的
-// 隧道带宽。按响应里的真实 TTL 缓存（夹在 5s~300s 之间：下限避免 TTL=0
-// 时缓存形同虚设，上限避免小概率的 DNS 生效延迟导致长时间用旧地址）。
+// 缓存随网络栈释放，基础 WARP 与地区出口不共享解析结果。
 const CACHE_MIN_TTL: Duration = Duration::from_secs(5);
 const CACHE_MAX_TTL: Duration = Duration::from_secs(300);
 
@@ -50,34 +45,37 @@ struct CacheEntry {
     expires_at: Instant,
 }
 
-static CACHE: LazyLock<Mutex<HashMap<(String, RecordType), CacheEntry>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
-
-fn cache_get(key: &(String, RecordType)) -> Option<Vec<IpAddr>> {
-    let cache = CACHE.lock();
-    let entry = cache.get(key)?;
-    (entry.expires_at > Instant::now()).then(|| entry.addrs.clone())
+#[derive(Default)]
+pub(crate) struct DnsCache {
+    entries: Mutex<HashMap<(SocketAddr, String, RecordType), CacheEntry>>,
 }
-
-// 命中数上限之后才顺带清理过期项，避免每次写入都遍历整个表；域名种类
-// 有限的场景下（个人/小规模代理）这个上限基本不会被触及。
-fn cache_put(key: (String, RecordType), addrs: Vec<IpAddr>, ttl_secs: u32) {
-    let ttl = Duration::from_secs(ttl_secs as u64).clamp(CACHE_MIN_TTL, CACHE_MAX_TTL);
-    let mut cache = CACHE.lock();
-    if cache.len() >= 512 {
-        let now = Instant::now();
-        cache.retain(|_, e| e.expires_at > now);
-        if cache.len() >= 512 {
-            cache.clear();
-        }
+impl DnsCache {
+    fn get(&self, key: &(SocketAddr, String, RecordType)) -> Option<Vec<IpAddr>> {
+        let cache = self.entries.lock();
+        let entry = cache.get(key)?;
+        (entry.expires_at > Instant::now()).then(|| entry.addrs.clone())
     }
-    cache.insert(
-        key,
-        CacheEntry {
-            addrs,
-            expires_at: Instant::now() + ttl,
-        },
-    );
+
+    // 命中数上限之后才顺带清理过期项，避免每次写入都遍历整个表；域名种类
+    // 有限的场景下（个人/小规模代理）这个上限基本不会被触及。
+    fn put(&self, key: (SocketAddr, String, RecordType), addrs: Vec<IpAddr>, ttl_secs: u32) {
+        let ttl = Duration::from_secs(ttl_secs as u64).clamp(CACHE_MIN_TTL, CACHE_MAX_TTL);
+        let mut cache = self.entries.lock();
+        if cache.len() >= 512 {
+            let now = Instant::now();
+            cache.retain(|_, e| e.expires_at > now);
+            if cache.len() >= 512 {
+                cache.clear();
+            }
+        }
+        cache.insert(
+            key,
+            CacheEntry {
+                addrs,
+                expires_at: Instant::now() + ttl,
+            },
+        );
+    }
 }
 
 pub(crate) fn encode_dns_query(id: u16, name: &str, record_type: RecordType) -> Result<Vec<u8>> {
@@ -210,8 +208,19 @@ pub async fn resolve(
     record_type: RecordType,
     timeout: Duration,
 ) -> Result<Vec<IpAddr>> {
-    let cache_key = (name.to_ascii_lowercase(), record_type);
-    if let Some(addrs) = cache_get(&cache_key) {
+    tokio::time::timeout(timeout, resolve_inner(net, dns_server, name, record_type))
+        .await
+        .context("DNS 查询总预算耗尽")?
+}
+
+async fn resolve_inner(
+    net: &Net,
+    dns_server: SocketAddr,
+    name: &str,
+    record_type: RecordType,
+) -> Result<Vec<IpAddr>> {
+    let cache_key = (dns_server, name.to_ascii_lowercase(), record_type);
+    if let Some(addrs) = net.dns_cache.get(&cache_key) {
         return Ok(addrs);
     }
 
@@ -233,14 +242,8 @@ pub async fn resolve(
     const RETRY_INTERVAL: Duration = Duration::from_millis(1200);
 
     let mut buf = [0u8; 512];
-    let deadline = tokio::time::Instant::now() + timeout;
     loop {
-        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-        if remaining.is_zero() {
-            bail!("DNS 解析 {name} 超时（{timeout:?}）");
-        }
-        let wait = remaining.min(RETRY_INTERVAL);
-        match tokio::time::timeout(wait, sock.recv_from(&mut buf)).await {
+        match tokio::time::timeout(RETRY_INTERVAL, sock.recv_from(&mut buf)).await {
             Ok(Ok((n, from))) if from == dns_server => {
                 let (addrs, ttl) = parse_dns_response(&buf[..n], query_id, record_type)
                     .context("解析隧道内 DNS 响应失败")?;
@@ -251,15 +254,12 @@ pub async fn resolve(
                 } else {
                     ttl
                 };
-                cache_put(cache_key, addrs.clone(), cache_ttl);
+                net.dns_cache.put(cache_key, addrs.clone(), cache_ttl);
                 return Ok(addrs);
             }
             Ok(Ok(_)) => continue, // 非期望来源，丢弃继续等
             Ok(Err(e)) => return Err(e).context("隧道内 UDP 接收失败"),
             Err(_) => {
-                if tokio::time::Instant::now() >= deadline {
-                    bail!("DNS 解析 {name} 超时（{timeout:?}）");
-                }
                 sock.send_to(&query, dns_server)
                     .await
                     .context("重发 DNS 查询失败")?;

@@ -37,7 +37,7 @@ Psiphon 只作为 H2 的 TCP 载体，不是公共出口。节点列表通过基
 
 - `data/endpoint-state.json`
   - 只保存 `last_good_endpoint` 和 cooldown
-  - 用于启动时候选重排（仅 WireGuard 路径，MASQUE 走固定边缘地址不涉及候选轮换）
+  - 用于 WireGuard 启动时候选重排；MASQUE 从注册结果生成边缘地址，H3 并发拨号、H2 逐个尝试 443 端口地址，不使用此状态
 
 - `data/reg.json`
   - MASQUE 路径的注册凭据（基础 MASQUE 或地区模式使用）：设备 id/token、ECDSA 客户端密钥、边缘固定公钥等
@@ -66,10 +66,10 @@ Psiphon 只作为 H2 的 TCP 载体，不是公共出口。节点列表通过基
   - `ip.rs`：WireGuard / H2 共用的 IP 栈配置、隧道内 A/AAAA 解析和 TCP 地址竞速
   - `https.rs`：在现有 `Outbound` 上执行有大小和时间上限的 HTTPS GET，供启动 trace 与签名节点列表下载使用；Hyper 解析 HTTP，rustls 验证公开 CA
   - `wireguard.rs`：建立 WireGuard packet device 和单一 `Net`，通过共享 IP 拨号逻辑提供 TCP，并提供隧道内 UDP
-  - H3 半关闭待验证：`masque::pump` 上传结束后直接等待下载，未在此边界显式结束 QUIC 发送方向；relay 的清理预算不等于端到端 EOF 传播已正确实现。需用等待请求 EOF 才响应的目标单独验证。
+  - H3 上传 EOF 调用 QUIC `finish` 后继续下载；下载仅在帧边界接受 EOF，帧内截断和 reset 通过 pump 任务结果传回调用方，不另建错误通道。本地 QUIC 已验证正常响应、截断与 reset。额度超时仅使当前请求失败；连接已关闭才串行重建，重建时刷新客户端证书。一次业务拨号的 DNS 与 CONNECT 共用 53 秒预算。
   - `psiphon/`：签名节点列表验证、国家筛选、SSH 主机密钥校验和 direct-tcpip；持有基础 WARP，不提供监听入口
   - `masque/`：H3 CONNECT 与 H2 CONNECT-IP。`tls.rs` 共用客户端身份与边缘公钥校验；`qpack.rs` / `huffman.rs` 提供 H3 编解码，`doh.rs` 处理 H3 隧道内 DNS
-  - `masque/h2.rs`：通过 Psiphon 建立 H2 CONNECT-IP，封装 IP capsule，收发任务遵守 H2 流控；有界入站 IP 队列满时丢包，保持 H2 读取和窗口释放，避免与 IP reactor 发送形成循环等待
+  - `masque/h2.rs`：通过 Psiphon 建立 H2 CONNECT-IP，封装 IP capsule，收发任务遵守 H2 流控；有界入站 IP 队列满时丢包，保持 H2 读取和窗口释放；设备读写均观察载体任务结束，背压不能阻塞终止通知
   - `masque/h2_outbound.rs`：把 H2 packet device 接入现有 `Net`，使用注册分配的 IPv4/IPv6 地址
 
 - `src/netstack.rs`
@@ -106,14 +106,14 @@ Psiphon 只作为 H2 的 TCP 载体，不是公共出口。节点列表通过基
   - 多监听地址共享同一出网后端和并发上限；auto 模式创建独立 IPv4 与 V6-only IPv6 wildcard listener，并在协议分发前拒绝公网来源；每个入口仍按首字节分发 SOCKS5/SOCKS4/HTTP；从探测开始到请求头读取完成共享 10 秒握手期限，不覆盖出站拨号或转发
 
 - `src/socks5.rs` / `src/socks4.rs` / `src/http_proxy.rs`
-  - 三种代理协议的服务端实现
+  - 三种代理协议的服务端实现；HTTP 普通请求逐请求路由，CONNECT/Upgrade 保留预读数据后进入 relay，响应体释放取消上游驱动
   - SOCKS5 的一个 UDP ASSOCIATE 可同时维护多个独立目标通道并汇聚回包；worker 完成结果不修改 route map，关闭通道只按 sender 状态清理，目标建立时间、活跃目标数和空闲时间均有界，控制连接关闭时统一回收
 
 - `src/relay.rs`
   - CONNECT 语义成功后的双向转发，三种协议共用
 
 - `src/dns.rs`
-  - 隧道内 DNS 解析（SOCKS5 CONNECT 域名解析必须在隧道内完成）
+  - 隧道内 DNS 解析（SOCKS5 CONNECT 域名解析必须在隧道内完成）；缓存属于 Net 实例并区分解析器，发送与重试共用总超时
 
 容器入口直接是 Dockerfile 里的 `ENTRYPOINT ["/usr/local/bin/warp-socks-rs"]`，不再经过 `entrypoint.sh` 转发（旧版 shell 编排年代的 exec 包装脚本已删除，二进制本身就作为 PID 1 运行）。
 
@@ -122,7 +122,7 @@ Psiphon 只作为 H2 的 TCP 载体，不是公共出口。节点列表通过基
 - WireGuard 使用 Teams 注册；MASQUE 使用独立注册
 - 隧道与代理由仓库根 `src/` 编译出的单一二进制提供，无子进程编排
 - 启动阶段必须先拿到可用 SOCKS 出口，再标记 runtime ready
-- 普通 WireGuard 首次真实探测失败即冷却 endpoint、退出；MASQUE / 地区模式达到失败阈值后退出
+- 普通 WireGuard 首次真实探测失败或 reactor 终止即冷却 endpoint、退出；MASQUE / 地区模式达到失败阈值或已知基础/最终 IP reactor 终止后退出
 
 ## 读代码顺序
 

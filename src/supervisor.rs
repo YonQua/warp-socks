@@ -107,7 +107,12 @@ impl Supervisor {
             None => Arc::clone(&selected.outbound),
         };
         let (proxy, outcome) = self
-            .spawn_and_probe(outbound, listen_mode, probe_addr, failure_threshold)
+            .spawn_and_probe(
+                Arc::clone(&outbound),
+                listen_mode,
+                probe_addr,
+                failure_threshold,
+            )
             .await?;
         if let Some(country) = country {
             info!(
@@ -118,7 +123,12 @@ impl Supervisor {
         } else if let Some(ip) = outcome.ip {
             info!("当前出口 IP: {ip}");
         }
-        self.serve_and_watch(proxy).await?;
+        self.serve_and_watch(
+            proxy,
+            outbound.as_ref(),
+            country.map(|_| selected.outbound.as_ref()),
+        )
+        .await?;
         if country.is_none() {
             if let Some(endpoint) = &selected.wg_endpoint {
                 let mut store = JsonFileEndpointStore::load(&self.config.endpoint_state_file)?;
@@ -129,7 +139,7 @@ impl Supervisor {
                 }
             }
         }
-        bail!("SOCKS 端到端探测失败，退出并重新选择后端与路径。")
+        bail!("出站终止或 SOCKS 端到端探测失败，退出并重新选择后端与路径。")
     }
 
     async fn prepare_region(
@@ -369,8 +379,13 @@ impl Supervisor {
         Ok((proxy, outcome))
     }
 
-    /// 运行期只探测唯一公开入口。`Ok(())` 仅表示连续失败达到阈值。
-    async fn serve_and_watch(&self, mut proxy: RunningProxy) -> Result<()> {
+    /// 运行期只探测唯一公开入口。`Ok(())` 表示已知出站终止或连续探测失败达到阈值。
+    async fn serve_and_watch(
+        &self,
+        mut proxy: RunningProxy,
+        outbound: &dyn Outbound,
+        base: Option<&dyn Outbound>,
+    ) -> Result<()> {
         let (probe_addr, backend, failure_threshold) =
             (proxy.probe_addr, proxy.backend, proxy.failure_threshold);
         info!("代理监听模式: {}", self.config.listen_addrs);
@@ -379,23 +394,44 @@ impl Supervisor {
         heartbeat::record_success();
         let probe = SocksTraceProbe::new(probe_addr, self.config.healthcheck_probe_timeout);
         let mut recovery = ThresholdRecovery::new(failure_threshold);
-        loop {
+        let terminated = async {
             tokio::select! {
+                reason = outbound.terminated() => format!("最终出站: {reason}"),
+                reason = async {
+                    match base {
+                        Some(base) => base.terminated().await,
+                        None => std::future::pending().await,
+                    }
+                } => format!("基础 WARP: {reason}"),
+            }
+        };
+        tokio::pin!(terminated);
+        loop {
+            let outcome = tokio::select! {
                 result = &mut proxy.serve_handle => return Err(listener_result(result)),
-                () = sleep(self.config.healthcheck_interval) => {
-                    match probe.probe().await {
-                        Ok(_) => {
-                            heartbeat::record_success();
-                            recovery.on_success();
-                        }
-                        Err(error) => {
-                            let action = recovery.on_failure();
-                            warn!(
-                                "SOCKS 出口探测失败: {error}; failures={}/{}",
-                                recovery.consecutive_failures(), failure_threshold
-                            );
-                            if action == RecoveryAction::RequestExit { return Ok(()); }
-                        }
+                reason = &mut terminated => {
+                    warn!("出站已终止，退出重建链路: {reason}");
+                    return Ok(());
+                }
+                outcome = async {
+                    sleep(self.config.healthcheck_interval).await;
+                    probe.probe().await
+                } => outcome,
+            };
+            match outcome {
+                Ok(_) => {
+                    heartbeat::record_success();
+                    recovery.on_success();
+                }
+                Err(error) => {
+                    let action = recovery.on_failure();
+                    warn!(
+                        "SOCKS 出口探测失败: {error}; failures={}/{}",
+                        recovery.consecutive_failures(),
+                        failure_threshold
+                    );
+                    if action == RecoveryAction::RequestExit {
+                        return Ok(());
                     }
                 }
             }

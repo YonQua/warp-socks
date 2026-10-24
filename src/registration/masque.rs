@@ -423,6 +423,12 @@ pub fn load(path: &Path) -> Result<RegCredentials> {
     build_credentials(&reg, &signing_key)
 }
 
+/// 重连沿用已登记的密钥，只刷新短期客户端证书。
+pub(crate) fn refresh_credentials(creds: &RegCredentials) -> Result<RegCredentials> {
+    let key = SigningKey::from_pkcs8_der(&creds.client_key_der).context("MASQUE 客户端私钥无效")?;
+    build_credentials(&creds.registration, &key)
+}
+
 /// 向 API 注销并删除本地文件。
 ///
 /// # Errors
@@ -451,12 +457,10 @@ pub async fn delete(path: &Path) -> Result<()> {
         .context("注销 API 请求失败")?;
     let status = resp.status();
     let body = resp.text().await.unwrap_or_default();
-    if !status.is_success() && status.as_u16() != 204 {
-        // API 注销失败只警告，仍删除本地文件（避免凭据悬空）。
-        println!("警告: API 注销返回 {status}: {body}（继续删除本地文件）");
-    } else {
-        println!("✓ 已注销: id={}", ident.id);
+    if !status.is_success() {
+        bail!("API 注销返回 {status}: {body}；本地凭据已保留以便重试");
     }
+    println!("✓ 已注销: id={}", ident.id);
     std::fs::remove_file(path).with_context(|| format!("删除 {} 失败", path.display()))?;
     Ok(())
 }

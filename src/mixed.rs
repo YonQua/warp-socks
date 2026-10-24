@@ -192,7 +192,7 @@ async fn dispatch(client: TcpStream, peer: SocketAddr, outbound: Arc<dyn Outboun
     match first_byte[0] {
         0x05 => socks5::handle_client(client, peer, outbound, deadline).await,
         0x04 => socks4::handle_client(client, peer, &*outbound, deadline).await,
-        _ => http_proxy::handle_client(client, peer, &*outbound, deadline).await,
+        _ => http_proxy::handle_client(client, peer, outbound, deadline).await,
     }
 }
 

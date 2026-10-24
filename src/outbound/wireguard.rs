@@ -86,6 +86,10 @@ impl Outbound for WgOutbound {
         true
     }
 
+    async fn terminated(&self) -> String {
+        self.net.terminated().await
+    }
+
     async fn connect_tcp(&self, host: Host, port: u16) -> std::io::Result<Connected> {
         ip::connect_tcp(&self.net, host, port).await
     }

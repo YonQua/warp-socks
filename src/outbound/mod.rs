@@ -42,6 +42,10 @@ impl Host {
 /// 到单一对端的数据报通道（SOCKS5 UDP ASSOCIATE 用）：一次 `connect_udp`
 /// 只绑定一个目的地址，语义上等价于已 connect 的 UDP socket。
 #[async_trait]
+#[expect(
+    clippy::double_must_use,
+    reason = "async-trait 0.1.91 adds bare must_use to methods returning must_use futures"
+)]
 pub trait Datagram: Send + Sync {
     /// 实际解析出的对端地址，用于给客户端拼 SOCKS5 UDP 响应头。
     fn peer_addr(&self) -> SocketAddr;
@@ -67,10 +71,19 @@ pub struct Connected {
 
 /// 出网后端：给定 host:port 产出一条双向字节流，可选支持 UDP。
 #[async_trait]
+#[expect(
+    clippy::double_must_use,
+    reason = "async-trait 0.1.91 adds bare must_use to methods returning must_use futures"
+)]
 pub trait Outbound: Send + Sync {
     /// 后端名，用于展示（启动日志、每条连接日志），如 "MASQUE"/"WireGuard"。
     /// 只在实现处定义这一份，避免调用方各自维护一份同名字符串、改名时漏改。
     fn name(&self) -> &'static str;
+
+    /// 等待不可恢复的后端终止；可自行恢复的后端保持 pending。
+    async fn terminated(&self) -> String {
+        std::future::pending().await
+    }
 
     /// 后端是否原生支持隧道内 UDP。SOCKS5 必须在回复 UDP ASSOCIATE 前读取
     /// 这个静态能力，避免先回复成功、收到首包后才发现后端不支持而形成黑洞。

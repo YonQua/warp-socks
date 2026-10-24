@@ -1,5 +1,5 @@
 // 各协议 CONNECT 语义成功后的双向转发，SOCKS5/SOCKS4/HTTP CONNECT 共用。
-// 客户端一侧固定是 tokio::net::TcpStream（mixed 分发器只 peek 不消费首字节），
+// 客户端可以是原始 TCP 或保留预读数据的 HTTP Upgrade 流，
 // 出网一侧是 trait object（Box<dyn Stream>），底层可以是 WireGuard 虚拟网卡
 // 的 TCP 流，也可以是 MASQUE H3 CONNECT 的双向 QUIC 流。
 
@@ -9,7 +9,6 @@ use std::time::Duration;
 use anyhow::Result;
 use log::info;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
-use tokio::net::TcpStream;
 
 use crate::outbound::{Connected, Host, Outbound};
 
@@ -25,20 +24,17 @@ pub async fn connect(outbound: &dyn Outbound, host: Host, port: u16) -> std::io:
 
 /// 双向转发：客户端 TCP 流 <-> 出网代理流，直到任一方关闭。
 ///
-/// "已建立"/"已关闭" 日志统一收在这里：SOCKS5/SOCKS4/HTTP CONNECT 三处协议
-/// 实现原先各自打印一遍"已建立"，且都没有对应的"已关闭"，是典型的重复
-/// 逻辑分散在调用点的模式，收口到转发本身归属的地方。后端名 + colo 等
-/// 诊断信息也并进这一行：单独打一行会跟这里的"已建立"分处两个模块，
-/// 并发连接一多只能靠时间戳去猜哪条对应哪条，合并后同一次连接的信息
-/// 天然聚在一起；`backend` 长时间运行只在启动时打过一次，翻旧了没法
-/// 确认当前连接到底走的哪个后端，这里每条连接都带上就不用翻。
-pub async fn tunnel_tcp(
+/// 统一记录目标和后端；I/O 错误与半关闭排空超时交给调用方报告。
+pub async fn tunnel_tcp<C>(
     peer: SocketAddr,
     display: &str,
     backend: &str,
-    client: TcpStream,
+    client: C,
     conn: Connected,
-) -> Result<()> {
+) -> Result<()>
+where
+    C: AsyncRead + AsyncWrite + Unpin,
+{
     let Connected {
         stream: outbound,
         note,
@@ -47,12 +43,12 @@ pub async fn tunnel_tcp(
         Some(note) => info!("连接 {peer} -> {display}（backend={backend}, {note}）: 已建立"),
         None => info!("连接 {peer} -> {display}（backend={backend}）: 已建立"),
     }
-    copy_with_drain(client, outbound, RELAY_DRAIN_GRACE).await;
+    copy_with_drain(client, outbound, RELAY_DRAIN_GRACE).await?;
     info!("连接 {peer} -> {display}: 已关闭");
     Ok(())
 }
 
-async fn copy_with_drain<C, O>(client: C, outbound: O, drain_grace: Duration)
+async fn copy_with_drain<C, O>(client: C, outbound: O, drain_grace: Duration) -> std::io::Result<()>
 where
     C: AsyncRead + AsyncWrite + Unpin,
     O: AsyncRead + AsyncWrite + Unpin,
@@ -60,29 +56,30 @@ where
     let (mut rc, mut wc) = tokio::io::split(client);
     let (mut ro, mut wo) = tokio::io::split(outbound);
     let down = async {
-        let n = tokio::io::copy(&mut ro, &mut wc).await;
-        let _ = wc.shutdown().await;
-        n
+        tokio::io::copy(&mut ro, &mut wc).await?;
+        wc.shutdown().await
     };
     tokio::pin!(down);
     {
         let up = tokio::io::copy(&mut rc, &mut wo);
         tokio::pin!(up);
         tokio::select! {
-            _ = &mut down => return,
-            _ = &mut up => {},
+            result = &mut down => return result,
+            result = &mut up => { result?; },
         }
     }
     // shutdown 与响应读取并发，整个收尾阶段共用一份预算。
-    let _ = tokio::time::timeout(drain_grace, async {
+    tokio::time::timeout(drain_grace, async {
         tokio::select! {
-            _ = &mut down => {}
-            _ = wo.shutdown() => {
-                let _ = down.await;
+            result = &mut down => result,
+            result = wo.shutdown() => {
+                result?;
+                down.await
             }
         }
     })
-    .await;
+    .await
+    .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "客户端半关闭后响应排空超时"))?
 }
 
 #[cfg(test)]
@@ -95,7 +92,7 @@ mod tests {
         let (outbound, _outbound_peer) = tokio::io::duplex(64);
         drop(client_peer);
 
-        tokio::time::timeout(
+        let _ = tokio::time::timeout(
             Duration::from_millis(100),
             copy_with_drain(client, outbound, Duration::from_millis(10)),
         )
