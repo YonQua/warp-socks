@@ -12,8 +12,8 @@ use anyhow::{Context, Result};
 use log::{error, warn};
 use socket2::{Domain, Protocol, Socket, Type};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::Semaphore;
-use tokio::time::{timeout_at, Instant};
+use tokio::sync::{watch, Semaphore};
+use tokio::time::{timeout, timeout_at, Instant};
 
 use crate::outbound::Outbound;
 use crate::{http_proxy, socks4, socks5};
@@ -28,12 +28,9 @@ use crate::{http_proxy, socks4, socks5};
 // "自愈"——一次瞬时的并发连接数冲高本不该升级到这一级别）。
 const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_secs(1);
 
-// 同时处理中的连接数上限：只是给一次异常的连接数飙升（例如单个客户端异常
-// 打满连接）托底，避免它把 fd 都耗尽、连累 DNS 解析/健康检查探测等不走这个
-// accept 循环的其它子系统。这不是运维需要按部署调整的旋钮（不在超时派生链
-// 里，也不是资源配额），跟 appconfig.rs 里 startup_endpoint_cooldown /
-// healthcheck_interval 同类处理：固定常量，不做成环境变量。
-const MAX_CONNECTIONS: usize = 4096;
+// IP 栈单 TCP 缓冲 512 KiB；限制业务并发为恢复和探测保留内存。
+const MAX_CONNECTIONS: usize = 64;
+const RECOVERY_WAIT: Duration = Duration::from_secs(5);
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Clone, Debug)]
@@ -43,16 +40,23 @@ pub enum ListenMode {
 }
 
 pub async fn serve(outbound: Arc<dyn Outbound>, mode: ListenMode) -> Result<()> {
-    let permits = Arc::new(Semaphore::new(MAX_CONNECTIONS));
-    let listeners = bind_listeners(mode).await?;
+    let (_owner, state) = watch::channel(Some(outbound));
+    serve_managed(state, mode).await
+}
 
+pub(crate) async fn serve_managed(
+    state: watch::Receiver<Option<Arc<dyn Outbound>>>,
+    mode: ListenMode,
+) -> Result<()> {
+    let listeners = bind_listeners(mode).await?;
+    let permits = Arc::new(Semaphore::new(MAX_CONNECTIONS));
     let mut tasks = tokio::task::JoinSet::new();
     for (listen_addr, listener, lan_only) in listeners {
         tasks.spawn(accept_loop(
             listener,
             listen_addr,
             lan_only,
-            Arc::clone(&outbound),
+            state.clone(),
             Arc::clone(&permits),
         ));
     }
@@ -113,24 +117,23 @@ async fn accept_loop(
     listener: TcpListener,
     listen_addr: SocketAddr,
     lan_only: bool,
-    outbound: Arc<dyn Outbound>,
+    state: watch::Receiver<Option<Arc<dyn Outbound>>>,
     permits: Arc<Semaphore>,
 ) -> Result<()> {
     log::info!("代理监听已就绪: {listen_addr}");
-
+    let mut connections = tokio::task::JoinSet::new();
     loop {
-        // 先拿许可证、再 accept：达到并发上限时不消费 listener 的 backlog，
-        // 新连接留在 OS 的 listen backlog 里排队等待，而不是被应用层主动拒绝
-        // ——对照 tokio 官方 mini-redis 示例（tokio-rs/mini-redis
-        // src/server.rs `Listener::run`）里 `limit_connections.acquire` 的限流
-        // 写法。许可证随 accept 到的连接一起 move 进 spawn 的任务，处理完毕
-        // 连接结束时随 permit 一起 drop 释放。
-        let permit = Arc::clone(&permits)
-            .acquire_owned()
-            .await
-            .expect("Semaphore 未被 close，acquire 不会失败");
-
-        let (client, peer) = match listener.accept().await {
+        // 接受后再分配容量，满载时及时关闭，避免在应用层堆积等待任务。
+        let accepted = tokio::select! {
+            result = connections.join_next(), if !connections.is_empty() => {
+                if let Some(Err(error)) = result {
+                    warn!("代理连接任务异常: {error}");
+                }
+                continue;
+            }
+            accepted = listener.accept() => accepted,
+        };
+        let (client, peer) = match accepted {
             Ok(pair) => pair,
             Err(e) if is_connection_error(&e) => {
                 // 对端在三次握手完成前就中止了连接，下一条待接受的连接大概率立刻
@@ -148,13 +151,60 @@ async fn accept_loop(
             warn!("自动监听拒绝非 LAN 客户端: {peer}");
             continue;
         }
-        let outbound = outbound.clone();
-        tokio::spawn(async move {
+        let permit = Arc::clone(&permits).try_acquire_owned();
+        let Ok(permit) = permit else {
+            warn!("代理连接容量已满: {peer}");
+            continue;
+        };
+        let mut state = state.clone();
+        connections.spawn(async move {
             let _permit = permit;
-            if let Err(e) = dispatch(client, peer, outbound).await {
-                warn!("连接 {peer} 处理失败: {e:#}");
+            let ready = timeout(RECOVERY_WAIT, async {
+                loop {
+                    if let Some(outbound) = state.borrow_and_update().clone() {
+                        return Ok::<_, watch::error::RecvError>(outbound);
+                    }
+                    state.changed().await?;
+                }
+            })
+            .await;
+            match ready {
+                Ok(Ok(outbound)) => {
+                    tokio::select! {
+                        result = dispatch(client, peer, outbound) => {
+                            if let Err(e) = result { warn!("连接 {peer} 处理失败: {e:#}"); }
+                        }
+                        _ = state.changed() => {
+                            log::debug!("出口已失效，释放连接: {peer}");
+                        }
+                    }
+                }
+                _ => {
+                    // 失败回复也有生命周期：HTTP keep-alive 不能永久占用恢复中的出口。
+                    tokio::select! {
+                        _ = timeout(HANDSHAKE_TIMEOUT, dispatch(client, peer, Arc::new(Unavailable))) => {}
+                        _ = state.changed() => {}
+                    }
+                }
             }
         });
+    }
+}
+
+struct Unavailable;
+
+#[async_trait::async_trait]
+impl Outbound for Unavailable {
+    fn name(&self) -> &'static str {
+        "recovering"
+    }
+
+    async fn connect_tcp(
+        &self,
+        _: crate::outbound::Host,
+        _: u16,
+    ) -> io::Result<crate::outbound::Connected> {
+        Err(io::Error::new(io::ErrorKind::NotConnected, "出口尚未就绪"))
     }
 }
 

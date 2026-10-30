@@ -1,12 +1,13 @@
 //! Native Psiphon SSH transport over an existing outbound.
-mod server_list;
+pub(crate) mod server_list;
 
 use super::{Connected, Host, Outbound};
 use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
 use base64::{engine::general_purpose::STANDARD, Engine};
-use rand::{seq::SliceRandom, RngCore};
+use rand::RngCore;
 use serde_json::json;
+use std::future::Future;
 use std::{io, net::IpAddr, sync::Arc, time::Duration};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -64,14 +65,13 @@ pub struct Psiphon {
     _upstream: Arc<dyn Outbound>,
 }
 impl Psiphon {
-    /// Download and shuffle SSH candidates for an already validated country.
+    /// Download SSH candidates for an already validated country.
     pub(crate) async fn candidates(
         upstream: &dyn Outbound,
         country: &str,
     ) -> Result<Vec<server_list::ServerEntry>> {
         let mut entries = server_list::fetch(upstream, country).await?;
         entries.retain(|e| e.ssh_port != 0 && e.capabilities.iter().any(|c| c == "SSH"));
-        entries.shuffle(&mut rand::thread_rng());
         log::info!(
             "Psiphon signed list: country={country}, SSH candidates={}",
             entries.len()
@@ -94,7 +94,7 @@ impl Psiphon {
         let mut tasks = JoinSet::new();
         tasks.spawn(async move {
             if let Err(e) = future.await {
-                log::debug!("Psiphon SSH closed: {e}");
+                log::warn!("Psiphon SSH 会话异常终止: {e}");
             }
         });
         tasks.spawn(async move {
@@ -192,6 +192,8 @@ impl Outbound for Psiphon {
         let (local, bridge) = tokio::io::duplex(65536);
         let (mut read, mut write) = tokio::io::split(bridge);
         let outgoing = channel.clone();
+        let received_eof = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let clean_eof = Arc::clone(&received_eof);
         let task = tokio::spawn(async move {
             let send = async {
                 let mut buf = [0u8; 16384];
@@ -216,22 +218,29 @@ impl Outbound for Psiphon {
                             write.write_all(&data).await?;
                         }
                         makiko::ChannelEvent::Eof => {
+                            clean_eof.store(true, std::sync::atomic::Ordering::Release);
                             write.shutdown().await?;
+                            return Ok::<_, io::Error>(());
                         }
                         _ => {}
                     }
                 }
-                write.shutdown().await?;
-                Ok::<_, io::Error>(())
+                Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "Psiphon channel closed without EOF",
+                ))
             };
-            let _ = tokio::try_join!(send, receive);
+            // SSH EOF 只关闭一个方向，另一方向仍可继续发送。
+            let result = tokio::try_join!(send, receive).map(|_| ());
             let _ = outgoing.close();
+            result
         });
         Ok(Connected {
             stream: Box::new(PsiphonStream {
                 io: local,
                 channel,
-                task,
+                task: Some(task),
+                received_eof,
             }),
             note: Some(format!("country={}", self.country)),
         })
@@ -248,12 +257,15 @@ impl Drop for PendingOpen {
 struct PsiphonStream {
     io: tokio::io::DuplexStream,
     channel: makiko::Channel,
-    task: JoinHandle<()>,
+    task: Option<JoinHandle<io::Result<()>>>,
+    received_eof: Arc<std::sync::atomic::AtomicBool>,
 }
 impl Drop for PsiphonStream {
     fn drop(&mut self) {
         let _ = self.channel.close();
-        self.task.abort();
+        if let Some(task) = &self.task {
+            task.abort();
+        }
     }
 }
 impl tokio::io::AsyncRead for PsiphonStream {
@@ -262,7 +274,27 @@ impl tokio::io::AsyncRead for PsiphonStream {
         cx: &mut std::task::Context<'_>,
         buf: &mut tokio::io::ReadBuf<'_>,
     ) -> std::task::Poll<io::Result<()>> {
-        std::pin::Pin::new(&mut self.io).poll_read(cx, buf)
+        let before = buf.filled().len();
+        let empty = buf.remaining() == 0;
+        match std::pin::Pin::new(&mut self.io).poll_read(cx, buf) {
+            std::task::Poll::Ready(Ok(())) if !empty && buf.filled().len() == before => {
+                if self.received_eof.load(std::sync::atomic::Ordering::Acquire) {
+                    return std::task::Poll::Ready(Ok(()));
+                }
+                // duplex EOF 不能把后台传输错误伪装成正常关闭。
+                let Some(task) = self.task.as_mut() else {
+                    return std::task::Poll::Ready(Ok(()));
+                };
+                match std::pin::Pin::new(task).poll(cx) {
+                    std::task::Poll::Pending => std::task::Poll::Pending,
+                    std::task::Poll::Ready(result) => {
+                        self.task = None;
+                        std::task::Poll::Ready(result.map_err(io::Error::other).and_then(|r| r))
+                    }
+                }
+            }
+            result => result,
+        }
     }
 }
 impl tokio::io::AsyncWrite for PsiphonStream {

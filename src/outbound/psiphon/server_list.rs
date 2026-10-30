@@ -16,7 +16,7 @@ const SERVER_LIST_PATH: &str = "/psiphon/web/mjr4-p23r-puwl/server_list_compress
 const SIGNING_PUBLIC_KEY: &str = include_str!("signing_key.txt");
 const MAX_PACKAGE_BYTES: usize = 64 * 1024 * 1024;
 
-#[derive(Default, Deserialize)]
+#[derive(Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct ServerEntry {
     pub ip_address: String,

@@ -4,7 +4,7 @@
 // 发 DNS 查询解析。这层只是薄封装，实际逻辑在 crate::netstack 和 crate::dns 里。
 //
 // WireGuard 后端持有单一、不可变的 Net 生命周期。运行期不原地重建或切换；
-// 真实出口探测失败时由 Supervisor 结束整个进程生命周期。
+// 真实出口探测失败时由 Supervisor 撤销旧出口并重建完整链路。
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::time::Duration;

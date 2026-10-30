@@ -179,8 +179,8 @@ impl TeamsRegistrar {
                     .and_then(|v| v.get("account").cloned())
                     .is_some_and(|v| !v.is_null());
                 if has_account {
-                    let mut account: WgAccount = serde_json::from_str(&response_body)
-                        .with_context(|| format!("解析 Teams 注册响应失败: {response_body}"))?;
+                    let mut account: WgAccount =
+                        serde_json::from_str(&response_body).context("解析 Teams 注册响应失败")?;
                     account.private_key = private_key_b64;
                     account.save(&self.account_path)?;
                     info!(
@@ -201,7 +201,6 @@ impl TeamsRegistrar {
                     .map(|c| c.to_string())
                     .unwrap_or_else(|| "unknown".to_string())
             );
-            warn!("响应摘要: {}", summarize(&response_body));
 
             if attempt >= retries {
                 bail!("Teams 注册失败，已达到最大重试次数。");
@@ -279,11 +278,6 @@ fn current_tos() -> String {
         now.minute(),
         now.second()
     )
-}
-
-fn summarize(body: &str) -> String {
-    let flat = body.split_whitespace().collect::<Vec<_>>().join(" ");
-    flat.chars().take(220).collect()
 }
 
 fn reserved_bytes(client_id: &str) -> [u8; 3] {

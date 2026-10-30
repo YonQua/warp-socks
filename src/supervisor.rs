@@ -1,10 +1,9 @@
 // 长驻进程编排：账户/MASQUE 注册 → （优先）MASQUE 隧道 → WireGuard endpoint
 // 候选依次尝试（进程内直接换下一个，不再像旧 shell 那样每个候选 spawn 一次
-// 子进程）→ 起 SOCKS5 服务 → 内部健康检查按后端阈值决定是否退出。
+// 子进程）；常驻 SOCKS5 监听，内部健康检查按后端阈值触发出口重建。
 //
 // 对应 lib/app/main.sh + lib/runtime/tunnel.sh + lib/runtime/recovery.sh 的编排部分。
 
-use std::net::SocketAddr;
 use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
@@ -14,10 +13,7 @@ use tokio::time::sleep;
 
 use crate::appconfig::AppConfig;
 use crate::endpoint::{candidate_pool, plan_candidates, JsonFileEndpointStore};
-use crate::health::{
-    heartbeat, probe::probe_outbound, ProbeOutcome, RecoveryAction, SocksTraceProbe,
-    ThresholdRecovery,
-};
+use crate::health::{heartbeat, probe::probe_outbound, RecoveryAction, ThresholdRecovery};
 use crate::mixed;
 use crate::outbound::{masque::MasqueH2, psiphon::Psiphon, Masque, Outbound, WgOutbound};
 use crate::registration::{self, RegCredentials, TeamsRegistrar, WgAccount};
@@ -28,11 +24,14 @@ pub struct Supervisor {
     config: AppConfig,
 }
 
+struct CachedCandidates {
+    entries: Vec<crate::outbound::psiphon::server_list::ServerEntry>,
+    fetched: std::time::Instant,
+    preferred: Option<usize>,
+}
+
 struct RunningProxy {
     serve_handle: JoinHandle<Result<()>>,
-    probe_addr: std::net::SocketAddr,
-    backend: &'static str,
-    failure_threshold: u32,
 }
 
 struct SelectedWarp {
@@ -53,11 +52,10 @@ impl Supervisor {
     }
 
     /// # Errors
-    /// 必要的注册/配置步骤失败、或所有 endpoint 候选均无法就绪时返回错误
-    /// （调用方应以非零退出码结束进程，交给 Docker `restart: unless-stopped` 重启）。
+    /// 配置、监听或本地健康状态初始化失败时返回错误。
+    /// 网络准备与出口故障由单一恢复循环处理，不关闭公共监听。
     pub async fn run(&self) -> Result<()> {
-        let (listen_mode, probe_addr) =
-            parse_listen_mode(&self.config.listen_addrs, self.config.listen_port)?;
+        let listen_mode = parse_listen_mode(&self.config.listen_addrs, self.config.listen_port)?;
         let psiphon_country = self.validate_psiphon_config()?;
         heartbeat::invalidate().context("重置启动健康状态失败")?;
         std::fs::create_dir_all(&self.config.state_dir)
@@ -78,7 +76,7 @@ impl Supervisor {
         );
 
         tokio::select! {
-            result = self.run_service(listen_mode, probe_addr, psiphon_country.as_deref()) => result,
+            result = self.run_service(listen_mode, psiphon_country.as_deref()) => result,
             signal = shutdown_signal() => {
                 signal?;
                 info!("收到退出信号，正在停止隧道/SOCKS5。");
@@ -90,70 +88,137 @@ impl Supervisor {
     async fn run_service(
         &self,
         listen_mode: mixed::ListenMode,
-        probe_addr: SocketAddr,
         country: Option<&str>,
     ) -> Result<()> {
-        let selected = self.prepare_base().await?;
-        let failure_threshold = if country.is_some() || selected.wg_endpoint.is_none() {
-            self.config.healthcheck_failure_threshold
-        } else {
-            WG_HEALTH_FAILURE_THRESHOLD
+        let (state, receiver) = tokio::sync::watch::channel(None);
+        let mut proxy = RunningProxy {
+            serve_handle: tokio::spawn(mixed::serve_managed(receiver, listen_mode)),
         };
-        let outbound: Arc<dyn Outbound> = match country {
-            Some(country) => {
-                self.prepare_region(Arc::clone(&selected.outbound), country)
-                    .await?
-            }
-            None => Arc::clone(&selected.outbound),
-        };
-        let (proxy, outcome) = self
-            .spawn_and_probe(
-                Arc::clone(&outbound),
-                listen_mode,
-                probe_addr,
-                failure_threshold,
-            )
-            .await?;
-        if let Some(country) = country {
-            info!(
-                "Psiphon 前置已就绪: country={country}, Cloudflare 最终出口: IP={}, loc={}",
-                outcome.ip.as_deref().unwrap_or("未知"),
-                outcome.loc.as_deref().unwrap_or("未知"),
-            );
-        } else if let Some(ip) = outcome.ip {
-            info!("当前出口 IP: {ip}");
+        // 监听是进程级资源，出口准备、运行和退避共用这一处监督。
+        tokio::select! {
+            result = &mut proxy.serve_handle => Err(listener_result(result)),
+            result = self.recover_outbound(state, country) => result,
         }
-        self.serve_and_watch(
-            proxy,
-            outbound.as_ref(),
-            country.map(|_| selected.outbound.as_ref()),
-        )
-        .await?;
-        if country.is_none() {
-            if let Some(endpoint) = &selected.wg_endpoint {
-                let mut store = JsonFileEndpointStore::load(&self.config.endpoint_state_file)?;
-                if let Err(error) =
-                    store.mark_cooldown(endpoint, self.config.startup_endpoint_cooldown)
-                {
-                    warn!("记录失效 endpoint 冷却失败: endpoint={endpoint}, error={error:#}");
+    }
+
+    async fn recover_outbound(
+        &self,
+        state: tokio::sync::watch::Sender<Option<Arc<dyn Outbound>>>,
+        country: Option<&str>,
+    ) -> Result<()> {
+        let mut candidates = None;
+        let mut failures = 0u32;
+        loop {
+            heartbeat::invalidate().context("重置恢复健康状态失败")?;
+            let started = tokio::time::Instant::now();
+            info!("出口准备开始: country={}", country.unwrap_or("none"));
+            let prepare = async {
+                let selected = self.prepare_base().await?;
+                let outbound = match country {
+                    Some(country) => {
+                        self.prepare_region(
+                            Arc::clone(&selected.outbound),
+                            country,
+                            &mut candidates,
+                        )
+                        .await?
+                    }
+                    None => Arc::clone(&selected.outbound),
+                };
+                Ok::<_, anyhow::Error>((selected, outbound))
+            };
+            let prepared = tokio::time::timeout(std::time::Duration::from_secs(120), prepare)
+                .await
+                .map_err(|error| {
+                    candidates = None;
+                    anyhow::Error::new(error).context("出口准备超过 120s 总预算")
+                })
+                .and_then(|result| result);
+            match prepared {
+                Ok((selected, outbound)) => {
+                    let failure_threshold = if country.is_none() && selected.wg_endpoint.is_some() {
+                        WG_HEALTH_FAILURE_THRESHOLD
+                    } else {
+                        self.config.healthcheck_failure_threshold
+                    };
+                    // prepare 已验证最终出口；先验证后发布，不让业务参与就绪判断。
+                    state.send_replace(Some(Arc::clone(&outbound)));
+                    failures = 0;
+                    heartbeat::record_success();
+                    info!(
+                        "出口已就绪: backend={}, elapsed={:?}",
+                        outbound.name(),
+                        started.elapsed()
+                    );
+                    self.watch_outbound(
+                        outbound.as_ref(),
+                        country.map(|_| selected.outbound.as_ref()),
+                        failure_threshold,
+                    )
+                    .await;
+                    state.send_replace(None);
+                    heartbeat::invalidate().context("重置恢复健康状态失败")?;
+                    if country.is_none() {
+                        if let Some(endpoint) = &selected.wg_endpoint {
+                            let cooldown =
+                                JsonFileEndpointStore::load(&self.config.endpoint_state_file)
+                                    .and_then(|mut store| {
+                                        store.mark_cooldown(
+                                            endpoint,
+                                            self.config.startup_endpoint_cooldown,
+                                        )
+                                    });
+                            if let Err(error) = cooldown {
+                                warn!("记录失效 endpoint 冷却失败: {error:#}");
+                            }
+                        }
+                    }
                 }
+                Err(error) => warn!(
+                    "出口准备失败: elapsed={:?}, error={error:#}",
+                    started.elapsed()
+                ),
             }
+            failures = failures.saturating_add(1);
+            let ceiling = 1u64 << failures.min(5);
+            let delay = std::time::Duration::from_millis(rand::Rng::gen_range(
+                &mut rand::thread_rng(),
+                1000..=ceiling * 1000,
+            ));
+            warn!("出口恢复等待: failures={failures}, delay={delay:?}");
+            sleep(delay).await;
         }
-        bail!("出站终止或 SOCKS 端到端探测失败，退出并重新选择后端与路径。")
     }
 
     async fn prepare_region(
         &self,
         base: Arc<dyn Outbound>,
         country: &str,
+        candidates: &mut Option<CachedCandidates>,
     ) -> Result<Arc<dyn Outbound>> {
         let creds = self.ensure_masque_credentials().await?;
-        let candidates = Psiphon::candidates(base.as_ref(), country).await?;
-        if candidates.is_empty() {
-            bail!("所选地区没有可用 SSH 候选: {country}");
+        if candidates
+            .as_ref()
+            .is_none_or(|cache| cache.fetched.elapsed() >= std::time::Duration::from_secs(86400))
+        {
+            *candidates = Some(CachedCandidates {
+                entries: Psiphon::candidates(base.as_ref(), country).await?,
+                fetched: std::time::Instant::now(),
+                preferred: None,
+            });
+        }
+        let cache = candidates.as_mut().context("Psiphon 候选缓存未初始化")?;
+        let mut order = (0..cache.entries.len()).collect::<Vec<_>>();
+        use rand::seq::SliceRandom;
+        order.shuffle(&mut rand::thread_rng());
+        if let Some(preferred) = cache.preferred.take() {
+            if let Some(index) = order.iter().position(|&index| index == preferred) {
+                order.swap(0, index);
+            }
         }
         let mut last_error = None;
-        for (index, entry) in candidates.into_iter().take(8).enumerate() {
+        for (index, entry_index) in order.into_iter().take(8).enumerate() {
+            let entry = cache.entries[entry_index].clone();
             let attempt = async {
                 let ssh = tokio::time::timeout(
                     std::time::Duration::from_secs(20),
@@ -171,7 +236,10 @@ impl Supervisor {
             }
             .await;
             match attempt {
-                Ok(outbound) => return Ok(outbound),
+                Ok(outbound) => {
+                    cache.preferred = Some(entry_index);
+                    return Ok(outbound);
+                }
                 Err(error) => {
                     warn!(
                         "地区路径候选 {} 失败: country={country}, error={error:#}",
@@ -181,6 +249,7 @@ impl Supervisor {
                 }
             }
         }
+        *candidates = None;
         Err(last_error
             .unwrap_or_else(|| anyhow::anyhow!("没有执行任何候选"))
             .context(format!("所选地区所有已尝试路径均不可用: {country}")))
@@ -235,7 +304,7 @@ impl Supervisor {
                 }
             }
         }
-        bail!("启动阶段出口探测失败，退出等待容器重启。")
+        bail!("本轮出口候选探测均失败")
     }
 
     async fn ensure_account(&self) -> Result<WgAccount> {
@@ -317,9 +386,12 @@ impl Supervisor {
             loop {
                 match probe_outbound(outbound, self.config.startup_probe_timeout).await {
                     Ok(outcome) => {
-                        if let Some(ip) = outcome.ip {
-                            info!("当前出口 IP: {ip}");
-                        }
+                        info!(
+                            "出口验证成功: backend={}, IP={}, loc={}",
+                            outbound.name(),
+                            outcome.ip.as_deref().unwrap_or("unknown"),
+                            outcome.loc.as_deref().unwrap_or("unknown")
+                        );
                         return Ok(());
                     }
                     Err(error) => {
@@ -341,58 +413,13 @@ impl Supervisor {
         Ok(Some(crate::outbound::psiphon::normalize_country(country)?))
     }
 
-    /// 起唯一公开 SOCKS 入口；启动探测失败或取消时 Drop 会停止监听。
-    async fn spawn_and_probe(
+    /// 仅判断出口是否需要重建；监听任务由 run_service 独立监督。
+    async fn watch_outbound(
         &self,
-        outbound: Arc<dyn Outbound>,
-        listen_mode: mixed::ListenMode,
-        probe_addr: SocketAddr,
-        failure_threshold: u32,
-    ) -> Result<(RunningProxy, ProbeOutcome)> {
-        let backend = outbound.name();
-        let mut proxy = RunningProxy {
-            serve_handle: tokio::spawn(mixed::serve(outbound, listen_mode)),
-            probe_addr,
-            backend,
-            failure_threshold,
-        };
-        let probe = SocksTraceProbe::new(probe_addr, self.config.startup_probe_timeout);
-        let mut last_error = None;
-        let outcome = tokio::time::timeout(self.config.startup_ready_timeout, async {
-            loop {
-                tokio::select! {
-                    result = &mut proxy.serve_handle => return Err(listener_result(result)),
-                    result = probe.probe() => {
-                        match result {
-                            Ok(outcome) => return Ok(outcome),
-                            Err(error) => {
-                                last_error = Some(error);
-                                sleep(self.config.startup_probe_delay).await;
-                            }
-                        }
-                    }
-                }
-            }
-        })
-        .await
-        .map_err(|_| startup_probe_error("SOCKS 启动探测超时", last_error))??;
-        Ok((proxy, outcome))
-    }
-
-    /// 运行期只探测唯一公开入口。`Ok(())` 表示已知出站终止或连续探测失败达到阈值。
-    async fn serve_and_watch(
-        &self,
-        mut proxy: RunningProxy,
         outbound: &dyn Outbound,
         base: Option<&dyn Outbound>,
-    ) -> Result<()> {
-        let (probe_addr, backend, failure_threshold) =
-            (proxy.probe_addr, proxy.backend, proxy.failure_threshold);
-        info!("代理监听模式: {}", self.config.listen_addrs);
-        info!("内部健康探测入口: {probe_addr}");
-        info!("隧道后端: {backend}");
-        heartbeat::record_success();
-        let probe = SocksTraceProbe::new(probe_addr, self.config.healthcheck_probe_timeout);
+        failure_threshold: u32,
+    ) {
         let mut recovery = ThresholdRecovery::new(failure_threshold);
         let terminated = async {
             tokio::select! {
@@ -408,14 +435,13 @@ impl Supervisor {
         tokio::pin!(terminated);
         loop {
             let outcome = tokio::select! {
-                result = &mut proxy.serve_handle => return Err(listener_result(result)),
                 reason = &mut terminated => {
-                    warn!("出站已终止，退出重建链路: {reason}");
-                    return Ok(());
+                    warn!("出站已终止，重建出口: {reason}");
+                    return;
                 }
                 outcome = async {
                     sleep(self.config.healthcheck_interval).await;
-                    probe.probe().await
+                    probe_outbound(outbound, self.config.healthcheck_probe_timeout).await
                 } => outcome,
             };
             match outcome {
@@ -426,12 +452,12 @@ impl Supervisor {
                 Err(error) => {
                     let action = recovery.on_failure();
                     warn!(
-                        "SOCKS 出口探测失败: {error}; failures={}/{}",
+                        "出口探测失败: {error}; failures={}/{}",
                         recovery.consecutive_failures(),
                         failure_threshold
                     );
                     if action == RecoveryAction::RequestExit {
-                        return Ok(());
+                        return;
                     }
                 }
             }
@@ -457,12 +483,9 @@ fn listener_result(result: Result<Result<()>, tokio::task::JoinError>) -> anyhow
     }
 }
 
-fn parse_listen_mode(raw: &str, port: u16) -> Result<(mixed::ListenMode, std::net::SocketAddr)> {
+fn parse_listen_mode(raw: &str, port: u16) -> Result<mixed::ListenMode> {
     if raw.trim().eq_ignore_ascii_case("auto") {
-        return Ok((
-            mixed::ListenMode::Auto { port },
-            std::net::SocketAddr::from(([127, 0, 0, 1], port)),
-        ));
+        return Ok(mixed::ListenMode::Auto { port });
     }
     let addrs = raw
         .split(',')
@@ -477,16 +500,7 @@ fn parse_listen_mode(raw: &str, port: u16) -> Result<(mixed::ListenMode, std::ne
     if addrs.is_empty() {
         bail!("SOCKS_LISTEN_ADDRS 至少需要一个监听地址");
     }
-    let probe_addr = match addrs[0] {
-        SocketAddr::V4(addr) if addr.ip().is_unspecified() => {
-            SocketAddr::from(([127, 0, 0, 1], addr.port()))
-        }
-        SocketAddr::V6(addr) if addr.ip().is_unspecified() => {
-            SocketAddr::from(([0, 0, 0, 0, 0, 0, 0, 1], addr.port()))
-        }
-        addr => addr,
-    };
-    Ok((mixed::ListenMode::Explicit(addrs), probe_addr))
+    Ok(mixed::ListenMode::Explicit(addrs))
 }
 
 fn log_candidate_plan(candidates: &[String], store: &JsonFileEndpointStore) {
@@ -541,9 +555,6 @@ mod tests {
         });
         let proxy = RunningProxy {
             serve_handle: handle,
-            probe_addr: "127.0.0.1:1080".parse().unwrap(),
-            backend: "test",
-            failure_threshold: 1,
         };
 
         drop(proxy);
@@ -556,14 +567,13 @@ mod tests {
 
     #[test]
     fn parses_ipv4_and_ipv6_listeners() {
-        let (mode, probe) = parse_listen_mode("127.0.0.1:1080, [2001:db8::10]:1080", 9999).unwrap();
+        let mode = parse_listen_mode("127.0.0.1:1080, [2001:db8::10]:1080", 9999).unwrap();
         let mixed::ListenMode::Explicit(addrs) = mode else {
             panic!("应解析为显式监听模式");
         };
         assert_eq!(addrs.len(), 2);
         assert!(addrs[0].is_ipv4());
         assert!(addrs[1].is_ipv6());
-        assert_eq!(probe, addrs[0]);
     }
 
     #[test]
@@ -573,9 +583,8 @@ mod tests {
     }
 
     #[test]
-    fn auto_mode_uses_loopback_for_health_probe() {
-        let (mode, probe) = parse_listen_mode("AUTO", 2080).unwrap();
+    fn parses_auto_mode() {
+        let mode = parse_listen_mode("AUTO", 2080).unwrap();
         assert!(matches!(mode, mixed::ListenMode::Auto { port: 2080 }));
-        assert_eq!(probe, "127.0.0.1:2080".parse().unwrap());
     }
 }

@@ -32,19 +32,54 @@ pub(super) fn net_config(addresses: Vec<IpCidr>) -> NetConfig {
 }
 
 pub(super) async fn connect_tcp(net: &Net, host: Host, port: u16) -> std::io::Result<Connected> {
-    // smoltcp 对未响应的 SYN 只会把重传间隔倍增到 60s 封顶，不加超时会永远挂着。
-    let targets = resolve_targets(net, host, port).await?;
-    let connected = tokio::time::timeout(
-        CONNECT_TIMEOUT,
-        connect_first(targets, |addr| net.tcp_connect(addr)),
-    )
+    // 两个地址族独立推进，单侧 DNS 停滞不阻塞另一侧已可用的地址。
+    let budget = match &host {
+        Host::Ip(_) => CONNECT_TIMEOUT,
+        Host::Domain(_) => DNS_TIMEOUT + CONNECT_TIMEOUT,
+    };
+    let connected = tokio::time::timeout(budget, async {
+        let name = match host {
+            Host::Domain(name) => name,
+            Host::Ip(ip) => {
+                let target = SocketAddr::new(ip, port);
+                return net.tcp_connect(target).await.map(|stream| (stream, target));
+            }
+        };
+        let mut families = FuturesUnordered::new();
+        for record_type in [RecordType::A, RecordType::Aaaa] {
+            let name = &name;
+            families.push(async move {
+                let addresses = resolve(net, DNS_SERVER, name, record_type, DNS_TIMEOUT)
+                    .await
+                    .map_err(std::io::Error::other)?;
+                if record_type == RecordType::A && !addresses.is_empty() {
+                    // RFC 8305 给较晚到达的 AAAA 一个短暂的优先窗口。
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+                connect_first(
+                    addresses
+                        .into_iter()
+                        .map(|ip| SocketAddr::new(ip, port))
+                        .collect(),
+                    |addr| net.tcp_connect(addr),
+                )
+                .await
+            });
+        }
+        let mut errors = Vec::new();
+        while let Some(result) = families.next().await {
+            match result {
+                Ok(connected) => return Ok(connected),
+                Err(error) => errors.push(error.to_string()),
+            }
+        }
+        Err(std::io::Error::new(
+            std::io::ErrorKind::NotConnected,
+            format!("域名 {name} 的所有地址族连接失败: {}", errors.join("; ")),
+        ))
+    })
     .await
-    .map_err(|_| {
-        std::io::Error::new(
-            std::io::ErrorKind::TimedOut,
-            format!("连接所有目标地址超时（{CONNECT_TIMEOUT:?}）"),
-        )
-    })??;
+    .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "DNS/目标连接总预算耗尽"))??;
     Ok(Connected {
         stream: Box::new(connected.0),
         note: Some(format!("target={}", connected.1)),
@@ -125,16 +160,28 @@ where
     F: Fn(SocketAddr) -> Fut + Clone,
     Fut: Future<Output = std::io::Result<T>>,
 {
-    let mut attempts = FuturesUnordered::new();
-    for (index, target) in interleave_addresses(targets).into_iter().enumerate() {
-        let connect = connect.clone();
-        attempts.push(async move {
-            if index > 0 {
-                tokio::time::sleep(HAPPY_EYEBALLS_DELAY * index as u32).await;
+    let attempts = interleave_addresses(targets)
+        .into_iter()
+        .enumerate()
+        .map(|(index, target)| {
+            let connect = connect.clone();
+            async move {
+                if index > 0 {
+                    tokio::time::sleep(HAPPY_EYEBALLS_DELAY).await;
+                }
+                let result = tokio::time::timeout(CONNECT_TIMEOUT, connect(target))
+                    .await
+                    .unwrap_or_else(|_| {
+                        Err(std::io::Error::new(
+                            std::io::ErrorKind::TimedOut,
+                            "目标地址连接超时",
+                        ))
+                    });
+                (target, result)
             }
-            (target, connect(target).await)
         });
-    }
+    // 每个地址族最多两个在途 socket，DNS 多地址不能放大每连接的缓冲占用。
+    let mut attempts = futures::stream::iter(attempts).buffer_unordered(2);
 
     let mut errors = Vec::new();
     while let Some((target, result)) = attempts.next().await {

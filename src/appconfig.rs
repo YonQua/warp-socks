@@ -22,7 +22,7 @@ pub struct AppConfig {
     pub trick: Trick,
 
     /// `auto` 自动监听 IPv4/IPv6 并只允许 LAN 客户端；也可配置逗号分隔的
-    /// 显式监听地址，此时第一个地址同时作为内部健康探测入口。
+    /// 显式监听地址。出口健康检查不经过业务监听端口。
     pub listen_addrs: String,
     pub listen_port: u16,
     /// 空值保持原 WARP 出口；启用时经所选国家的 Psiphon 前置连接 Cloudflare。
@@ -37,7 +37,7 @@ pub struct AppConfig {
     pub startup_endpoint_cooldown: Duration,
     pub healthcheck_probe_timeout: Duration,
     pub healthcheck_failure_threshold: u32,
-    /// Supervisor 运行期真实 SOCKS 探测的轮询间隔。
+    /// Supervisor 运行期出口探测的轮询间隔。
     pub healthcheck_interval: Duration,
 }
 

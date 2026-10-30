@@ -1,5 +1,5 @@
 // 生产入口：长驻进程，内部完成注册确认、endpoint 候选尝试、SOCKS5 服务与
-// 健康检查，替代旧版 shell 的编排（lib/app/main.sh 等，见 docs/module-boundaries.md）。
+// 健康检查。
 //
 // 用法：
 //   warp-socks [serve]                  默认子命令：启动隧道 + SOCKS5 服务（前台常驻）
@@ -113,7 +113,7 @@ async fn run_healthcheck() -> Result<()> {
 fn heartbeat_max_age(config: &AppConfig) -> std::time::Duration {
     // Docker 只读心跳，不参与恢复决策。窗口覆盖 MASQUE 配置的
     // 完整失败阈值，并额外留一轮调度余量；WireGuard 在首次失败后
-    // 由 PID 1 主动退出，不依赖这个过期窗口。
+    // 由 Supervisor 撤销出口并清空心跳，不依赖这个过期窗口。
     let rounds = config.healthcheck_failure_threshold.saturating_add(1);
     (config.healthcheck_interval + config.healthcheck_probe_timeout) * rounds
         + std::time::Duration::from_secs(10)

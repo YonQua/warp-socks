@@ -46,8 +46,8 @@ services:
     logging:
       driver: json-file
       options:
-        max-size: 1m
-        max-file: '1'
+        max-size: 10m
+        max-file: '3'
     # UDP ASSOCIATE 使用随机 relay 端口，bridge/ports 无法预先发布；host
     # network 让返回的 BND.ADDR:BND.PORT 对远端客户端真实可达。
     network_mode: host

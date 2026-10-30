@@ -21,7 +21,7 @@ pub(crate) fn decode_key(b64: &str) -> Result<[u8; 32]> {
     use base64::Engine;
     let raw = base64::engine::general_purpose::STANDARD
         .decode(b64.trim())
-        .with_context(|| format!("base64 解码失败: {b64}"))?;
+        .context("密钥 base64 解码失败")?;
     raw.try_into()
         .map_err(|v: Vec<u8>| anyhow!("key 长度应为32字节，实际 {}", v.len()))
 }

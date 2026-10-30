@@ -37,6 +37,10 @@ const UDP_TARGET_CHANNEL_CAPACITY: usize = 32;
 const UDP_REPLY_CHANNEL_CAPACITY: usize = 64;
 const UDP_TARGET_ESTABLISH_TIMEOUT: Duration = Duration::from_secs(10);
 const UDP_TARGET_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
+// 队列按字节限额，避免多个 association 的大报文同时耗尽内存。
+static UDP_QUEUE_BYTES: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(8 * 1024 * 1024);
+static UDP_WORKERS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(128);
+type QueuedDatagram = (Vec<u8>, tokio::sync::SemaphorePermit<'static>);
 
 async fn reply(client: &mut TcpStream, rep: u8) -> Result<()> {
     client
@@ -218,10 +222,11 @@ fn target_host_port(target: &SocketAddrOrName) -> (Host, u16) {
 struct UdpReply {
     from: SocketAddr,
     payload: Vec<u8>,
+    _budget: tokio::sync::SemaphorePermit<'static>,
 }
 
 struct UdpEgressSet {
-    routes: HashMap<SocketAddrOrName, mpsc::Sender<Vec<u8>>>,
+    routes: HashMap<SocketAddrOrName, mpsc::Sender<QueuedDatagram>>,
     workers: JoinSet<()>,
     reply_tx: mpsc::Sender<UdpReply>,
     reply_rx: mpsc::Receiver<UdpReply>,
@@ -254,15 +259,20 @@ impl UdpEgressSet {
         peer: SocketAddr,
     ) {
         self.prune();
+        let Ok(budget) = UDP_QUEUE_BYTES.try_acquire_many(payload.len() as u32) else {
+            return;
+        };
+        let mut packet = (payload.to_vec(), budget);
 
         if let Some(route) = self.routes.get(&target) {
-            match route.try_send(payload.to_vec()) {
+            match route.try_send(packet) {
                 Ok(()) => return,
                 Err(mpsc::error::TrySendError::Full(_)) => {
                     log::debug!("UDP ASSOCIATE 目标发送队列已满，丢弃数据报: {target:?}");
                     return;
                 }
-                Err(mpsc::error::TrySendError::Closed(_)) => {
+                Err(mpsc::error::TrySendError::Closed(returned)) => {
+                    packet = returned;
                     self.routes.remove(&target);
                 }
             }
@@ -276,12 +286,16 @@ impl UdpEgressSet {
             return;
         }
 
+        let Ok(worker_permit) = UDP_WORKERS.try_acquire() else {
+            return;
+        };
         let (send_tx, send_rx) = mpsc::channel(UDP_TARGET_CHANNEL_CAPACITY);
         let reply_tx = self.reply_tx.clone();
         let worker_target = target.clone();
         let establish_timeout = self.establish_timeout;
         let idle_timeout = self.idle_timeout;
         self.workers.spawn(async move {
+            let _worker_permit = worker_permit;
             log::debug!("UDP ASSOCIATE 开始建立目标通道: {worker_target:?}");
             match tokio::time::timeout(
                 establish_timeout,
@@ -305,7 +319,7 @@ impl UdpEgressSet {
                 ),
             }
         });
-        if send_tx.try_send(payload.to_vec()).is_err() {
+        if send_tx.try_send(packet).is_err() {
             log::debug!("新建 UDP ASSOCIATE 目标后发送队列意外关闭");
             return;
         }
@@ -329,7 +343,7 @@ impl UdpEgressSet {
 async fn run_udp_egress(
     target: SocketAddrOrName,
     egress: Box<dyn Datagram>,
-    mut sends: mpsc::Receiver<Vec<u8>>,
+    mut sends: mpsc::Receiver<QueuedDatagram>,
     replies: mpsc::Sender<UdpReply>,
     idle_timeout: Duration,
 ) {
@@ -339,14 +353,16 @@ async fn run_udp_egress(
         let operation = async {
             tokio::select! {
                 command = sends.recv() => {
-                    let Some(payload) = command else { return Ok(false) };
+                    let Some((payload, _budget)) = command else { return Ok(false) };
                     egress.send(&payload).await?;
                 }
                 result = egress.recv(&mut recv_buf) => {
                     let size = result?;
+                    let Ok(budget) = UDP_QUEUE_BYTES.try_acquire_many(size as u32) else { return Ok(true) };
                     let reply = UdpReply {
                         from: egress.peer_addr(),
                         payload: recv_buf[..size].to_vec(),
+                        _budget: budget,
                     };
                     if replies.send(reply).await.is_err() {
                         return Ok(false);

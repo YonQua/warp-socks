@@ -64,17 +64,26 @@ impl SocksTraceProbe {
             .build()
             .map_err(|e| ProbeError::Request(e.to_string()))?;
 
-        let resp = client
+        let mut resp = client
             .get(&self.trace_url)
             .send()
             .await
-            .map_err(|e| ProbeError::Request(e.to_string()))?;
+            .map_err(|e| ProbeError::Request(format!("{:#}", anyhow::Error::new(e))))?;
         let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
         if !status.is_success() {
             return Err(ProbeError::Request(format!("HTTP {status}")));
         }
-
+        let mut bytes = Vec::new();
+        while let Some(chunk) = resp.chunk().await.map_err(|e| {
+            ProbeError::Request(format!("读取 trace 响应失败: {:#}", anyhow::Error::new(e)))
+        })? {
+            if chunk.len() > MAX_TRACE_BYTES.saturating_sub(bytes.len()) {
+                return Err(ProbeError::Request("trace 响应超过大小上限".into()));
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        let body = String::from_utf8(bytes)
+            .map_err(|e| ProbeError::Request(format!("trace 响应不是 UTF-8: {e}")))?;
         parse_trace(&body)
     }
 }

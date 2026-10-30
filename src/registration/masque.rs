@@ -218,12 +218,11 @@ pub async fn register() -> Result<RegCredentials> {
         .await
         .context("注册 API 请求失败")?;
     let status = resp.status();
-    let body = resp.text().await.unwrap_or_default();
+    let body = resp.text().await.context("读取注册 API 响应失败")?;
     if !status.is_success() {
-        bail!("注册 API 返回 {status}: {body}");
+        bail!("注册 API 返回 {status}");
     }
-    let step1: Wrapper<RegResult> =
-        serde_json::from_str(&body).with_context(|| format!("解析注册响应失败: {body}"))?;
+    let step1: Wrapper<RegResult> = serde_json::from_str(&body).context("解析注册响应失败")?;
     println!("第 1 步完成: id={}", step1.result.id);
 
     // Step 2: 生成 ECDSA P-256 密钥，PATCH 登记为 masque。
@@ -251,12 +250,11 @@ pub async fn register() -> Result<RegCredentials> {
         .await
         .context("登记 API 请求失败")?;
     let status = resp.status();
-    let body = resp.text().await.unwrap_or_default();
+    let body = resp.text().await.context("读取登记 API 响应失败")?;
     if !status.is_success() {
-        bail!("登记 API 返回 {status}: {body}");
+        bail!("登记 API 返回 {status}");
     }
-    let step2: Wrapper<RegResult> =
-        serde_json::from_str(&body).with_context(|| format!("解析登记响应失败: {body}"))?;
+    let step2: Wrapper<RegResult> = serde_json::from_str(&body).context("解析登记响应失败")?;
 
     let private_key_b64 = STANDARD.encode(&pkcs8_der(&signing_key)?);
 
@@ -456,9 +454,8 @@ pub async fn delete(path: &Path) -> Result<()> {
         .await
         .context("注销 API 请求失败")?;
     let status = resp.status();
-    let body = resp.text().await.unwrap_or_default();
     if !status.is_success() {
-        bail!("API 注销返回 {status}: {body}；本地凭据已保留以便重试");
+        bail!("API 注销返回 {status}；本地凭据已保留以便重试");
     }
     println!("✓ 已注销: id={}", ident.id);
     std::fs::remove_file(path).with_context(|| format!("删除 {} 失败", path.display()))?;

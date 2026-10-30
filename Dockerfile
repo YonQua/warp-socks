@@ -42,7 +42,7 @@ COPY --from=rust-builder /usr/local/bin/warp-socks-rs /usr/local/bin/warp-socks-
 
 RUN chmod +x /usr/local/bin/warp-socks-rs
 
-# Docker 只负责定时展示健康状态；连续失败阈值判定与重启触发完全在
+# Docker 只负责定时展示健康状态；连续失败阈值判定与出口恢复完全在
 # warp-socks-rs 自己的运行期健康检查循环里（见 src/supervisor.rs）。
 #
 # healthcheck 子命令不再自己发起一次真实的隧道探测，只读运行期循环写的心跳
