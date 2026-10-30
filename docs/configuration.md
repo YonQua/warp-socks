@@ -75,4 +75,3 @@ AT AU BE BG CA CH CZ DE DK EE ES FI FR GB HR HU IE IN IT JP LV NL NO PL PT RO RS
 仓库 Compose 默认限制内存 256 MiB、CPU 0.5，日志轮转为 10m × 3。资源限制可以按负载调整；不代表已经完成该限额下的压力验收。入口最多 64 条连接，满载关闭新连接；UDP 每个 association 最多 64 个目标，全进程最多 128 个目标 worker，报文字节额度 8 MiB。
 
 健康检查只表示出口探测结果，不代表入口仍有空闲容量。出口恢复期间，新连接最多等待 5 秒；已有连接可能断开，需要客户端重新连接。
-
