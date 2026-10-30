@@ -9,6 +9,7 @@
 //! Apache-2.0 许可的 `tokio-smoltcp 0.6.0`，并按本项目双栈主动拨号边界裁剪。
 
 use std::collections::VecDeque;
+use std::future::Future;
 use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::ops::Deref;
@@ -16,8 +17,8 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
-use futures::future::{poll_fn, FutureExt};
-use futures::{Sink, SinkExt, Stream, StreamExt};
+use futures::future::poll_fn;
+use futures::{Sink, Stream};
 use parking_lot::{MappedMutexGuard, Mutex, MutexGuard};
 use smoltcp::iface::{
     Config as InterfaceConfig, Context as InterfaceContext, Interface,
@@ -267,6 +268,7 @@ struct BufferDevice {
     max_burst_size: usize,
     recv_queue: VecDeque<Vec<u8>>,
     send_queue: VecDeque<Vec<u8>>,
+    dropped_tx: usize,
 }
 
 impl BufferDevice {
@@ -279,19 +281,8 @@ impl BufferDevice {
             max_burst_size,
             recv_queue: VecDeque::with_capacity(max_burst_size),
             send_queue: VecDeque::with_capacity(max_burst_size),
+            dropped_tx: 0,
         }
-    }
-
-    fn take_send_queue(&mut self) -> VecDeque<Vec<u8>> {
-        std::mem::replace(
-            &mut self.send_queue,
-            VecDeque::with_capacity(self.max_burst_size),
-        )
-    }
-
-    fn push_received(&mut self, packets: impl Iterator<Item = Vec<u8>>) {
-        let available = self.max_burst_size.saturating_sub(self.recv_queue.len());
-        self.recv_queue.extend(packets.take(available));
     }
 }
 
@@ -315,7 +306,12 @@ impl TxToken for BufferTxToken<'_> {
     {
         let mut packet = vec![0; len];
         let result = f(&mut packet);
-        self.0.send_queue.push_back(packet);
+        // 接收 token 自带响应 token；发送满时仍须处理入站，响应按 IP 丢包处理。
+        if self.0.send_queue.len() < self.0.max_burst_size {
+            self.0.send_queue.push_back(packet);
+        } else {
+            self.0.dropped_tx = self.0.dropped_tx.saturating_add(1);
+        }
         result
     }
 }
@@ -647,69 +643,67 @@ async fn run_reactor(
     notify: Arc<Notify>,
     observer: Option<DataPlaneObserver>,
 ) -> io::Result<()> {
-    let max_burst = device
-        .capabilities()
-        .max_burst_size
-        .unwrap_or(DEFAULT_MAX_BURST_SIZE);
-    let mut received = VecDeque::with_capacity(max_burst);
-
+    let max_burst = buffered.max_burst_size;
     loop {
         if let Some(observer) = &observer {
             observer.record_reactor_loop();
         }
-        let outgoing = buffered.take_send_queue();
-        if let Some(observer) = &observer {
-            observer.record_device_backlog(buffered.recv_queue.len(), outgoing.len());
-        }
-        flush_packets(&mut device, outgoing).await?;
-
-        let mut stream_ended = false;
-        if received.is_empty() && buffered.recv_queue.is_empty() {
-            let delay = interface
+        // 队列满时 poll_delay 可能持续为零，但没有发送容量就无法推进出站。
+        // 等待设备、入站或应用唤醒；WireGuard 的独立设备计时仍在 poll_next 中轮询。
+        let can_transmit = buffered.send_queue.len() < max_burst;
+        let delay = if can_transmit {
+            interface
                 .lock()
                 .poll_delay(SmolInstant::now(), &allocator.table.lock().sockets)
-                .unwrap_or(DEFAULT_POLL_INTERVAL);
-            if let Some(observer) = &observer {
-                observer.record_reactor_wait();
+                .unwrap_or(DEFAULT_POLL_INTERVAL)
+        } else {
+            DEFAULT_POLL_INTERVAL
+        };
+        let timer = tokio::time::sleep(delay.into());
+        let notified = notify.notified();
+        tokio::pin!(timer, notified);
+        if let Some(observer) = &observer {
+            observer.record_reactor_wait();
+        }
+        let (wake, stream_ended) = poll_fn(|cx| {
+            let queued = buffered.send_queue.len();
+            if let Poll::Ready(Err(error)) =
+                poll_send_packets(&mut device, &mut buffered.send_queue, cx)
+            {
+                return Poll::Ready(Err(error));
             }
-            tokio::select! {
-                _ = tokio::time::sleep(delay.into()) => {
-                    if let Some(observer) = &observer {
-                        observer.record_reactor_wake(ReactorWake::Timer);
+            let mut stream_ended = false;
+            // 发送 Pending 不能提前返回：接收负责处理对端响应和设备定时器。
+            while buffered.recv_queue.len() < max_burst {
+                match Pin::new(&mut device).poll_next(cx) {
+                    Poll::Ready(Some(Ok(packet))) => {
+                        buffered.recv_queue.push_back(packet);
                     }
-                }
-                packet = device.next() => {
-                    if let Some(observer) = &observer {
-                        observer.record_reactor_wake(ReactorWake::Device);
-                    }
-                    match packet {
-                        Some(Ok(packet)) => received.push_back(packet),
-                        Some(Err(error)) => return Err(error),
-                        None => break,
-                    }
-                },
-                _ = notify.notified() => {
-                    if let Some(observer) = &observer {
-                        observer.record_reactor_wake(ReactorWake::Notify);
-                    }
-                }
-            }
-
-            while received.len() < max_burst {
-                match device.next().now_or_never() {
-                    Some(Some(Ok(packet))) => received.push_back(packet),
-                    Some(Some(Err(error))) => return Err(error),
-                    Some(None) => {
+                    Poll::Ready(Some(Err(error))) => return Poll::Ready(Err(error)),
+                    Poll::Ready(None) => {
                         stream_ended = true;
                         break;
                     }
-                    None => break,
+                    Poll::Pending => break,
                 }
             }
-        }
-
-        buffered.push_received(received.drain(..));
+            let wake = if stream_ended
+                || !buffered.recv_queue.is_empty()
+                || buffered.send_queue.len() != queued
+            {
+                ReactorWake::Device
+            } else if notified.as_mut().poll(cx).is_ready() {
+                ReactorWake::Notify
+            } else if can_transmit && timer.as_mut().poll(cx).is_ready() {
+                ReactorWake::Timer
+            } else {
+                return Poll::Pending;
+            };
+            Poll::Ready(Ok((wake, stream_ended)))
+        })
+        .await?;
         if let Some(observer) = &observer {
+            observer.record_reactor_wake(wake);
             observer.record_device_backlog(buffered.recv_queue.len(), buffered.send_queue.len());
         }
         interface.lock().poll(
@@ -717,14 +711,18 @@ async fn run_reactor(
             &mut buffered,
             &mut allocator.table.lock().sockets,
         );
+        let dropped = std::mem::take(&mut buffered.dropped_tx);
         if let Some(observer) = &observer {
             observer.record_reactor_poll();
             observer.record_device_backlog(buffered.recv_queue.len(), buffered.send_queue.len());
+            observer.record_device_tx_dropped(dropped);
         }
 
         if stream_ended {
             break;
         }
+        // 自定义设备可能一直 Ready；有限批次之间显式让出，保证取消和业务任务可运行。
+        tokio::task::yield_now().await;
     }
     Ok(())
 }
@@ -774,14 +772,18 @@ fn socket_snapshot(sockets: &SocketSet<'_>) -> SocketSnapshot {
     snapshot
 }
 
-async fn flush_packets(
+fn poll_send_packets(
     device: &mut impl AsyncDevice,
-    packets: impl IntoIterator<Item = Vec<u8>>,
-) -> io::Result<()> {
-    for packet in packets {
-        device.feed(packet).await?;
+    packets: &mut VecDeque<Vec<u8>>,
+    cx: &mut Context<'_>,
+) -> Poll<io::Result<()>> {
+    while !packets.is_empty() {
+        std::task::ready!(Pin::new(&mut *device).poll_ready(cx))?;
+        if let Some(packet) = packets.pop_front() {
+            Pin::new(&mut *device).start_send(packet)?;
+        }
     }
-    device.flush().await
+    Pin::new(device).poll_flush(cx)
 }
 
 fn map_error(error: impl std::error::Error) -> io::Error {
@@ -1129,7 +1131,8 @@ mod tests {
             closed: closed.clone(),
         };
 
-        flush_packets(&mut device, vec![vec![1], vec![2]])
+        let mut packets = VecDeque::from([vec![1], vec![2]]);
+        poll_fn(|cx| poll_send_packets(&mut device, &mut packets, cx))
             .await
             .unwrap();
 

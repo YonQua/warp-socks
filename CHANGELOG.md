@@ -8,7 +8,7 @@
 
 - **breaking**：`TEAMS_TOKEN` 统一为注册链接中 `token=` 后面的原始三段 JWT（`header.payload.signature`）；不再接受或自动截取 `token=`、完整 `com.cloudflare.warp://...` 链接或引号，错误格式会在发送注册请求前明确失败。
 - WireGuard transport 收敛为直接实现 netstack `AsyncDevice` 的单 `Tunn`、单 outer UDP socket、单 `Net` 生命周期；移除数据中转 task、packet channel、代际热切换和基于 TX/RX 顺序的伪停滞判断。
-- netstack 的有限发送批次改为 `feed + flush`，不再把每个批次误当成完整 Stream 并关闭 packet sink。
+- netstack 有限发送批次保持 packet sink 打开；发送背压期间继续轮询接收、设备计时和终止信号，有界批次之间让出执行权。发送队列满时响应报文按 IP 丢包处理，WireGuard 外层待发队列上限为 256 包，数据面窗口新增队列溢出丢包计数。
 - 公共代理监听与出口生命周期分离：启动准备失败、运行期探测失败或明确的出站终止由 Supervisor 在进程内重建完整出口，撤销出口时取消旧连接。普通 WireGuard 首次探测失败冷却 endpoint；MASQUE/地区模式按配置阈值恢复，地区链路失败不误冷却基础 WireGuard endpoint。每轮准备最多 120 秒，连续失败随机退避上限逐步增加到 32 秒。
 - **breaking**：代理入口并发上限从 4096 调整为 64，满载关闭新连接；出口不可用时新连接最多等待 5 秒，再按协议失败。健康检查直接验证出口，监听任务独立监督；不再通过业务 SOCKS 入口执行周期探测；成功心跳不代表业务入口仍有空闲容量。
 - Psiphon 候选在进程内缓存最多 24 小时并优先最近成功节点；全部已尝试候选失败或准备总预算耗尽后清空。候选仍需签名校验、国家过滤和完整出口验证。
@@ -41,6 +41,7 @@
 
 ### Fixed
 
+- MASQUE 共用锁定版本 Quinn 的 QUIC 整数编码，消除手写 8 字节分支的长度错误；现有小帧编码保持一致。
 - Psiphon 后台传输错误传播到读端，不再伪装成正常 EOF；下载 EOF 后保留上传方向，丢弃流时取消后台任务并关闭 channel。
 - 健康 trace 限制响应大小并保留读取错误链；注册响应与密钥解析失败不再输出原始敏感内容。
 

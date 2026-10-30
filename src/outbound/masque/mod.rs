@@ -42,6 +42,7 @@ mod h2_outbound;
 mod huffman;
 mod qpack;
 mod tls;
+mod varint;
 
 pub use h2_outbound::MasqueH2;
 
@@ -434,14 +435,15 @@ async fn drain_upload(
     send: &mut quinn::SendStream,
 ) -> io::Result<()> {
     let mut buf = vec![0u8; RELAY_BUF];
+    let mut frame = Vec::new();
     loop {
         let n = input.read(&mut buf).await?;
         if n == 0 {
             return Ok(());
         }
-        send.write_all(&qpack::data_frame(&buf[..n]))
-            .await
-            .map_err(io::Error::other)?;
+        frame.clear();
+        qpack::data_frame(&mut frame, &buf[..n]);
+        send.write_all(&frame).await.map_err(io::Error::other)?;
     }
 }
 
@@ -551,11 +553,8 @@ async fn read_varint_or_eof(recv: &mut quinn::RecvStream) -> io::Result<Option<u
     }
     let len = 1usize << (buf[0] >> 6);
     AsyncReadExt::read_exact(recv, &mut buf[1..len]).await?;
-    let mut value = (buf[0] & 0x3f) as u64;
-    for &byte in &buf[1..len] {
-        value = (value << 8) | byte as u64;
-    }
-    Ok(Some(value))
+    // 首字节决定长度，read_exact 已保证整数完整。
+    Ok(varint::read(&buf[..len]).map(|(value, _)| value))
 }
 
 fn io_err(msg: String) -> io::Error {

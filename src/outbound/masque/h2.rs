@@ -18,7 +18,7 @@ use tokio::sync::mpsc as tokio_mpsc;
 use tokio::task::JoinSet;
 use tokio_rustls::TlsConnector;
 
-use super::{edge_addrs, tls, SNI};
+use super::{edge_addrs, tls, varint, SNI};
 use crate::netstack::AsyncDevice;
 use crate::outbound::{Host, Outbound};
 use crate::registration::RegCredentials;
@@ -218,7 +218,7 @@ async fn send_packets(
         }
         let mut capsule = Vec::with_capacity(packet.len() + 4);
         capsule.push(0); // DATAGRAM capsule type
-        encode_varint(packet.len() as u64, &mut capsule);
+        varint::write(&mut capsule, packet.len() as u64);
         capsule.extend_from_slice(&packet);
         let mut remaining = Bytes::from(capsule);
         while !remaining.is_empty() {
@@ -250,8 +250,8 @@ async fn receive_packets(
         }
         buf.extend_from_slice(&chunk);
         let mut consumed = 0;
-        while let Some((kind, kind_len)) = decode_varint(&buf[consumed..]) {
-            let Some((length, length_len)) = decode_varint(&buf[consumed + kind_len..]) else {
+        while let Some((kind, kind_len)) = varint::read(&buf[consumed..]) {
+            let Some((length, length_len)) = varint::read(&buf[consumed + kind_len..]) else {
                 break;
             };
             let length = usize::try_from(length).context("MASQUE capsule 长度超出平台限制")?;
@@ -283,27 +283,4 @@ async fn receive_packets(
         buf.drain(..consumed);
     }
     bail!("MASQUE H2 数据流已关闭")
-}
-
-fn encode_varint(value: u64, out: &mut Vec<u8>) {
-    if value < 64 {
-        out.push(value as u8);
-    } else if value < 16_384 {
-        out.extend_from_slice(&((value as u16) | 0x4000).to_be_bytes());
-    } else {
-        out.extend_from_slice(&((value as u32) | 0x8000_0000).to_be_bytes());
-    }
-}
-
-fn decode_varint(buf: &[u8]) -> Option<(u64, usize)> {
-    let first = *buf.first()?;
-    let len = 1usize << (first >> 6);
-    if buf.len() < len {
-        return None;
-    }
-    let mut value = u64::from(first & 0x3f);
-    for byte in &buf[1..len] {
-        value = (value << 8) | u64::from(*byte);
-    }
-    Some((value, len))
 }

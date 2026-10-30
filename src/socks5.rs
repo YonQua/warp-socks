@@ -501,7 +501,7 @@ fn encode_udp_header(target: SocketAddr) -> Vec<u8> {
 }
 
 async fn read_target(client: &mut TcpStream, atyp: u8) -> Result<Target> {
-    // 域名不在此解析：交给后端（MASQUE 直接交边缘解析，WireGuard 走虚拟网卡 DNS）。
+    // 域名交给后端：H3 走隧道内 DoH，WireGuard/H2 走虚拟网卡 DNS。
     match atyp {
         0x01 => {
             let mut addr = [0u8; 4];

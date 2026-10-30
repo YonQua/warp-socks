@@ -1,6 +1,5 @@
-// 对应 lib/core/probe.sh: probe_socks_trace —— 通过本地 SOCKS5 代理（域名解析
-// 走隧道）请求 trace 接口，检查响应里的 warp=on|plus 标记，这是隧道对外提供
-// 的真实使用路径，比直接探测出口 IP 更贴近实际用户流量。
+// Supervisor 直接经 Outbound 请求 trace，检查 warp=on|plus；
+// SocksTraceProbe 保留为经公共 SOCKS5 入口的独立诊断工具。
 
 use std::net::SocketAddr;
 use std::time::Duration;

@@ -24,7 +24,7 @@ const CLIENT_VERSION: &str = "linux-2026.6.880.0";
 const USER_AGENT: &str = "WARP for Linux";
 
 /// WARP 注册信息（可序列化到 reg.json）。
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct Registration {
     pub id: String,
     pub token: String,
@@ -334,7 +334,7 @@ fn build_credentials(reg: &Registration, signing_key: &SigningKey) -> Result<Reg
             .context("边缘公钥 base64 解码失败")?
     };
     Ok(RegCredentials {
-        registration: reg.clone_struct(),
+        registration: reg.clone(),
         client_cert_der: cert.der().to_vec(),
         client_key_der: pkcs8_der(signing_key)?,
         pinned_spki_der: pinned_spki,
@@ -376,24 +376,6 @@ fn build_client_cert(reg_id: &str, signing_key: &SigningKey) -> Result<rcgen::Ce
 }
 
 impl Registration {
-    /// 浅克隆（私有字段一起带上）。
-    fn clone_struct(&self) -> Self {
-        Self {
-            id: self.id.clone(),
-            token: self.token.clone(),
-            account: self.account.clone(),
-            key_type: self.key_type.clone(),
-            tunnel_type: self.tunnel_type.clone(),
-            private_key: self.private_key.clone(),
-            endpoint_v4: self.endpoint_v4.clone(),
-            endpoint_v6: self.endpoint_v6.clone(),
-            endpoint_ports: self.endpoint_ports.clone(),
-            peer_public_key: self.peer_public_key.clone(),
-            assigned_ipv4: self.assigned_ipv4.clone(),
-            assigned_ipv6: self.assigned_ipv6.clone(),
-        }
-    }
-
     /// 保存到 JSON 文件。
     ///
     /// # Errors

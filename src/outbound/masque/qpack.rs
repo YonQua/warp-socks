@@ -16,6 +16,10 @@
 // host=域名 字面量，会因 :authority 与 Host 值不一致触发边缘按 RFC 9114
 // §4.3.1 / RFC 9113 §8.3.1 的一致性校验，以 H3_MESSAGE_ERROR reset 流。
 
+#[cfg(test)]
+use super::varint::read as read_varint;
+use super::varint::write as write_varint;
+
 /// HPACK 前缀整数编码（RFC 7541 §5.1，QPACK 沿用）。
 /// `prefix_bits` 个高位已被 `prefix_max` 占用，剩余值用 7-bit 续字节。
 fn encode_integer(out: &mut Vec<u8>, value: u64, prefix_bits: u8, prefix_max: u8) {
@@ -45,41 +49,6 @@ fn write_frame(out: &mut Vec<u8>, frame_type: u64, payload: &[u8]) {
     write_varint(out, frame_type);
     write_varint(out, payload.len() as u64);
     out.extend_from_slice(payload);
-}
-
-/// QUIC 可变长度整数编码（RFC 9000 §16）。长度值 0..64 用 1 字节，否则 2 字节。
-fn write_varint(out: &mut Vec<u8>, value: u64) {
-    if value < (1 << 6) {
-        out.push(value as u8);
-    } else if value < (1 << 14) {
-        out.push(0x40 | ((value >> 8) as u8));
-        out.push((value & 0xff) as u8);
-    } else if value < (1 << 30) {
-        out.push(0x80 | ((value >> 24) as u8));
-        out.push(((value >> 16) & 0xff) as u8);
-        out.push(((value >> 8) & 0xff) as u8);
-        out.push((value & 0xff) as u8);
-    } else {
-        out.push(0xc0 | ((value >> 56) as u8));
-        for shift in (0..56).rev() {
-            out.push(((value >> shift) & 0xff) as u8);
-        }
-    }
-}
-
-/// 读 QUIC 可变长度整数（RFC 9000 §16）。返回 (值, 消耗字节数)。
-#[allow(dead_code)]
-fn read_varint(buf: &[u8]) -> Option<(u64, usize)> {
-    let first = *buf.first()?;
-    let len = 1usize << (first >> 6);
-    if buf.len() < len {
-        return None;
-    }
-    let mut value = (first & 0x3f) as u64;
-    for &b in &buf[1..len] {
-        value = (value << 8) | b as u64;
-    }
-    Some((value, len))
 }
 
 /// 编码 MASQUE CONNECT 请求头的 QPACK field section。
@@ -125,10 +94,8 @@ pub fn headers_frame(qpack_payload: &[u8]) -> Vec<u8> {
 /// 应用数据都要经过这层分帧（RFC 9114 §4.4，对应 HTTP/2 CONNECT 里 DATA
 /// frame 承载隧道字节的语义）——warp-go 靠 quic-go 的 http3.RequestStream
 /// 自动做这层分帧，我们手写实现所以要显式包一层。
-pub fn data_frame(payload: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(payload.len() + 9);
-    write_frame(&mut out, 0x00, payload);
-    out
+pub fn data_frame(out: &mut Vec<u8>, payload: &[u8]) {
+    write_frame(out, 0x00, payload);
 }
 
 /// 控制流前导：stream type(0x00=control) + 空 SETTINGS frame（type=0x04, len=0）。
@@ -344,7 +311,8 @@ mod tests {
     #[test]
     fn data_frame_wraps_with_type_0() {
         let payload = [1u8, 2, 3];
-        let f = data_frame(&payload);
+        let mut f = Vec::new();
+        data_frame(&mut f, &payload);
         assert_eq!(f[0], 0x00); // DATA type
         assert_eq!(f[1], 3); // length varint
         assert_eq!(&f[2..], &payload);

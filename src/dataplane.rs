@@ -44,6 +44,8 @@ struct ObserverInner {
     outer_rx_bytes: AtomicU64,
     outer_tx_packets: AtomicU64,
     outer_tx_bytes: AtomicU64,
+    outer_tx_dropped: AtomicU64,
+    device_tx_dropped: AtomicU64,
     decap_done: AtomicU64,
     decap_write_network: AtomicU64,
     decap_v4: AtomicU64,
@@ -105,6 +107,8 @@ struct CounterSnapshot {
     outer_rx_bytes: u64,
     outer_tx_packets: u64,
     outer_tx_bytes: u64,
+    outer_tx_dropped: u64,
+    device_tx_dropped: u64,
     decap_done: u64,
     decap_write_network: u64,
     decap_v4: u64,
@@ -182,6 +186,8 @@ impl DataPlaneObserver {
                 outer_rx_bytes: AtomicU64::new(0),
                 outer_tx_packets: AtomicU64::new(0),
                 outer_tx_bytes: AtomicU64::new(0),
+                outer_tx_dropped: AtomicU64::new(0),
+                device_tx_dropped: AtomicU64::new(0),
                 decap_done: AtomicU64::new(0),
                 decap_write_network: AtomicU64::new(0),
                 decap_v4: AtomicU64::new(0),
@@ -227,6 +233,14 @@ impl DataPlaneObserver {
     pub(crate) fn record_outer_tx(&self, bytes: usize) {
         add(&self.inner.outer_tx_packets, 1);
         add(&self.inner.outer_tx_bytes, bytes);
+    }
+
+    pub(crate) fn record_outer_tx_dropped(&self) {
+        add(&self.inner.outer_tx_dropped, 1);
+    }
+
+    pub(crate) fn record_device_tx_dropped(&self, packets: usize) {
+        add(&self.inner.device_tx_dropped, packets);
     }
 
     pub(crate) fn record_decap(&self, outcome: DecapOutcome) {
@@ -332,7 +346,7 @@ impl DataPlaneObserver {
              tcp_rx=pkts:{},payload:{},ack:{},ack_only:{},last:{}, \
              tcp_tx=pkts:{},payload:{},ack:{},ack_only:{},last:{}, bulk={}, \
              reactor=loops:{},wake_calls:{},waits:{},device:{},notify:{},timer:{},polls:{},idle_ms:{},max_gap_ms:{}, \
-             backlog=outer:{}/{},device_rx:{}/{},device_tx:{}/{}, \
+             dropped=outer_tx:{},device_tx:{}, backlog=outer:{}/{},device_rx:{}/{},device_tx:{}/{}, \
              sockets=tcp:{},est:{},connecting:{},closing:{},closed:{},rxq:{},txq:{},udp:{}, cgroup={}",
             self.inner.endpoint,
             REPORT_INTERVAL.as_secs(),
@@ -369,6 +383,8 @@ impl DataPlaneObserver {
             delta.reactor_polls,
             now_ms.saturating_sub(reactor_last),
             self.inner.reactor_max_gap_ms.swap(0, Ordering::Relaxed),
+            delta.outer_tx_dropped,
+            delta.device_tx_dropped,
             self.inner.outer_backlog_current.load(Ordering::Relaxed),
             self.inner.outer_backlog_peak.swap(0, Ordering::Relaxed),
             self.inner.device_rx_backlog.load(Ordering::Relaxed),
@@ -397,6 +413,8 @@ impl DataPlaneObserver {
             outer_rx_bytes: load(&self.inner.outer_rx_bytes),
             outer_tx_packets: load(&self.inner.outer_tx_packets),
             outer_tx_bytes: load(&self.inner.outer_tx_bytes),
+            outer_tx_dropped: load(&self.inner.outer_tx_dropped),
+            device_tx_dropped: load(&self.inner.device_tx_dropped),
             decap_done: load(&self.inner.decap_done),
             decap_write_network: load(&self.inner.decap_write_network),
             decap_v4: load(&self.inner.decap_v4),
@@ -551,6 +569,8 @@ impl CounterSnapshot {
             outer_rx_bytes: delta!(outer_rx_bytes),
             outer_tx_packets: delta!(outer_tx_packets),
             outer_tx_bytes: delta!(outer_tx_bytes),
+            outer_tx_dropped: delta!(outer_tx_dropped),
+            device_tx_dropped: delta!(device_tx_dropped),
             decap_done: delta!(decap_done),
             decap_write_network: delta!(decap_write_network),
             decap_v4: delta!(decap_v4),

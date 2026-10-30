@@ -29,6 +29,9 @@ use crate::netstack::AsyncDevice;
 const TUNNEL_MTU: usize = 1330;
 const PACKET_BUF: usize = 2048;
 const DECAP_ERROR_REPORT_INTERVAL: Duration = Duration::from_secs(10);
+// 接收与计时在发送背压下仍会产生控制报文，外层队列限制在约 512 KiB 内。
+const MAX_PENDING_NETWORK_PACKETS: usize = 256;
+const MAX_RECEIVE_BURST: usize = 64;
 
 #[derive(Debug, PartialEq, Eq)]
 struct DecapErrorReport {
@@ -184,6 +187,10 @@ impl WgTunnel {
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
                 Err(error) => return Err(error),
             }
+        }
+        if self.pending_network.len() == MAX_PENDING_NETWORK_PACKETS {
+            self.observer.record_outer_tx_dropped();
+            return Ok(());
         }
         self.pending_network.push_back(packet);
         self.observer
@@ -440,16 +447,16 @@ impl Stream for WgTunnel {
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.get_mut();
-        loop {
-            while this.timer.poll_tick(cx).is_ready() {
-                if let Err(error) = this.try_tick() {
-                    return Poll::Ready(Some(Err(error)));
-                }
-            }
-            if let Poll::Ready(Err(error)) = this.poll_network_flush(cx) {
+        while this.timer.poll_tick(cx).is_ready() {
+            if let Err(error) = this.try_tick() {
                 return Poll::Ready(Some(Err(error)));
             }
-
+        }
+        if let Poll::Ready(Err(error)) = this.poll_network_flush(cx) {
+            return Poll::Ready(Some(Err(error)));
+        }
+        // 控制包或无效包可能没有明文输出；限制单次轮询，避免持续收包独占执行器。
+        for _ in 0..MAX_RECEIVE_BURST {
             match this.poll_recv_plaintext(cx) {
                 Poll::Ready(Ok(Some(packet))) => return Poll::Ready(Some(Ok(packet))),
                 Poll::Ready(Ok(None)) => continue,
@@ -457,6 +464,8 @@ impl Stream for WgTunnel {
                 Poll::Pending => return Poll::Pending,
             }
         }
+        cx.waker().wake_by_ref();
+        Poll::Pending
     }
 }
 

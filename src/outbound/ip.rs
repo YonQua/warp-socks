@@ -86,8 +86,7 @@ pub(super) async fn connect_tcp(net: &Net, host: Host, port: u16) -> std::io::Re
     })
 }
 
-// 域名的 A/AAAA 并发走隧道内 DNS；IP 字面量直接返回。地址按 IPv4、IPv6
-// 分组返回，TCP 在下一层交错竞速，UDP 使用第一个地址（A 优先、AAAA 兜底）。
+// UDP 解析等待 A/AAAA 完成后按 A 优先、AAAA 兜底返回；TCP 使用独立地址族竞速。
 pub(super) async fn resolve_targets(
     net: &Net,
     host: Host,

@@ -99,8 +99,7 @@ impl AppConfig {
                 &env_var("WARP_SOCKS_HEALTHCHECK_FAILURE_THRESHOLD", "3"),
                 3,
             ),
-            // 30 秒轮询叠加一次失败连接的 10 秒拨号预算，会让真实 UDP
-            // 黑洞最多持续约 40 秒；10 秒在探测开销和视频恢复时间之间折中。
+            // 探测完成后间隔 10 秒再发起下一轮；故障识别还取决于上方的探测预算。
             healthcheck_interval: Duration::from_secs(10),
         }
     }
